@@ -90,6 +90,50 @@ mycel-os/
 
 ---
 
+## Development Environment
+
+### Option 1: GitHub Codespaces (Recommended)
+
+The easiest way to develop - everything pre-configured:
+
+1. Click green "Code" button → "Create codespace on main"
+2. Select **4-core** minimum (8-core recommended)
+3. Wait ~3-5 minutes for setup
+4. Pull a model: `ollama pull phi3:mini`
+5. Build: `mb` (alias for `cargo build`)
+6. Run: `mr` (alias for `cargo run -- --dev`)
+
+**Pre-configured aliases:**
+
+| Alias | Command |
+|-------|---------|
+| `mb` | `cargo build` |
+| `mr` | `cargo run -- --dev --verbose` |
+| `mt` | `cargo test` |
+| `mc` | `cargo check` |
+| `mw` | `cargo watch -x check` |
+| `ollama-start` | Start Ollama service |
+| `ollama-pull MODEL` | Pull a model |
+
+See `.devcontainer/CODESPACE_README.md` for full guide.
+
+### Option 2: Local Development
+
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Install Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull phi3:mini
+
+# Build
+cd mycel-runtime
+cargo build
+```
+
+---
+
 ## Phase 1: Get It Running (Priority)
 
 ### Step 1: Verify Compilation

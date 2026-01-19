@@ -1,0 +1,88 @@
+{
+  // Rust Analyzer
+  "rust-analyzer.cargo.features": "all",
+  "rust-analyzer.checkOnSave.command": "clippy",
+  "rust-analyzer.inlayHints.parameterHints.enable": true,
+  "rust-analyzer.inlayHints.typeHints.enable": true,
+  "rust-analyzer.linkedProjects": [
+    "./mycel-runtime/Cargo.toml"
+  ],
+  
+  // Editor
+  "editor.formatOnSave": true,
+  "editor.rulers": [100],
+  "editor.tabSize": 4,
+  "editor.insertSpaces": true,
+  
+  // Rust formatting
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true
+  },
+  
+  // TOML formatting
+  "[toml]": {
+    "editor.defaultFormatter": "tamasfe.even-better-toml"
+  },
+  
+  // Python
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.python",
+    "editor.formatOnSave": true
+  },
+  
+  // Files
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "files.exclude": {
+    "**/target": true,
+    "**/.git": true,
+    "**/node_modules": true
+  },
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/.git/objects/**": true
+  },
+  
+  // Search
+  "search.exclude": {
+    "**/target": true,
+    "**/node_modules": true,
+    "**/*.lock": true
+  },
+  
+  // Terminal
+  "terminal.integrated.scrollback": 10000,
+  "terminal.integrated.env.linux": {
+    "RUST_BACKTRACE": "1",
+    "RUST_LOG": "info"
+  },
+  
+  // Spelling
+  "cSpell.words": [
+    "mycel",
+    "ollama",
+    "bittensor",
+    "crdt",
+    "wireguard",
+    "hypercore",
+    "ipfs",
+    "tokio",
+    "serde",
+    "toml",
+    "reqwest",
+    "firejail",
+    "bubblewrap",
+    "wayland",
+    "musl",
+    "runit",
+    "xbps"
+  ],
+  
+  // Git
+  "git.autofetch": true,
+  "git.confirmSync": false,
+  
+  // Don't show certain files
+  "explorer.excludeGitIgnore": false
+}

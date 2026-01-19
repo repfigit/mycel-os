@@ -1,0 +1,133 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build",
+      "type": "cargo",
+      "command": "build",
+      "problemMatcher": ["$rustc"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "options": {
+        "cwd": "${workspaceFolder}/mycel-runtime"
+      }
+    },
+    {
+      "label": "Build Release",
+      "type": "cargo",
+      "command": "build",
+      "args": ["--release"],
+      "problemMatcher": ["$rustc"],
+      "options": {
+        "cwd": "${workspaceFolder}/mycel-runtime"
+      }
+    },
+    {
+      "label": "Check",
+      "type": "cargo",
+      "command": "check",
+      "problemMatcher": ["$rustc"],
+      "options": {
+        "cwd": "${workspaceFolder}/mycel-runtime"
+      }
+    },
+    {
+      "label": "Test",
+      "type": "cargo",
+      "command": "test",
+      "problemMatcher": ["$rustc"],
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "options": {
+        "cwd": "${workspaceFolder}/mycel-runtime"
+      }
+    },
+    {
+      "label": "Clippy",
+      "type": "cargo",
+      "command": "clippy",
+      "problemMatcher": ["$rustc"],
+      "options": {
+        "cwd": "${workspaceFolder}/mycel-runtime"
+      }
+    },
+    {
+      "label": "Run Dev Mode",
+      "type": "shell",
+      "command": "cargo run -- --dev --verbose",
+      "options": {
+        "cwd": "${workspaceFolder}/mycel-runtime"
+      },
+      "problemMatcher": ["$rustc"],
+      "isBackground": true
+    },
+    {
+      "label": "Run Dev Mode (No LLM)",
+      "type": "shell",
+      "command": "cargo run -- --dev --verbose --no-local-llm",
+      "options": {
+        "cwd": "${workspaceFolder}/mycel-runtime"
+      },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "Watch Mode",
+      "type": "shell",
+      "command": "cargo watch -x check",
+      "options": {
+        "cwd": "${workspaceFolder}/mycel-runtime"
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "rust",
+        "fileLocation": ["relative", "${workspaceFolder}/mycel-runtime"],
+        "pattern": {
+          "regexp": "^error\\[E\\d+\\]: (.+)$",
+          "message": 1
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^\\[Running",
+          "endsPattern": "^\\[Finished"
+        }
+      }
+    },
+    {
+      "label": "Clean",
+      "type": "cargo",
+      "command": "clean",
+      "options": {
+        "cwd": "${workspaceFolder}/mycel-runtime"
+      }
+    },
+    {
+      "label": "Start Ollama",
+      "type": "shell",
+      "command": "ollama serve",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Pull Ollama Model (phi3:mini)",
+      "type": "shell",
+      "command": "ollama pull phi3:mini",
+      "problemMatcher": []
+    },
+    {
+      "label": "Test CLI",
+      "type": "shell",
+      "command": "python3 ${workspaceFolder}/tools/mycel-cli.py status",
+      "problemMatcher": []
+    },
+    {
+      "label": "Test IPC Ping",
+      "type": "shell",
+      "command": "echo '{\"type\":\"ping\"}' | nc -U /tmp/mycel-dev.sock",
+      "problemMatcher": []
+    }
+  ]
+}

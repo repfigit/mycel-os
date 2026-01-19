@@ -1,0 +1,30 @@
+{
+  "recommendations": [
+    // Rust (essential)
+    "rust-lang.rust-analyzer",
+    "tamasfe.even-better-toml",
+    "serayuzgur.crates",
+    "vadimcn.vscode-lldb",
+    
+    // Python (for CLI tools)
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    
+    // General development
+    "esbenp.prettier-vscode",
+    "redhat.vscode-yaml",
+    "yzhang.markdown-all-in-one",
+    "streetsidesoftware.code-spell-checker",
+    
+    // Git
+    "eamodio.gitlens",
+    "mhutchie.git-graph",
+    
+    // Docker (for ISO builds)
+    "ms-azuretools.vscode-docker",
+    
+    // Optional: AI assistance
+    "GitHub.copilot"
+  ],
+  "unwantedRecommendations": []
+}

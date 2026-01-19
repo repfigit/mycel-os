@@ -1,42 +1,146 @@
 {
   "name": "Mycel OS Development",
-  "dockerComposeFile": "../docker/docker-compose.yml",
-  "service": "mycel-dev",
-  "workspaceFolder": "/workspace/mycel-os",
   
+  // Use Rust devcontainer as base (includes cargo, rustc, rust-analyzer)
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  
+  // Codespaces machine type recommendation
+  // Minimum: 4-core (for Ollama + compilation)
+  // Recommended: 8-core (faster builds, better Ollama performance)
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "8gb",
+    "storage": "32gb"
+  },
+  
+  // Features to install
+  "features": {
+    // Python for CLI tools and scripting
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.11"
+    },
+    // Docker-in-Docker (for building ISOs)
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest"
+    },
+    // Common utilities
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "configureZshAsDefaultShell": true
+    }
+  },
+  
+  // VS Code customizations
   "customizations": {
     "vscode": {
       "extensions": [
+        // Rust
         "rust-lang.rust-analyzer",
         "tamasfe.even-better-toml",
         "serayuzgur.crates",
         "vadimcn.vscode-lldb",
+        
+        // Python
         "ms-python.python",
+        "ms-python.vscode-pylance",
+        
+        // General
+        "esbenp.prettier-vscode",
         "redhat.vscode-yaml",
-        "esbenp.prettier-vscode"
+        "yzhang.markdown-all-in-one",
+        "streetsidesoftware.code-spell-checker",
+        
+        // Git
+        "eamodio.gitlens",
+        "mhutchie.git-graph",
+        
+        // Docker
+        "ms-azuretools.vscode-docker",
+        
+        // AI assistance (optional - GitHub Copilot)
+        "GitHub.copilot"
       ],
       "settings": {
-        "terminal.integrated.defaultProfile.linux": "bash",
+        // Rust
         "rust-analyzer.cargo.features": "all",
         "rust-analyzer.checkOnSave.command": "clippy",
+        "rust-analyzer.inlayHints.parameterHints.enable": true,
+        "rust-analyzer.inlayHints.typeHints.enable": true,
+        
+        // Editor
         "editor.formatOnSave": true,
+        "editor.rulers": [100],
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        
+        // Files
+        "files.trimTrailingWhitespace": true,
+        "files.insertFinalNewline": true,
         "files.watcherExclude": {
-          "**/target/**": true
+          "**/target/**": true,
+          "**/.git/objects/**": true
+        },
+        
+        // Terminal
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.scrollback": 10000,
+        
+        // Search
+        "search.exclude": {
+          "**/target": true,
+          "**/node_modules": true
         }
       }
+    },
+    "codespaces": {
+      "openFiles": [
+        "CLAUDE.md",
+        "TODO.md"
+      ]
     }
   },
   
+  // Ports to forward
   "forwardPorts": [
-    2222,
-    3000,
-    11434,
-    51820
+    11434,  // Ollama API
+    3000,   // Dev server (if any)
+    8080    // Alternative web port
+  ],
+  "portsAttributes": {
+    "11434": {
+      "label": "Ollama API",
+      "onAutoForward": "silent"
+    },
+    "3000": {
+      "label": "Dev Server",
+      "onAutoForward": "notify"
+    }
+  },
+  
+  // Environment variables
+  "containerEnv": {
+    "RUST_BACKTRACE": "1",
+    "RUST_LOG": "info",
+    "OLLAMA_HOST": "127.0.0.1:11434"
+  },
+  
+  // Run after container is created
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  
+  // Run when Codespace starts (including restarts)
+  "postStartCommand": "bash .devcontainer/post-start.sh",
+  
+  // Run commands as vscode user
+  "remoteUser": "vscode",
+  
+  // Mount configuration
+  "mounts": [
+    // Persist Cargo registry between rebuilds
+    "source=mycel-cargo-cache,target=/usr/local/cargo/registry,type=volume",
+    // Persist Ollama models
+    "source=mycel-ollama-models,target=/home/vscode/.ollama,type=volume"
   ],
   
-  "remoteUser": "mycel",
-  
-  "postCreateCommand": "echo 'Mycel OS development environment ready!'",
-  
-  "features": {}
+  // Lifecycle scripts run as root
+  "postCreateCommand": "bash .devcontainer/post-create.sh"
 }

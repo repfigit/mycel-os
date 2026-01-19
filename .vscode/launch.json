@@ -1,0 +1,93 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug Dev Mode",
+      "cargo": {
+        "args": ["build", "--bin=mycel-runtime", "--package=mycel-runtime"],
+        "filter": {
+          "name": "mycel-runtime",
+          "kind": "bin"
+        }
+      },
+      "args": ["--dev", "--verbose"],
+      "cwd": "${workspaceFolder}/mycel-runtime",
+      "env": {
+        "RUST_BACKTRACE": "1",
+        "RUST_LOG": "debug"
+      }
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug Dev Mode (No LLM)",
+      "cargo": {
+        "args": ["build", "--bin=mycel-runtime", "--package=mycel-runtime"],
+        "filter": {
+          "name": "mycel-runtime",
+          "kind": "bin"
+        }
+      },
+      "args": ["--dev", "--verbose", "--no-local-llm"],
+      "cwd": "${workspaceFolder}/mycel-runtime",
+      "env": {
+        "RUST_BACKTRACE": "1",
+        "RUST_LOG": "debug"
+      }
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug Tests",
+      "cargo": {
+        "args": ["test", "--no-run", "--lib", "--package=mycel-runtime"],
+        "filter": {
+          "name": "mycel-runtime",
+          "kind": "lib"
+        }
+      },
+      "cwd": "${workspaceFolder}/mycel-runtime",
+      "env": {
+        "RUST_BACKTRACE": "1"
+      }
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug Specific Test",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--lib",
+          "--package=mycel-runtime",
+          "${input:testName}"
+        ],
+        "filter": {
+          "name": "mycel-runtime",
+          "kind": "lib"
+        }
+      },
+      "cwd": "${workspaceFolder}/mycel-runtime",
+      "env": {
+        "RUST_BACKTRACE": "1"
+      }
+    },
+    {
+      "type": "lldb",
+      "request": "attach",
+      "name": "Attach to Running Process",
+      "pid": "${command:pickProcess}"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "testName",
+      "type": "promptString",
+      "description": "Test name to debug",
+      "default": "test_"
+    }
+  ]
+}
