@@ -1,0 +1,104 @@
+# Mycel OS Development Environment
+# Based on Void Linux (musl) - the actual target platform
+
+FROM ghcr.io/void-linux/void-musl:latest
+
+LABEL maintainer="Mycel OS Team"
+LABEL description="Mycel OS Development Environment (Void Linux musl)"
+LABEL version="1.0"
+
+# Update and install base development tools
+RUN xbps-install -Syu && xbps-install -y \
+    # Base development
+    base-devel \
+    git \
+    curl \
+    wget \
+    # Editors
+    vim \
+    # SSH
+    openssh \
+    # Rust toolchain
+    rust \
+    cargo \
+    rust-analyzer \
+    # Python (for scripting)
+    python3 \
+    python3-pip \
+    # Wayland development
+    wayland-devel \
+    wayland-protocols \
+    libxkbcommon-devel \
+    mesa-devel \
+    libdrm-devel \
+    libinput-devel \
+    libseat-devel \
+    pixman-devel \
+    # X11 (for XWayland/Wine)
+    libX11-devel \
+    libxcb-devel \
+    xorg-server-xwayland \
+    # GTK/WebKit
+    gtk4-devel \
+    webkit2gtk-devel \
+    # Sandboxing
+    firejail \
+    bubblewrap \
+    # Compression
+    xz \
+    zstd \
+    # Networking
+    iproute2 \
+    wireguard-tools \
+    # Process management
+    htop \
+    # JSON processing
+    jq \
+    # For mklive (ISO building)
+    squashfs-tools \
+    liblz4 \
+    dosfstools \
+    grub-x86_64-efi \
+    # Virtualization
+    qemu \
+    # Certificates
+    ca-certificates \
+    && xbps-remove -Oo && rm -rf /var/cache/xbps
+
+# Install additional Rust tools
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
+RUN cargo install \
+    cargo-watch \
+    just \
+    && rm -rf /usr/local/cargo/registry
+
+# Install Ollama
+RUN curl -fsSL https://ollama.com/install.sh | sh
+
+# Set up SSH
+RUN ssh-keygen -A && \
+    echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config && \
+    echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config && \
+    echo 'root:mycel' | chpasswd
+
+# Create development user
+RUN useradd -m -s /bin/bash -G wheel mycel && \
+    echo 'mycel:mycel' | chpasswd && \
+    echo '%wheel ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+
+# Create directories
+RUN mkdir -p /workspace /home/mycel/.config /var/run/sshd && \
+    chown -R mycel:mycel /workspace /home/mycel
+
+# Copy entrypoint
+COPY docker/entrypoint-mycel.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Ports
+EXPOSE 22 11434 3000 51820/udp
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]

@@ -1,0 +1,127 @@
+# Mycel OS Development Environment
+# Based on Void Linux (musl) - the actual target platform
+
+version: '3.8'
+
+services:
+  # ============================================
+  # Primary Development Environment
+  # Void Linux musl - matches target platform
+  # ============================================
+  mycel-dev:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.void
+    container_name: mycel-dev
+    hostname: mycel-dev
+    
+    stdin_open: true
+    tty: true
+    
+    volumes:
+      # Mount project source
+      - ..:/workspace/mycel-os
+      # Persist Cargo cache
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      # Persist Ollama models
+      - ollama-models:/root/.ollama
+      # Persist build artifacts
+      - build-output:/workspace/mycel-os/output
+    
+    ports:
+      - "2222:22"         # SSH
+      - "11434:11434"     # Ollama API
+      - "3000:3000"       # Dev server
+      - "51820:51820/udp" # WireGuard (mesh)
+    
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - RUST_BACKTRACE=1
+      - RUST_LOG=info
+    
+    # Needed for ISO building (loop devices, etc.)
+    privileged: true
+    
+    deploy:
+      resources:
+        limits:
+          memory: 16G
+        reservations:
+          memory: 4G
+
+  # ============================================
+  # ISO Build Environment
+  # Requires privileged for loop devices
+  # ============================================
+  mycel-builder:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.void
+    container_name: mycel-builder
+    hostname: mycel-builder
+    profiles:
+      - build
+    
+    volumes:
+      - ..:/workspace/mycel-os
+      - build-output:/workspace/mycel-os/output
+    
+    # Required for mklive
+    privileged: true
+    
+    command: ["./scripts/build-mycel-iso.sh"]
+
+  # ============================================
+  # QEMU Test Environment
+  # For testing built ISOs
+  # ============================================
+  mycel-vm:
+    image: tianon/qemu:latest
+    container_name: mycel-vm
+    hostname: mycel-vm
+    profiles:
+      - test
+    
+    volumes:
+      - build-output:/iso:ro
+      - vm-disks:/disks
+    
+    ports:
+      - "5900:5900"   # VNC
+      - "2223:22"     # SSH (forwarded from VM)
+    
+    devices:
+      - /dev/kvm:/dev/kvm
+    
+    command: >
+      qemu-system-x86_64
+      -enable-kvm
+      -m 4G
+      -smp 2
+      -cdrom /iso/mycel-os-latest.iso
+      -hda /disks/mycel-test.qcow2
+      -vnc :0
+      -boot d
+
+# ============================================
+# Named Volumes
+# ============================================
+volumes:
+  cargo-cache:
+    name: mycel-cargo-cache
+  cargo-git:
+    name: mycel-cargo-git
+  ollama-models:
+    name: mycel-ollama-models
+  build-output:
+    name: mycel-build-output
+  vm-disks:
+    name: mycel-vm-disks
+
+# ============================================
+# Networks
+# ============================================
+networks:
+  default:
+    name: mycel-network

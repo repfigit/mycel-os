@@ -1,0 +1,42 @@
+{
+  "name": "Mycel OS Development",
+  "dockerComposeFile": "../docker/docker-compose.yml",
+  "service": "mycel-dev",
+  "workspaceFolder": "/workspace/mycel-os",
+  
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "serayuzgur.crates",
+        "vadimcn.vscode-lldb",
+        "ms-python.python",
+        "redhat.vscode-yaml",
+        "esbenp.prettier-vscode"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "rust-analyzer.cargo.features": "all",
+        "rust-analyzer.checkOnSave.command": "clippy",
+        "editor.formatOnSave": true,
+        "files.watcherExclude": {
+          "**/target/**": true
+        }
+      }
+    }
+  },
+  
+  "forwardPorts": [
+    2222,
+    3000,
+    11434,
+    51820
+  ],
+  
+  "remoteUser": "mycel",
+  
+  "postCreateCommand": "echo 'Mycel OS development environment ready!'",
+  
+  "features": {}
+}

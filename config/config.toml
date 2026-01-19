@@ -1,0 +1,94 @@
+# Mycel OS Configuration
+# The intelligent network beneath everything.
+
+[system]
+# Node identification
+hostname = "mycel"
+node_name = "default"
+
+# Paths
+data_dir = "/var/lib/mycel"
+cache_dir = "/var/cache/mycel"
+config_dir = "/etc/mycel"
+
+[ai]
+# Local AI (Ollama)
+local_enabled = true
+local_model = "phi3:medium"
+local_url = "http://localhost:11434"
+local_timeout_secs = 120
+
+# Cloud AI (Anthropic Claude)
+cloud_enabled = false
+cloud_api_key = ""  # Set via ANTHROPIC_API_KEY env var
+cloud_model = "claude-sonnet-4-20250514"
+cloud_timeout_secs = 60
+
+# Routing preferences
+prefer_local = true
+escalate_threshold = 0.7  # Confidence below this triggers cloud
+
+[executor]
+# Sandboxed code execution
+enabled = true
+sandbox_type = "firejail"  # or "bubblewrap"
+timeout_secs = 30
+max_memory_mb = 512
+allowed_languages = ["python", "javascript", "bash"]
+
+[collective]
+# Decentralized network participation
+enabled = false
+
+# NEAR Protocol (coordination, registry, payments)
+near_network = "testnet"  # or "mainnet"
+near_account = ""
+near_contract = "patterns.mycel.testnet"
+
+# Bittensor (AI evaluation, rewards)
+bittensor_network = "finney"  # or "test"
+bittensor_coldkey = ""
+bittensor_hotkey = ""
+bittensor_subnet = 0  # TBD
+
+# IPFS (pattern storage)
+ipfs_enabled = false
+ipfs_api = "/ip4/127.0.0.1/tcp/5001"
+
+# Privacy settings
+share_patterns = false  # Opt-in to share learned patterns
+differential_privacy_epsilon = 1.0
+
+[mesh]
+# Personal device mesh (sync between your devices)
+enabled = false
+
+# WireGuard mesh network
+interface = "mycel0"
+listen_port = 51820
+
+# Sync settings
+sync_config = true
+sync_patterns = true
+sync_documents = false  # Opt-in
+sync_ai_context = true
+
+# Discovery
+mdns_enabled = true  # Local network discovery
+relay_enabled = true  # For NAT traversal
+
+[ui]
+# Interface settings
+default_layout = "conversation"
+theme = "dark"
+font_family = "monospace"
+
+# Evolution settings
+learn_from_usage = true
+adopt_collective_patterns = false  # Opt-in
+
+[logging]
+level = "info"  # debug, info, warn, error
+file = "/var/log/mycel/runtime.log"
+max_size_mb = 100
+max_files = 5

@@ -1,0 +1,81 @@
+[package]
+name = "mycel-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Mycel OS Runtime - The intelligent network beneath everything"
+license = "MIT"
+repository = "https://github.com/mycel-os/mycel"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# HTTP client for cloud API
+reqwest = { version = "0.11", features = ["json", "stream"] }
+
+# JSON handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Local LLM interface (llama.cpp bindings)
+llama-cpp-rs = { version = "0.3", optional = true }
+
+# Alternative: HTTP interface to Ollama
+# (simpler to start with)
+
+# Command line parsing
+clap = { version = "4.4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# File watching
+notify = "6.1"
+
+# Template rendering for UI generation
+minijinja = "1.0"
+
+# Sandboxing (Linux namespaces)
+nix = { version = "0.27", features = ["process", "sched", "mount"] }
+
+# IPC
+interprocess = "1.2"
+
+# UUID generation
+uuid = { version = "1.6", features = ["v4"] }
+
+# Datetime
+chrono = { version = "0.4", features = ["serde"] }
+
+# Configuration
+config = "0.14"
+toml = "0.8"
+
+# Directory paths
+dirs = "5.0"
+
+# HTML escaping
+html-escape = "0.2"
+
+# Async channels
+async-channel = "2.1"
+
+# Collective intelligence dependencies
+sha256 = "1.4"
+base64 = "0.21"
+regex = "1.10"
+rand = "0.8"
+
+[features]
+default = ["ollama"]
+ollama = []
+llama-cpp = ["llama-cpp-rs"]
+
+[profile.release]
+opt-level = 3
+lto = true
