@@ -1,6 +1,6 @@
-# Getting Started with Clay OS
+# Getting Started with Mycel OS
 
-This guide walks you through setting up and running Clay OS in development mode.
+This guide walks you through setting up and running Mycel OS in development mode.
 
 ## Prerequisites
 
@@ -16,8 +16,8 @@ You'll need:
 ### 1. Clone and Build
 
 ```bash
-git clone https://github.com/yourusername/clay-os
-cd clay-os
+git clone https://github.com/yourusername/mycel-os
+cd mycel-os
 ```
 
 ### 2. Install Ollama (Local LLM)
@@ -43,7 +43,7 @@ export ANTHROPIC_API_KEY="sk-ant-your-key-here"
 ```
 
 This will:
-- Build the Clay Runtime
+- Build the Mycel Runtime
 - Start Ollama if not running
 - Launch an interactive CLI
 
@@ -52,7 +52,7 @@ This will:
 ```
 clay> Hello, what can you do?
 
-I'm Clay, the AI at the heart of Clay OS. I can help you with:
+I'm Clay, the AI at the heart of Mycel OS. I can help you with:
 
 - Answering questions and explaining concepts
 - Writing and executing code on-the-fly
@@ -101,9 +101,9 @@ for hash_val, files in dupes.items():
 
 ## Understanding the Architecture
 
-### The Clay Runtime
+### The Mycel Runtime
 
-The heart of Clay OS is the **Clay Runtime** (`clay-runtime`), a Rust daemon that:
+The heart of Mycel OS is the **Mycel Runtime** (`clay-runtime`), a Rust daemon that:
 - Runs a local LLM for fast, private responses
 - Routes complex queries to cloud AI when needed
 - Generates and executes code in a sandbox
@@ -111,7 +111,7 @@ The heart of Clay OS is the **Clay Runtime** (`clay-runtime`), a Rust daemon tha
 
 ### Local vs Cloud AI
 
-Clay OS uses a hybrid approach:
+Mycel OS uses a hybrid approach:
 
 | Task | Where it runs | Why |
 |------|--------------|-----|
@@ -125,7 +125,7 @@ You control this with configuration and can run fully local (no cloud) or fully 
 
 ### The Fluid UI Concept
 
-Unlike traditional window managers, Clay OS generates UI on-demand:
+Unlike traditional window managers, Mycel OS generates UI on-demand:
 
 ```
 clay> I need to compare these three documents side by side
@@ -163,20 +163,20 @@ anthropic_api_key = ""
 
 ## Building a Full OS Image
 
-To create a bootable Clay OS image:
+To create a bootable Mycel OS image:
 
 ```bash
 sudo ./scripts/build-image.sh
 ```
 
-This creates `build/clay-os.img` which can be:
+This creates `build/mycel-os.img` which can be:
 - Run in QEMU: `./scripts/run-vm.sh`
-- Written to USB: `sudo dd if=build/clay-os.img of=/dev/sdX bs=4M`
+- Written to USB: `sudo dd if=build/mycel-os.img of=/dev/sdX bs=4M`
 
 ## Project Structure
 
 ```
-clay-os/
+mycel-os/
 ├── clay-runtime/        # Core Rust daemon
 │   └── src/
 │       ├── main.rs      # Entry point

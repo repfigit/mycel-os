@@ -1,4 +1,4 @@
-# Clay OS Quick Reference
+# Mycel OS Quick Reference
 
 ## Development Environment Setup
 
@@ -6,8 +6,8 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/clay-os
-cd clay-os
+git clone https://github.com/yourusername/mycel-os
+cd mycel-os
 
 # Start CLI development environment
 ./scripts/setup-dev.sh
@@ -22,7 +22,7 @@ cd clay-os
 ### Option 2: VS Code Dev Container
 
 1. Install "Dev Containers" extension
-2. Open clay-os folder
+2. Open mycel-os folder
 3. Click "Reopen in Container" when prompted
 
 ### Option 3: Manual Setup
@@ -35,8 +35,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 curl -fsSL https://ollama.com/install.sh | sh
 ollama pull phi3:medium
 
-# Build Clay OS
-cd clay-os
+# Build Mycel OS
+cd mycel-os
 cargo build --release
 ```
 
@@ -144,7 +144,7 @@ winecfg
 ## Project Structure
 
 ```
-clay-os/
+mycel-os/
 ├── clay-runtime/          # Core Rust daemon
 │   └── src/
 │       ├── main.rs        # Entry point

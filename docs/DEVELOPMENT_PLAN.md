@@ -1,8 +1,8 @@
-# Clay OS Development Plan
+# Mycel OS Development Plan
 
 ## Executive Summary
 
-This document outlines a phased development plan for Clay OS, from a Docker-based development environment to a fully realized AI-native operating system with an evolving graphical interface driven by collective intelligence.
+This document outlines a phased development plan for Mycel OS, from a Docker-based development environment to a fully realized AI-native operating system with an evolving graphical interface driven by collective intelligence.
 
 **Timeline**: 18-24 months to production-ready release
 **Team Size**: 3-5 core developers initially, scaling to 10-15
@@ -21,7 +21,7 @@ This document outlines a phased development plan for Clay OS, from a Docker-base
 
 #### Docker Development Environment
 ```
-clay-os-dev/
+mycel-os-dev/
 ├── docker/
 │   ├── Dockerfile.dev          # Full dev environment
 │   ├── Dockerfile.runtime      # Minimal runtime
@@ -62,7 +62,7 @@ For Windows compatibility, we'll use a layered approach:
 ## Phase 1: Core Runtime (Weeks 5-12)
 
 ### Goals
-- Stable Clay Runtime daemon
+- Stable Mycel Runtime daemon
 - Working local LLM integration
 - Basic intent parsing and execution
 - Sandboxed code execution
@@ -70,7 +70,7 @@ For Windows compatibility, we'll use a layered approach:
 ### Milestones
 
 #### Week 5-6: Runtime Foundation
-- [ ] Complete Clay Runtime build system
+- [ ] Complete Mycel Runtime build system
 - [ ] Implement configuration management
 - [ ] Create systemd service files
 - [ ] Write integration tests
@@ -149,7 +149,7 @@ $ clay "convert CSV to JSON"
 
 ---
 
-## Phase 3: Basic GUI - "Clay Shell" (Weeks 21-32)
+## Phase 3: Basic GUI - "Mycel Shell" (Weeks 21-32)
 
 ### Goals
 - Minimal Wayland compositor
@@ -175,7 +175,7 @@ $ clay "convert CSV to JSON"
 │  │  └─────────┘  └─────────┘  └─────────┘  └─────────┘    │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │                   Clay Runtime (IPC)                     │    │
+│  │                   Mycel Runtime (IPC)                     │    │
 │  └─────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -345,7 +345,7 @@ The GUI isn't static - it evolves based on:
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │                    Clay Shell (Wayland)                   │   │
+│  │                    Mycel Shell (Wayland)                   │   │
 │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐ │   │
 │  │  │ Native   │  │ Wine App │  │ Wine App │  │ Native   │ │   │
 │  │  │ Surface  │  │ (Notepad)│  │ (Excel)  │  │ Surface  │ │   │
@@ -393,7 +393,7 @@ The GUI isn't static - it evolves based on:
 ```
 User: "I need to run Excel"
 
-Clay: I'll set up Microsoft Excel for you. I found that Excel 2019 
+Mycel: I'll set up Microsoft Excel for you. I found that Excel 2019 
       works well with Wine. Setting up now...
       
       [Progress: Installing dependencies...]
@@ -402,7 +402,7 @@ Clay: I'll set up Microsoft Excel for you. I found that Excel 2019
       
       Done! Excel is ready. Would you like me to open it?
 
-[Excel window appears integrated into Clay Shell, 
+[Excel window appears integrated into Mycel Shell, 
  sharing clipboard with native apps]
 ```
 
@@ -468,7 +468,7 @@ Clay: I'll set up Microsoft Excel for you. I found that Excel 2019
 
 | Role | Count | Focus |
 |------|-------|-------|
-| Runtime Engineer | 2 | Clay Runtime, Rust |
+| Runtime Engineer | 2 | Mycel Runtime, Rust |
 | Blockchain Engineer | 1 | NEAR, Bittensor |
 | Graphics Engineer | 1 | Compositor, GPU |
 | ML Engineer | 1 | LLM integration, patterns |

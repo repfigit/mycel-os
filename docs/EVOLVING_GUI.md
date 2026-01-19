@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Clay OS graphical interface is not designed - it **emerges**. Starting from a minimal conversational interface, the GUI evolves based on:
+The Mycel OS graphical interface is not designed - it **emerges**. Starting from a minimal conversational interface, the GUI evolves based on:
 
 1. **Personal usage patterns** - What you do frequently becomes easier to access
 2. **Collective intelligence** - UI patterns that work well for others spread to your instance
@@ -560,7 +560,7 @@ impl InteractionLogger {
 ```
 ┌──────────────────┬─────────────────────┐
 │  Conversation    │  Last Project       │
-│                  │  ~/code/clay-os     │
+│                  │  ~/code/mycel-os     │
 │  Good morning!   │                     │
 │                  │  Recent files:      │
 │  Continue where  │  - main.rs          │

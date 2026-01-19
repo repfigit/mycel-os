@@ -1,8 +1,8 @@
-# Clay OS Development Plan v2.0
+# Mycel OS Development Plan v2.0
 
 ## Correcting Course
 
-The previous plan mistakenly used Ubuntu as a base. Clay OS is not an app layer on top of an existing distro - it's a **fork of a foundational operating system** where the AI becomes the OS itself.
+The previous plan mistakenly used Ubuntu as a base. Mycel OS is not an app layer on top of an existing distro - it's a **fork of a foundational operating system** where the AI becomes the OS itself.
 
 This document presents a researched, realistic plan.
 
@@ -114,16 +114,16 @@ This document presents a researched, realistic plan.
 
 ```
 Developer Machine              Docker Container              Target
-(Windows/macOS/Linux)          (Void Linux)                  (Clay OS)
+(Windows/macOS/Linux)          (Void Linux)                  (Mycel OS)
       │                              │                            │
-      │   Code editing               │   Builds Clay Runtime      │
+      │   Code editing               │   Builds Mycel Runtime      │
       │   Git operations             │   Runs tests               │
       │                              │   Cross-compiles           │
       │                              │                            │
       └──────────────────────────────┼────────────────────────────┘
                                      │
-                              Produces: clay-os.iso
-                              Produces: clay-os.img
+                              Produces: mycel-os.iso
+                              Produces: mycel-os.img
 ```
 
 ---
@@ -132,7 +132,7 @@ Developer Machine              Docker Container              Target
 
 ### Phase 0: Foundation (Weeks 1-6)
 
-**Goal:** Bootable Void Linux fork with Clay branding
+**Goal:** Bootable Void Linux fork with Mycel branding
 
 #### Week 1-2: Void Linux Deep Dive
 - [ ] Install Void Linux (musl) on test hardware
@@ -143,28 +143,28 @@ Developer Machine              Docker Container              Target
 
 #### Week 3-4: Build Infrastructure
 - [ ] Set up void-packages fork
-- [ ] Create clay-os repository structure
+- [ ] Create mycel-os repository structure
 - [ ] Write mklive scripts for ISO generation
 - [ ] Create QEMU/KVM test environment
 - [ ] Establish CI/CD for ISO builds
 
 #### Week 5-6: Base Image
-- [ ] Minimal bootable Clay OS image
+- [ ] Minimal bootable Mycel OS image
 - [ ] Custom branding (boot, login)
 - [ ] Pre-installed: Rust toolchain, Ollama
 - [ ] Basic networking and SSH
 - [ ] Documentation: how to boot and test
 
-**Deliverable:** `clay-os-0.1.0-base.iso` - Bootable, minimal, Void-derived
+**Deliverable:** `mycel-os-0.1.0-base.iso` - Bootable, minimal, Void-derived
 
 ---
 
-### Phase 1: Clay Runtime (Weeks 7-14)
+### Phase 1: Mycel Runtime (Weeks 7-14)
 
 **Goal:** Working AI daemon with CLI interface
 
 #### Week 7-9: Core Runtime
-- [ ] Clay Runtime daemon (Rust)
+- [ ] Mycel Runtime daemon (Rust)
 - [ ] runit service integration
 - [ ] Configuration system (TOML)
 - [ ] Logging and diagnostics
@@ -184,7 +184,7 @@ Developer Machine              Docker Container              Target
 - [ ] Basic conversation flow
 - [ ] Context persistence
 
-**Deliverable:** `clay-os-0.2.0-runtime.iso` - Boot, login, use `clay` CLI
+**Deliverable:** `mycel-os-0.2.0-runtime.iso` - Boot, login, use `clay` CLI
 
 ---
 
@@ -204,7 +204,7 @@ Developer Machine              Docker Container              Target
 | FEX-Emu | x86 on ARM64 | For future ARM support |
 
 #### Week 15-17: Wine Integration
-- [ ] Package Wine 10.x for Clay OS
+- [ ] Package Wine 10.x for Mycel OS
 - [ ] Package DXVK and VKD3D
 - [ ] Create default Wine prefix
 - [ ] Test common applications
@@ -224,7 +224,7 @@ Developer Machine              Docker Container              Target
 - [ ] System tray integration
 - [ ] Error handling and recovery
 
-**Deliverable:** `clay-os-0.3.0-windows.iso` - Run Windows apps via conversation
+**Deliverable:** `mycel-os-0.3.0-windows.iso` - Run Windows apps via conversation
 
 ---
 
@@ -241,7 +241,7 @@ Developer Machine              Docker Container              Target
 
 #### Week 27-30: Bittensor Integration
 - [ ] Bittensor SDK integration
-- [ ] Clay subnet specification
+- [ ] Mycel subnet specification
 - [ ] Miner implementation
 - [ ] Validator implementation
 - [ ] Testnet deployment
@@ -252,7 +252,7 @@ Developer Machine              Docker Container              Target
 - [ ] Discovery and ranking
 - [ ] Federated learning pipeline
 
-**Deliverable:** `clay-os-0.4.0-collective.iso` - Connected to decentralized networks
+**Deliverable:** `mycel-os-0.4.0-collective.iso` - Connected to decentralized networks
 
 ---
 
@@ -280,7 +280,7 @@ Developer Machine              Docker Container              Target
 - [ ] Cross-instance learning
 - [ ] User override controls
 
-**Deliverable:** `clay-os-0.5.0-gui.iso` - Full graphical interface
+**Deliverable:** `mycel-os-0.5.0-gui.iso` - Full graphical interface
 
 ---
 
@@ -306,7 +306,7 @@ Developer Machine              Docker Container              Target
 - [ ] Website and downloads
 - [ ] Community infrastructure
 
-**Deliverable:** `clay-os-1.0.0.iso` - Production release
+**Deliverable:** `mycel-os-1.0.0.iso` - Production release
 
 ---
 
@@ -358,21 +358,21 @@ qemu-system-x86_64 \
     -boot d
 ```
 
-### Building Clay OS Images
+### Building Mycel OS Images
 
 ```bash
 # Clone void-mklive (Void's ISO builder)
 git clone https://github.com/void-linux/void-mklive
 cd void-mklive
 
-# Customize for Clay OS
+# Customize for Mycel OS
 # - Add clay-runtime package
 # - Add ollama
 # - Add branding
 # - Configure default services
 
 # Build ISO
-./mklive.sh -a x86_64-musl -p "clay-runtime ollama ..." -o clay-os.iso
+./mklive.sh -a x86_64-musl -p "clay-runtime ollama ..." -o mycel-os.iso
 ```
 
 ---
@@ -416,7 +416,7 @@ compositor = "clay-shell"
 default_layout = "conversation"
 ```
 
-The Clay Runtime can read, modify, and apply this configuration.
+The Mycel Runtime can read, modify, and apply this configuration.
 
 ### 3. Windows Support Strategy
 
@@ -438,7 +438,7 @@ User: "I need to use Excel"
 └─────────────────────────────────────────┘
       │
       ▼
-[Excel window appears in Clay Shell]
+[Excel window appears in Mycel Shell]
 ```
 
 ### 4. Evolving GUI Through Collective Intelligence
@@ -531,7 +531,7 @@ User: "I need to use Excel"
 1. **Hardware targets**: x86_64 only? ARM64 later?
 2. **Funding model**: Grants? VC? Community?
 3. **Governance**: How are protocol decisions made?
-4. **Trademark**: "Clay OS" availability?
+4. **Trademark**: "Mycel OS" availability?
 5. **Legal**: License for collective patterns?
 
 ---

@@ -1,4 +1,4 @@
-//! Configuration for Clay Runtime
+//! Configuration for Mycel Runtime
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -61,18 +61,18 @@ fn default_cloud_model() -> String {
 
 fn default_context_path() -> String {
     dirs::data_dir()
-        .map(|p| p.join("clay").to_string_lossy().to_string())
-        .unwrap_or_else(|| "/var/lib/clay".to_string())
+        .map(|p| p.join("mycel").to_string_lossy().to_string())
+        .unwrap_or_else(|| "/var/lib/mycel".to_string())
 }
 
 fn default_code_path() -> String {
     dirs::cache_dir()
         .map(|p| p.join("clay/code").to_string_lossy().to_string())
-        .unwrap_or_else(|| "/tmp/clay/code".to_string())
+        .unwrap_or_else(|| "/tmp/mycel/code".to_string())
 }
 
 fn default_ipc_path() -> String {
-    "/tmp/clay.sock".to_string()
+    "/tmp/mycel.sock".to_string()
 }
 
 fn default_true() -> bool {
@@ -123,9 +123,9 @@ impl MycelConfig {
 
         // Dev mode adjustments
         if dev_mode {
-            config.context_path = "./clay-data".to_string();
-            config.code_path = "./clay-code".to_string();
-            config.ipc_socket_path = "/tmp/clay-dev.sock".to_string();
+            config.context_path = "./mycel-data".to_string();
+            config.code_path = "./mycel-code".to_string();
+            config.ipc_socket_path = "/tmp/mycel-dev.sock".to_string();
         }
 
         Ok(config)

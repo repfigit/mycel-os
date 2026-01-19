@@ -1,16 +1,16 @@
-# Clay OS Collective Intelligence Layer
+# Mycel OS Collective Intelligence Layer
 
 ## Vision
 
-Individual Clay OS instances are smart. But what if they could learn from each other?
+Individual Mycel OS instances are smart. But what if they could learn from each other?
 
 Imagine:
-- Your Clay OS figures out an elegant way to parse legal documents
+- Your Mycel OS figures out an elegant way to parse legal documents
 - That pattern propagates to other instances who need it
 - You earn tokens for contributing useful knowledge
 - The collective gets smarter without any central authority
 
-This document explores embedding **NEAR Protocol** and **Bittensor** deep into Clay OS to create a decentralized collective intelligence.
+This document explores embedding **NEAR Protocol** and **Bittensor** deep into Mycel OS to create a decentralized collective intelligence.
 
 ## The Three-Layer Intelligence Model
 
@@ -22,7 +22,7 @@ This document explores embedding **NEAR Protocol** and **Bittensor** deep into C
 │  │   - Distributed model inference                                  │   │
 │  │   - Pattern marketplace                                          │   │
 │  │   - Incentivized knowledge sharing                               │   │
-│  │   - Subnet for Clay-specific intelligence                        │   │
+│  │   - Subnet for Mycel-specific intelligence                        │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
 │  │                       NEAR Protocol                              │   │
@@ -62,9 +62,9 @@ This document explores embedding **NEAR Protocol** and **Bittensor** deep into C
 
 ### NEAR Protocol - The Coordination Layer
 
-NEAR provides the infrastructure for Clay instances to coordinate:
+NEAR provides the infrastructure for Mycel instances to coordinate:
 
-| Capability | Use in Clay OS |
+| Capability | Use in Mycel OS |
 |------------|----------------|
 | Account abstraction | Human-readable identities (alice.clay.near) |
 | Fast finality (~1s) | Real-time micropayments for compute |
@@ -76,7 +76,7 @@ NEAR provides the infrastructure for Clay instances to coordinate:
 
 Bittensor provides the distributed AI infrastructure:
 
-| Capability | Use in Clay OS |
+| Capability | Use in Mycel OS |
 |------------|----------------|
 | Incentivized inference | Reward useful model responses |
 | Subnet architecture | Clay-specific AI subnet |
@@ -88,7 +88,7 @@ Bittensor provides the distributed AI infrastructure:
 
 ### 1. Pattern Sharing System
 
-Clay OS instances learn "patterns" - reusable solutions to problems:
+Mycel OS instances learn "patterns" - reusable solutions to problems:
 
 ```rust
 struct LearnedPattern {
@@ -272,20 +272,20 @@ impl ReputationSystem {
 
 #### Clay Subnet Architecture
 
-Clay OS would operate its own Bittensor subnet optimized for:
+Mycel OS would operate its own Bittensor subnet optimized for:
 - Pattern evaluation
 - Federated model improvement
 - Specialized inference
 
 ```python
-# Bittensor subnet for Clay OS collective intelligence
+# Bittensor subnet for Mycel OS collective intelligence
 
 class ClayMiner(bt.Miner):
     """
-    Miners in the Clay subnet provide:
+    Miners in the Mycel subnet provide:
     1. Pattern evaluation - Test if a pattern works for a query
     2. Pattern generation - Create new patterns from successful interactions
-    3. Model inference - Run specialized models for Clay queries
+    3. Model inference - Run specialized models for Mycel queries
     """
     
     def __init__(self):
@@ -348,7 +348,7 @@ class ClayMiner(bt.Miner):
 
 class ClayValidator(bt.Validator):
     """
-    Validators in the Clay subnet:
+    Validators in the Mycel subnet:
     1. Verify pattern quality through testing
     2. Score miner responses
     3. Maintain pattern quality standards
@@ -541,7 +541,7 @@ impl FederatedLearningClient {
 | Pattern users | Find best solutions | Reputation system surfaces quality |
 | Miners | Provide good evaluations | TAO rewards for accurate scoring |
 | Validators | Maintain quality | Stake slashing for bad validation |
-| Clay OS operators | Run network infrastructure | Transaction fees + mining rewards |
+| Mycel OS operators | Run network infrastructure | Transaction fees + mining rewards |
 
 ### 6. Discovery and Matching
 
@@ -612,7 +612,7 @@ impl PatternDiscovery {
 ## Implementation Roadmap
 
 ### Phase 1: Foundation (Months 1-3)
-- [ ] NEAR wallet integration in Clay Runtime
+- [ ] NEAR wallet integration in Mycel Runtime
 - [ ] Basic pattern serialization format
 - [ ] Local pattern storage and indexing
 - [ ] Simple pattern sharing (manual export/import)
@@ -625,11 +625,11 @@ impl PatternDiscovery {
 - [ ] Add payment flows
 
 ### Phase 3: Bittensor Subnet (Months 7-10)
-- [ ] Design Clay subnet architecture
+- [ ] Design Mycel subnet architecture
 - [ ] Implement miner logic
 - [ ] Implement validator logic
 - [ ] Deploy subnet to testnet
-- [ ] Integrate with Clay Runtime
+- [ ] Integrate with Mycel Runtime
 
 ### Phase 4: Privacy & Scale (Months 11-14)
 - [ ] Differential privacy for patterns
@@ -677,4 +677,4 @@ Manipulating token economics for profit:
 
 ---
 
-*This architecture enables Clay OS instances to form a global brain - each contributing, each benefiting, no central point of control.*
+*This architecture enables Mycel OS instances to form a global brain - each contributing, each benefiting, no central point of control.*

@@ -120,7 +120,7 @@ Guidelines:
     /// Generate a simple text response
     pub async fn generate_response(&self, input: &str, context: &Context) -> Result<String> {
         let prompt = format!(
-            r#"You are Clay, the AI assistant embedded in Mycel OS.
+            r#"You are Mycel, the AI assistant embedded in Mycel OS.
 You are helpful, concise, and focused on getting things done.
 
 Context:
@@ -192,7 +192,7 @@ Respond with JSON only:
     /// Request from cloud AI (for complex tasks)
     pub async fn cloud_request(&self, input: &str, context: &Context) -> Result<String> {
         let prompt = format!(
-            r#"You are Clay, an AI assistant embedded in Mycel OS.
+            r#"You are Mycel, an AI assistant embedded in Mycel OS.
 
 Context:
 - Working directory: {}

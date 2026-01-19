@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use super::patterns::{Pattern, PatternId};
 
-/// Bittensor client for Clay OS
+/// Bittensor client for Mycel OS
 #[derive(Clone)]
 pub struct BittensorClient {
     config: BittensorConfig,
@@ -91,7 +91,7 @@ impl BittensorClient {
         
         // Query miners for evaluation
         let responses = self.query_miners(
-            ClaySynapse::EvaluatePattern(request),
+            MycelSynapse::EvaluatePattern(request),
             self.config.evaluation_timeout_secs,
         ).await?;
         
@@ -123,7 +123,7 @@ impl BittensorClient {
         };
         
         let responses = self.query_miners(
-            ClaySynapse::Inference(request),
+            MycelSynapse::Inference(request),
             self.config.inference_timeout_secs,
         ).await?;
         
@@ -146,7 +146,7 @@ impl BittensorClient {
         };
         
         let responses = self.query_miners(
-            ClaySynapse::SemanticSearch(request),
+            MycelSynapse::SemanticSearch(request),
             self.config.search_timeout_secs,
         ).await?;
         
@@ -256,7 +256,7 @@ impl BittensorClient {
     
     async fn query_miners(
         &self,
-        synapse: ClaySynapse,
+        synapse: MycelSynapse,
         timeout_secs: u64,
     ) -> Result<Vec<MinerResponse>> {
         let metagraph = self.get_metagraph().await?;
@@ -339,7 +339,7 @@ impl BittensorClient {
         let mut total_weight = 0.0;
         
         for resp in &responses {
-            if let ClaySynapseResult::Evaluation(eval) = &resp.result {
+            if let MycelSynapseResult::Evaluation(eval) = &resp.result {
                 let weight = resp.stake_weight;
                 total_score += eval.score * weight;
                 total_weight += weight;
@@ -361,7 +361,7 @@ impl BittensorClient {
         let mut best: Option<(f64, InferenceResult)> = None;
         
         for resp in responses {
-            if let ClaySynapseResult::Inference(result) = resp.result {
+            if let MycelSynapseResult::Inference(result) = resp.result {
                 let score = result.quality_score * resp.stake_weight;
                 
                 if best.is_none() || score > best.as_ref().unwrap().0 {
@@ -382,7 +382,7 @@ impl BittensorClient {
         let mut all_matches: Vec<SemanticMatch> = Vec::new();
         
         for resp in responses {
-            if let ClaySynapseResult::SemanticSearch(matches) = resp.result {
+            if let MycelSynapseResult::SemanticSearch(matches) = resp.result {
                 all_matches.extend(matches);
             }
         }
@@ -399,7 +399,7 @@ impl BittensorClient {
 /// Bittensor configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BittensorConfig {
-    /// Subnet UID for Clay
+    /// Subnet UID for Mycel
     pub subnet_uid: u16,
     
     /// API endpoint URL
@@ -489,7 +489,7 @@ pub struct AxonInfo {
 // Synapse types
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ClaySynapse {
+pub enum MycelSynapse {
     EvaluatePattern(EvaluationRequest),
     Inference(InferenceRequest),
     SemanticSearch(SemanticSearchRequest),
@@ -520,19 +520,19 @@ pub struct SemanticSearchRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MinerRequest {
-    pub synapse: ClaySynapse,
+    pub synapse: MycelSynapse,
     pub timeout: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MinerResponse {
-    pub result: ClaySynapseResult,
+    pub result: MycelSynapseResult,
     pub process_time: f64,
     pub stake_weight: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ClaySynapseResult {
+pub enum MycelSynapseResult {
     Evaluation(EvaluationResponse),
     Inference(InferenceResult),
     SemanticSearch(Vec<SemanticMatch>),

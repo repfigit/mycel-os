@@ -1,8 +1,8 @@
-# Clay OS - Architecture Document
+# Mycel OS - Architecture Document
 
 ## Vision
 
-Clay OS reimagines the operating system as a fluid, AI-driven experience. Instead of fixed applications with rigid interfaces, users interact with a local AI that dynamically generates interfaces, writes programs on-the-fly, and seamlessly escalates to cloud AI when deeper reasoning is needed.
+Mycel OS reimagines the operating system as a fluid, AI-driven experience. Instead of fixed applications with rigid interfaces, users interact with a local AI that dynamically generates interfaces, writes programs on-the-fly, and seamlessly escalates to cloud AI when deeper reasoning is needed.
 
 The metaphor is **clay, not windows** - you shape your computing experience through conversation and intent, not by navigating menus and clicking buttons.
 
@@ -143,9 +143,9 @@ Decides when to use local vs cloud AI:
 
 ## File System Design
 
-### AI-Aware File System (ClayFS)
+### AI-Aware File System (MycelFS)
 
-Traditional hierarchical filesystems don't fit the fluid paradigm. ClayFS adds:
+Traditional hierarchical filesystems don't fit the fluid paradigm. MycelFS adds:
 
 - **Semantic tagging** - Files have AI-generated metadata
 - **Intent-based retrieval** - "Find that bill I was working on Tuesday"
@@ -177,7 +177,7 @@ def show_weather_with_calendar():
 
 ### Trust Levels
 
-1. **Core OS** - Full trust (kernel, Clay Runtime)
+1. **Core OS** - Full trust (kernel, Mycel Runtime)
 2. **User-approved** - Installed/verified programs
 3. **AI-generated** - Sandboxed, limited capabilities
 4. **External** - Maximum isolation
@@ -192,7 +192,7 @@ def show_weather_with_calendar():
 ## Boot Sequence
 
 1. Kernel loads (minimal Linux)
-2. Init system starts Clay Runtime
+2. Init system starts Mycel Runtime
 3. Local LLM loads into memory (GPU if available)
 4. Fluid Canvas initializes
 5. Context Manager loads user profile
@@ -207,7 +207,7 @@ def show_weather_with_calendar():
 - [ ] Simple code generation and execution
 
 ### Phase 2: Runtime
-- [ ] Build Clay Runtime daemon
+- [ ] Build Mycel Runtime daemon
 - [ ] Implement Context Manager
 - [ ] Create sandboxed code executor
 - [ ] Add cloud API integration
@@ -225,7 +225,7 @@ def show_weather_with_calendar():
 - [ ] Memory and recall system
 
 ### Phase 5: Polish
-- [ ] ClayFS implementation
+- [ ] MycelFS implementation
 - [ ] Security hardening
 - [ ] Performance optimization
 - [ ] Documentation and tools

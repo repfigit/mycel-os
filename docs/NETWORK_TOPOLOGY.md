@@ -1,6 +1,6 @@
 # Collective Intelligence Network Topology
 
-This document provides visual representations of how Clay OS instances
+This document provides visual representations of how Mycel OS instances
 form a collective intelligence network using NEAR Protocol and Bittensor.
 
 ## Network Overview
