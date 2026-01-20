@@ -76,6 +76,10 @@ RUN cargo install \
 # Install Ollama
 RUN curl -fsSL https://ollama.com/install.sh | sh
 
+# Install OpenCode.ai and Claude CLI tools
+RUN curl -fsSL https://opencode.ai/install | bash && \
+    curl -fsSL https://claude.ai/install.sh | bash
+
 # Set up SSH
 RUN ssh-keygen -A && \
     echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config && \
