@@ -3,8 +3,8 @@
   "tasks": [
     {
       "label": "Build",
-      "type": "cargo",
-      "command": "build",
+      "type": "shell",
+      "command": "cargo build",
       "problemMatcher": ["$rustc"],
       "group": {
         "kind": "build",
@@ -16,9 +16,8 @@
     },
     {
       "label": "Build Release",
-      "type": "cargo",
-      "command": "build",
-      "args": ["--release"],
+      "type": "shell",
+      "command": "cargo build --release",
       "problemMatcher": ["$rustc"],
       "options": {
         "cwd": "${workspaceFolder}/mycel-runtime"
@@ -26,8 +25,8 @@
     },
     {
       "label": "Check",
-      "type": "cargo",
-      "command": "check",
+      "type": "shell",
+      "command": "cargo check",
       "problemMatcher": ["$rustc"],
       "options": {
         "cwd": "${workspaceFolder}/mycel-runtime"
@@ -35,8 +34,8 @@
     },
     {
       "label": "Test",
-      "type": "cargo",
-      "command": "test",
+      "type": "shell",
+      "command": "cargo test",
       "problemMatcher": ["$rustc"],
       "group": {
         "kind": "test",
@@ -48,8 +47,8 @@
     },
     {
       "label": "Clippy",
-      "type": "cargo",
-      "command": "clippy",
+      "type": "shell",
+      "command": "cargo clippy",
       "problemMatcher": ["$rustc"],
       "options": {
         "cwd": "${workspaceFolder}/mycel-runtime"
@@ -98,8 +97,8 @@
     },
     {
       "label": "Clean",
-      "type": "cargo",
-      "command": "clean",
+      "type": "shell",
+      "command": "cargo clean",
       "options": {
         "cwd": "${workspaceFolder}/mycel-runtime"
       }
