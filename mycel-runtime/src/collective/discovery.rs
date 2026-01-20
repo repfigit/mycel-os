@@ -33,26 +33,26 @@ impl PatternDiscovery {
             cache: DiscoveryCache::new(),
         }
     }
-    
+
     /// Discover patterns relevant to the current context
     pub async fn discover(&self, context: &Context) -> Result<Vec<RankedPattern>> {
         debug!("Discovering patterns for context");
-        
+
         // Check cache first
         let cache_key = self.compute_cache_key(context);
         if let Some(cached) = self.cache.get(&cache_key).await {
             debug!("Cache hit for pattern discovery");
             return Ok(cached);
         }
-        
+
         // Gather patterns from all sources
         let mut all_patterns = Vec::new();
-        
+
         // 1. Local patterns (fastest)
         let local_patterns = self.search_local(context).await?;
         debug!("Found {} local patterns", local_patterns.len());
         all_patterns.extend(local_patterns);
-        
+
         // 2. NEAR registry patterns
         if let Some(ref near) = self.near_client {
             match self.search_near(near, context).await {
@@ -65,7 +65,7 @@ impl PatternDiscovery {
                 }
             }
         }
-        
+
         // 3. Bittensor semantic search
         if let Some(ref bt) = self.bittensor_client {
             match self.search_bittensor(bt, context).await {
@@ -78,64 +78,64 @@ impl PatternDiscovery {
                 }
             }
         }
-        
+
         // Deduplicate
         let deduped = self.deduplicate(all_patterns);
-        
+
         // Rank patterns
         let ranked = self.rank_patterns(deduped, context);
-        
+
         // Cache results
         self.cache.set(&cache_key, ranked.clone()).await;
-        
+
         Ok(ranked)
     }
-    
+
     async fn search_local(&self, context: &Context) -> Result<Vec<DiscoveredPattern>> {
         let store = self.local_store.read().await;
-        
+
         // Infer domain from context
         let domain = self.infer_domain(context);
-        
+
         // Search by domain and recent activity
         let patterns = store.search(Some(&domain), "");
-        
+
         Ok(patterns
             .into_iter()
             .map(|p| DiscoveredPattern {
                 pattern: p.clone(),
                 source: PatternSource::Local,
-                source_score: 1.0,  // Local patterns get a boost
+                source_score: 1.0, // Local patterns get a boost
                 fetch_time_ms: 0,
             })
             .collect())
     }
-    
+
     async fn search_near(
         &self,
         near: &NearClient,
         context: &Context,
     ) -> Result<Vec<DiscoveredPattern>> {
         let domain = self.infer_domain(context);
-        
+
         let query = super::near::PatternQuery {
             domain: Some(domain),
             min_reputation: 0.6,
             max_price: Some(1_000_000_000_000_000_000_000_000), // 1 NEAR
             limit: 20,
         };
-        
+
         let start = std::time::Instant::now();
         let entries = near.query_patterns(query).await?;
         let fetch_time = start.elapsed().as_millis() as u64;
-        
+
         // Convert entries to patterns (would need to fetch full data)
         let patterns: Vec<DiscoveredPattern> = entries
             .into_iter()
             .map(|e| DiscoveredPattern {
                 pattern: Pattern {
                     id: e.id,
-                    trigger: "".to_string(),  // Would fetch from IPFS
+                    trigger: "".to_string(), // Would fetch from IPFS
                     context_requirements: Vec::new(),
                     solution: super::patterns::PatternSolution::PromptTemplate {
                         template: "".to_string(),
@@ -156,10 +156,10 @@ impl PatternDiscovery {
                 fetch_time_ms: fetch_time,
             })
             .collect();
-        
+
         Ok(patterns)
     }
-    
+
     async fn search_bittensor(
         &self,
         bt: &BittensorClient,
@@ -167,11 +167,11 @@ impl PatternDiscovery {
     ) -> Result<Vec<DiscoveredPattern>> {
         // Compute embedding for semantic search
         let embedding = self.compute_context_embedding(context)?;
-        
+
         let start = std::time::Instant::now();
         let matches = bt.semantic_pattern_search(embedding, 10).await?;
         let fetch_time = start.elapsed().as_millis() as u64;
-        
+
         let patterns: Vec<DiscoveredPattern> = matches
             .into_iter()
             .map(|m| DiscoveredPattern {
@@ -198,18 +198,18 @@ impl PatternDiscovery {
                 fetch_time_ms: fetch_time,
             })
             .collect();
-        
+
         Ok(patterns)
     }
-    
+
     fn deduplicate(&self, patterns: Vec<DiscoveredPattern>) -> Vec<DiscoveredPattern> {
         use std::collections::HashMap;
-        
+
         let mut seen: HashMap<String, DiscoveredPattern> = HashMap::new();
-        
+
         for pattern in patterns {
             let key = pattern.pattern.id.clone();
-            
+
             if let Some(existing) = seen.get(&key) {
                 // Keep the one with higher source score
                 if pattern.source_score > existing.source_score {
@@ -219,10 +219,10 @@ impl PatternDiscovery {
                 seen.insert(key, pattern);
             }
         }
-        
+
         seen.into_values().collect()
     }
-    
+
     fn rank_patterns(
         &self,
         patterns: Vec<DiscoveredPattern>,
@@ -232,25 +232,24 @@ impl PatternDiscovery {
             .into_iter()
             .map(|dp| {
                 let relevance_score = self.compute_relevance(&dp.pattern, context);
-                
+
                 // Combined score factors:
                 // - Relevance to context (40%)
                 // - Quality/reputation score (30%)
                 // - Source preference (local > network) (15%)
                 // - Success rate (15%)
-                
+
                 let source_bonus = match dp.source {
                     PatternSource::Local => 0.15,
                     PatternSource::Network => 0.0,
                     PatternSource::Builtin => 0.1,
                 };
-                
-                let combined_score = 
-                    relevance_score * 0.4 +
-                    (dp.pattern.quality_score as f64) * 0.3 +
-                    source_bonus +
-                    (dp.pattern.success_rate as f64) * 0.15;
-                
+
+                let combined_score = relevance_score * 0.4
+                    + (dp.pattern.quality_score as f64) * 0.3
+                    + source_bonus
+                    + (dp.pattern.success_rate as f64) * 0.15;
+
                 RankedPattern {
                     pattern: dp.pattern,
                     relevance_score,
@@ -258,64 +257,69 @@ impl PatternDiscovery {
                 }
             })
             .collect();
-        
+
         // Sort by combined score descending
         ranked.sort_by(|a, b| {
             b.combined_score
                 .partial_cmp(&a.combined_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        
+
         ranked
     }
-    
+
     fn compute_relevance(&self, pattern: &Pattern, context: &Context) -> f64 {
         let mut score = 0.0;
-        
+
         // Domain match
         let context_domain = self.infer_domain(context);
         if pattern.domain == context_domain {
             score += 0.4;
         }
-        
+
         // Keyword overlap between trigger and recent activity
         let trigger_lower = pattern.trigger.to_lowercase();
-        let trigger_words: std::collections::HashSet<_> = trigger_lower
-            .split_whitespace()
-            .collect();
-        
-        let context_words: std::collections::HashSet<_> = context.recent_files
+        let trigger_words: std::collections::HashSet<_> =
+            trigger_lower.split_whitespace().collect();
+
+        let context_words: std::collections::HashSet<_> = context
+            .recent_files
             .iter()
-            .flat_map(|f| f.to_lowercase().split('/').map(String::from).collect::<Vec<_>>())
+            .flat_map(|f| {
+                f.to_lowercase()
+                    .split('/')
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            })
             .collect();
-        
+
         let overlap = trigger_words
             .iter()
             .filter(|w| context_words.iter().any(|cw| cw.contains(*w)))
             .count();
-        
+
         if !trigger_words.is_empty() {
             score += (overlap as f64 / trigger_words.len() as f64) * 0.3;
         }
-        
+
         // User preference match
         if let Some(pref_domain) = context.user_preferences.get("preferred_domain") {
             if &pattern.domain == pref_domain {
                 score += 0.2;
             }
         }
-        
+
         // Recency bonus for recently successful patterns
         // (Would need access to usage history)
-        score += 0.1;  // Default
-        
+        score += 0.1; // Default
+
         score
     }
-    
+
     fn infer_domain(&self, context: &Context) -> String {
         // Infer domain from working directory and recent files
         let wd = context.working_directory.to_lowercase();
-        
+
         if wd.contains("code") || wd.contains("src") || wd.contains("dev") {
             return "coding".to_string();
         }
@@ -325,7 +329,7 @@ impl PatternDiscovery {
         if wd.contains("data") || wd.contains("analytics") {
             return "analysis".to_string();
         }
-        
+
         // Check recent files
         for file in &context.recent_files {
             let ext = file.split('.').last().unwrap_or("");
@@ -336,25 +340,25 @@ impl PatternDiscovery {
                 _ => {}
             }
         }
-        
+
         "general".to_string()
     }
-    
+
     fn compute_context_embedding(&self, _context: &Context) -> Result<Vec<f32>> {
         // Compute embedding for semantic search
         // Simplified - would use actual embedding model
-        
+
         Ok(vec![0.0; 128])
     }
-    
+
     fn compute_cache_key(&self, context: &Context) -> String {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
-        
+        use std::hash::{Hash, Hasher};
+
         let mut hasher = DefaultHasher::new();
         context.working_directory.hash(&mut hasher);
         context.recent_files.hash(&mut hasher);
-        
+
         format!("{:x}", hasher.finish())
     }
 }
@@ -382,30 +386,33 @@ impl DiscoveryCache {
     fn new() -> Self {
         Self {
             cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            ttl_secs: 300,  // 5 minutes
+            ttl_secs: 300, // 5 minutes
         }
     }
-    
+
     async fn get(&self, key: &str) -> Option<Vec<RankedPattern>> {
         let cache = self.cache.read().await;
-        
+
         if let Some(entry) = cache.get(key) {
             if entry.timestamp.elapsed().as_secs() < self.ttl_secs {
                 return Some(entry.patterns.clone());
             }
         }
-        
+
         None
     }
-    
+
     async fn set(&self, key: &str, patterns: Vec<RankedPattern>) {
         let mut cache = self.cache.write().await;
-        
-        cache.insert(key.to_string(), CacheEntry {
-            patterns,
-            timestamp: std::time::Instant::now(),
-        });
-        
+
+        cache.insert(
+            key.to_string(),
+            CacheEntry {
+                patterns,
+                timestamp: std::time::Instant::now(),
+            },
+        );
+
         // Clean old entries
         cache.retain(|_, v| v.timestamp.elapsed().as_secs() < self.ttl_secs * 2);
     }

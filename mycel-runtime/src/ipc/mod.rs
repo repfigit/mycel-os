@@ -48,7 +48,8 @@ impl RateLimiter {
     fn check(&mut self) -> bool {
         let now = Instant::now();
         // Remove old requests outside the window
-        self.requests.retain(|t| now.duration_since(*t) < self.window);
+        self.requests
+            .retain(|t| now.duration_since(*t) < self.window);
 
         if self.requests.len() >= self.max_requests as usize {
             false
@@ -192,7 +193,8 @@ async fn handle_connection(
                                         let response = IpcResponse::Ok {
                                             message: "Authenticated successfully".to_string(),
                                         };
-                                        let response_json = serde_json::to_string(&response)? + "\n";
+                                        let response_json =
+                                            serde_json::to_string(&response)? + "\n";
                                         let mut w = writer.lock().await;
                                         w.write_all(response_json.as_bytes()).await?;
                                         w.flush().await?;
@@ -212,7 +214,8 @@ async fn handle_connection(
                                 }
                                 IpcRequest::Ping => {
                                     // Allow Ping without auth for health checks
-                                    let response_json = serde_json::to_string(&IpcResponse::Pong)? + "\n";
+                                    let response_json =
+                                        serde_json::to_string(&IpcResponse::Pong)? + "\n";
                                     let mut w = writer.lock().await;
                                     w.write_all(response_json.as_bytes()).await?;
                                     w.flush().await?;
@@ -222,7 +225,8 @@ async fn handle_connection(
                                     let error_response = IpcResponse::Error {
                                         message: "Authentication required. Send Authenticate request first.".to_string(),
                                     };
-                                    let response_json = serde_json::to_string(&error_response)? + "\n";
+                                    let response_json =
+                                        serde_json::to_string(&error_response)? + "\n";
                                     let mut w = writer.lock().await;
                                     w.write_all(response_json.as_bytes()).await?;
                                     w.flush().await?;
@@ -231,8 +235,7 @@ async fn handle_connection(
                             }
                         }
 
-                        let response =
-                            process_request(&request, &runtime, &mut session_id).await;
+                        let response = process_request(&request, &runtime, &mut session_id).await;
                         let response_json = serde_json::to_string(&response)? + "\n";
 
                         let mut w = writer.lock().await;
@@ -274,46 +277,42 @@ async fn process_request(
                 message: "Already authenticated".to_string(),
             }
         }
-        IpcRequest::Chat { message } => {
-            match runtime.process_input(message, session_id).await {
-                Ok(response) => match response {
-                    crate::RuntimeResponse::Text(text) => IpcResponse::Chat {
-                        response: text,
-                        surface: None,
-                    },
-                    crate::RuntimeResponse::CodeResult { code, output } => IpcResponse::CodeResult {
-                        code,
-                        output,
-                        success: true,
-                    },
-                    crate::RuntimeResponse::UiSurface(surface) => IpcResponse::Chat {
-                        response: format!("Created surface: {}", surface.title),
-                        surface: Some(surface),
-                    },
-                    crate::RuntimeResponse::Error(err) => IpcResponse::Error { message: err },
+        IpcRequest::Chat { message } => match runtime.process_input(message, session_id).await {
+            Ok(response) => match response {
+                crate::RuntimeResponse::Text(text) => IpcResponse::Chat {
+                    response: text,
+                    surface: None,
                 },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
+                crate::RuntimeResponse::CodeResult { code, output } => IpcResponse::CodeResult {
+                    code,
+                    output,
+                    success: true,
                 },
-            }
-        }
+                crate::RuntimeResponse::UiSurface(surface) => IpcResponse::Chat {
+                    response: format!("Created surface: {}", surface.title),
+                    surface: Some(surface),
+                },
+                crate::RuntimeResponse::Error(err) => IpcResponse::Error { message: err },
+            },
+            Err(e) => IpcResponse::Error {
+                message: e.to_string(),
+            },
+        },
         IpcRequest::SetSession { id } => {
             *session_id = id.clone();
             IpcResponse::Ok {
                 message: format!("Session set to {}", id),
             }
         }
-        IpcRequest::GetContext => {
-            match runtime.context_manager.get_context(session_id).await {
-                Ok(ctx) => IpcResponse::Context {
-                    working_directory: ctx.working_directory,
-                    recent_files: ctx.recent_files,
-                },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
-            }
-        }
+        IpcRequest::GetContext => match runtime.context_manager.get_context(session_id).await {
+            Ok(ctx) => IpcResponse::Context {
+                working_directory: ctx.working_directory,
+                recent_files: ctx.recent_files,
+            },
+            Err(e) => IpcResponse::Error {
+                message: e.to_string(),
+            },
+        },
         IpcRequest::Ping => IpcResponse::Pong,
     }
 }

@@ -3,9 +3,9 @@
 //! Syncs config, patterns, and files between user's Mycel devices
 //! using WireGuard for transport and CRDTs for conflict-free merge.
 
+use crate::config::MycelConfig;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use crate::config::MycelConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -58,7 +58,7 @@ impl SyncService {
             name: "Mycel Device".to_string(),
             status: PeerStatus::Connected,
         };
-        
+
         self.state.write().await.peers.push(peer.clone());
         Ok(peer)
     }
@@ -70,7 +70,7 @@ impl SyncService {
             last_sync: chrono::Utc::now(),
         })
     }
-    
+
     pub async fn get_peers(&self) -> Vec<PeerInfo> {
         self.state.read().await.peers.clone()
     }

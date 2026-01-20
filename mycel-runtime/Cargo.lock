@@ -1267,6 +1267,7 @@ dependencies = [
  "minijinja",
  "nix",
  "notify",
+ "once_cell",
  "rand",
  "regex",
  "reqwest",

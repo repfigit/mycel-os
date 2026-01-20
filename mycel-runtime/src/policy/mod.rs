@@ -18,7 +18,10 @@ pub enum ActionPolicy {
     /// Action is denied
     Deny { reason: String },
     /// Action requires explicit user confirmation
-    RequiresConfirmation { message: String, risk_level: RiskLevel },
+    RequiresConfirmation {
+        message: String,
+        risk_level: RiskLevel,
+    },
 }
 
 /// Risk level for actions requiring confirmation
@@ -129,7 +132,11 @@ impl PolicyEvaluator {
 
         // High-risk patterns
         let high_risk_patterns = [
-            "delete", "remove", "uninstall", "modify system", "change config",
+            "delete",
+            "remove",
+            "uninstall",
+            "modify system",
+            "change config",
         ];
 
         for pattern in high_risk_patterns {
@@ -209,9 +216,12 @@ impl PolicyEvaluator {
     pub fn is_path_allowed(&self, path: &str) -> bool {
         for blocked in &self.config.blocked_file_patterns {
             // Simple substring match - would use glob in production
-            let normalized_blocked = blocked.replace("~", &dirs::home_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default());
+            let normalized_blocked = blocked.replace(
+                "~",
+                &dirs::home_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            );
 
             if path.starts_with(&normalized_blocked.replace("*", "")) {
                 return false;

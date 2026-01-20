@@ -45,16 +45,17 @@ impl CodeArtifact {
             CodeLanguage::Unknown => "txt",
         };
 
-        let filename = format!("{}_{}.{}", 
+        let filename = format!(
+            "{}_{}.{}",
             self.created_at.format("%Y%m%d_%H%M%S"),
             &self.id[..8],
             extension
         );
-        
+
         let path = PathBuf::from(base_path).join(&filename);
         std::fs::create_dir_all(base_path)?;
         std::fs::write(&path, &self.code)?;
-        
+
         self.saved_path = Some(path.clone());
         Ok(path)
     }
@@ -77,7 +78,7 @@ impl CodeLanguage {
     /// Detect language from code content
     pub fn detect(code: &str) -> Self {
         let code_lower = code.to_lowercase();
-        
+
         // Check for shebangs first
         if code.starts_with("#!/usr/bin/env python") || code.starts_with("#!/usr/bin/python") {
             return Self::Python;
@@ -85,27 +86,38 @@ impl CodeLanguage {
         if code.starts_with("#!/bin/bash") || code.starts_with("#!/bin/sh") {
             return Self::Shell;
         }
-        
+
         // Check for language-specific patterns
-        if code_lower.contains("import ") && (code_lower.contains("def ") || code_lower.contains("class ")) {
+        if code_lower.contains("import ")
+            && (code_lower.contains("def ") || code_lower.contains("class "))
+        {
             return Self::Python;
         }
         if code_lower.contains("fn ") && code_lower.contains("let ") && code_lower.contains("->") {
             return Self::Rust;
         }
-        if code_lower.contains("interface ") || code_lower.contains(": string") || code_lower.contains(": number") {
+        if code_lower.contains("interface ")
+            || code_lower.contains(": string")
+            || code_lower.contains(": number")
+        {
             return Self::TypeScript;
         }
-        if code_lower.contains("const ") || code_lower.contains("function ") || code_lower.contains("=>") {
+        if code_lower.contains("const ")
+            || code_lower.contains("function ")
+            || code_lower.contains("=>")
+        {
             return Self::JavaScript;
         }
         if code_lower.contains("<!doctype") || code_lower.contains("<html") {
             return Self::Html;
         }
-        if code.contains("{") && code.contains("}") && (code.contains("color:") || code.contains("margin:")) {
+        if code.contains("{")
+            && code.contains("}")
+            && (code.contains("color:") || code.contains("margin:"))
+        {
             return Self::Css;
         }
-        
+
         Self::Unknown
     }
 
@@ -131,87 +143,5 @@ impl CodeLanguage {
             Self::Shell => Some("bash"),
             _ => None,
         }
-    }
-}
-
-/// Template for common code patterns
-pub struct CodeTemplate {
-    pub name: String,
-    pub description: String,
-    pub language: CodeLanguage,
-    pub template: String,
-    pub variables: Vec<String>,
-}
-
-impl CodeTemplate {
-    /// Common templates for quick generation
-    pub fn builtin_templates() -> Vec<Self> {
-        vec![
-            Self {
-                name: "python_script".to_string(),
-                description: "Basic Python script with main function".to_string(),
-                language: CodeLanguage::Python,
-                template: r#"#!/usr/bin/env python3
-"""{{description}}"""
-
-def main():
-    {{code}}
-
-if __name__ == "__main__":
-    main()
-"#.to_string(),
-                variables: vec!["description".to_string(), "code".to_string()],
-            },
-            Self {
-                name: "data_analysis".to_string(),
-                description: "Python data analysis script".to_string(),
-                language: CodeLanguage::Python,
-                template: r#"#!/usr/bin/env python3
-"""{{description}}"""
-import json
-from collections import Counter
-
-def analyze(data):
-    {{analysis_code}}
-
-def main():
-    # Input data
-    data = {{input_data}}
-    
-    # Run analysis
-    result = analyze(data)
-    
-    # Output
-    print(json.dumps(result, indent=2))
-
-if __name__ == "__main__":
-    main()
-"#.to_string(),
-                variables: vec!["description".to_string(), "analysis_code".to_string(), "input_data".to_string()],
-            },
-            Self {
-                name: "web_scraper".to_string(),
-                description: "Simple web data fetcher (no actual scraping to respect policies)".to_string(),
-                language: CodeLanguage::Python,
-                template: r#"#!/usr/bin/env python3
-"""{{description}}"""
-import urllib.request
-import json
-
-def fetch_data(url):
-    with urllib.request.urlopen(url) as response:
-        return response.read().decode('utf-8')
-
-def main():
-    url = "{{url}}"
-    data = fetch_data(url)
-    {{processing_code}}
-
-if __name__ == "__main__":
-    main()
-"#.to_string(),
-                variables: vec!["description".to_string(), "url".to_string(), "processing_code".to_string()],
-            },
-        ]
     }
 }

@@ -75,7 +75,7 @@ fn default_context_path() -> String {
 
 fn default_code_path() -> String {
     dirs::cache_dir()
-        .map(|p| p.join("clay/code").to_string_lossy().to_string())
+        .map(|p| p.join("mycel/code").to_string_lossy().to_string())
         .unwrap_or_else(|| "/tmp/mycel/code".to_string())
 }
 

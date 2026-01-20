@@ -89,16 +89,16 @@ impl IntentCategory {
     /// Categorize based on keywords in the action
     pub fn from_action(action: &str) -> Self {
         let action_lower = action.to_lowercase();
-        
-        if action_lower.contains("what") 
+
+        if action_lower.contains("what")
             || action_lower.contains("who")
             || action_lower.contains("when")
             || action_lower.contains("where")
-            || action_lower.contains("tell me") 
+            || action_lower.contains("tell me")
         {
             return Self::Information;
         }
-        
+
         if action_lower.contains("create")
             || action_lower.contains("make")
             || action_lower.contains("generate")
@@ -106,7 +106,7 @@ impl IntentCategory {
         {
             return Self::Creation;
         }
-        
+
         if action_lower.contains("convert")
             || action_lower.contains("transform")
             || action_lower.contains("change")
@@ -114,7 +114,7 @@ impl IntentCategory {
         {
             return Self::Transformation;
         }
-        
+
         if action_lower.contains("analyze")
             || action_lower.contains("compare")
             || action_lower.contains("summarize")
@@ -122,7 +122,7 @@ impl IntentCategory {
         {
             return Self::Analysis;
         }
-        
+
         if action_lower.contains("open")
             || action_lower.contains("run")
             || action_lower.contains("execute")
@@ -131,7 +131,7 @@ impl IntentCategory {
         {
             return Self::Action;
         }
-        
+
         if action_lower.contains("find")
             || action_lower.contains("show")
             || action_lower.contains("display")
@@ -139,14 +139,14 @@ impl IntentCategory {
         {
             return Self::Navigation;
         }
-        
+
         if action_lower.contains("set")
             || action_lower.contains("configure")
             || action_lower.contains("setting")
         {
             return Self::Configuration;
         }
-        
+
         Self::Unknown
     }
 }

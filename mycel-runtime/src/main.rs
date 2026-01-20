@@ -19,6 +19,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod ai;
 mod codegen;
+mod collective;
 mod config;
 mod context;
 mod executor;
@@ -26,9 +27,8 @@ mod intent;
 mod ipc;
 mod models;
 mod policy;
-mod ui;
-mod collective;
 mod sync;
+mod ui;
 
 use crate::config::MycelConfig;
 
@@ -52,14 +52,15 @@ struct Args {
     /// Skip loading the local LLM (cloud-only mode)
     #[arg(long)]
     no_local_llm: bool,
-    
+
     /// Skip collective network connection (local-only mode)
     #[arg(long)]
     no_collective: bool,
 }
 
 fn print_banner() {
-    println!(r#"
+    println!(
+        r#"
     ███╗   ███╗██╗   ██╗ ██████╗███████╗██╗     
     ████╗ ████║╚██╗ ██╔╝██╔════╝██╔════╝██║     
     ██╔████╔██║ ╚████╔╝ ██║     █████╗  ██║     
@@ -68,7 +69,8 @@ fn print_banner() {
     ╚═╝     ╚═╝   ╚═╝    ╚═════╝╚══════╝╚══════╝
     
     The intelligent network beneath everything.
-"#);
+"#
+    );
 }
 
 #[tokio::main]
@@ -154,7 +156,10 @@ async fn main() -> Result<()> {
             interval.tick().await;
             let removed = cleanup_context_manager.cleanup_stale_sessions(None).await;
             if removed > 0 {
-                info!(removed_sessions = removed, "Periodic session cleanup completed");
+                info!(
+                    removed_sessions = removed,
+                    "Periodic session cleanup completed"
+                );
             }
         }
     });
@@ -252,7 +257,7 @@ async fn run_dev_cli(runtime: MycelRuntime) {
     use std::io::{self, BufRead, Write};
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    
+
     println!("\n=== Mycel OS Development CLI ===");
     println!("The intelligent network beneath everything.");
     println!("Type your requests, or 'quit' to exit.\n");
@@ -280,7 +285,10 @@ async fn run_dev_cli(runtime: MycelRuntime) {
             Ok(response) => match response {
                 RuntimeResponse::Text(text) => println!("\n{}\n", text),
                 RuntimeResponse::CodeResult { code, output } => {
-                    println!("\n--- Generated Code ---\n{}\n--- Output ---\n{}\n", code, output);
+                    println!(
+                        "\n--- Generated Code ---\n{}\n--- Output ---\n{}\n",
+                        code, output
+                    );
                 }
                 RuntimeResponse::UiSurface(surface) => {
                     println!("\n[UI Surface created: {}]\n", surface.id);

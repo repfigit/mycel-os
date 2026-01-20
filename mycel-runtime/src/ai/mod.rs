@@ -89,17 +89,19 @@ Guidelines:
 - generate_ui: User needs a visual interface, comparison view, or interactive element
 - system_action: File operations, settings changes, system commands
 - cloud_escalate: Complex analysis, nuanced writing, or when uncertain"#,
-            input,
-            context.working_directory,
-            context.recent_files,
-            context.timestamp
+            input, context.working_directory, context.recent_files, context.timestamp
         );
 
         let response = self.local_generate(&prompt).await?;
-        
+
         // Parse the JSON response
-        let intent: IntentResponse = serde_json::from_str(&response)
-            .map_err(|e| anyhow!("Failed to parse intent response: {} - Response was: {}", e, response))?;
+        let intent: IntentResponse = serde_json::from_str(&response).map_err(|e| {
+            anyhow!(
+                "Failed to parse intent response: {} - Response was: {}",
+                e,
+                response
+            )
+        })?;
 
         Ok(Intent {
             action: intent.action,
@@ -284,7 +286,7 @@ Provide a thorough, helpful response. You have access to the user's full context
         }
 
         let response: AnthropicResponse = response.json().await?;
-        
+
         response
             .content
             .first()

@@ -30,7 +30,7 @@ impl CodeExecutor {
     pub fn new(config: &MycelConfig) -> Result<Self> {
         // Check if we have sandboxing capabilities
         let sandbox_type = Self::check_sandbox_available();
-        
+
         if config.sandbox_enabled && sandbox_type == SandboxType::None {
             warn!("Sandboxing enabled but no supported sandbox tool found (firejail, bwrap). Execution will be BLOCKED.");
         }
@@ -46,7 +46,7 @@ impl CodeExecutor {
         if Self::check_command("firejail") {
             return SandboxType::Firejail;
         }
-        
+
         // Check for bwrap
         if Self::check_command("bwrap") {
             return SandboxType::Bubblewrap;
@@ -78,18 +78,24 @@ impl CodeExecutor {
 
     fn detect_language(&self, code: &str) -> Language {
         let code_lower = code.to_lowercase();
-        
+
         // Simple heuristics
-        if code_lower.contains("import ") || code_lower.contains("def ") || code_lower.contains("print(") {
+        if code_lower.contains("import ")
+            || code_lower.contains("def ")
+            || code_lower.contains("print(")
+        {
             return Language::Python;
         }
-        if code_lower.contains("const ") || code_lower.contains("function ") || code_lower.contains("console.log") {
+        if code_lower.contains("const ")
+            || code_lower.contains("function ")
+            || code_lower.contains("console.log")
+        {
             return Language::JavaScript;
         }
         if code_lower.starts_with("#!/bin/bash") || code_lower.starts_with("#!/bin/sh") {
             return Language::Shell;
         }
-        
+
         // Default to Python
         Language::Python
     }
@@ -122,10 +128,15 @@ impl CodeExecutor {
             SandboxType::Bubblewrap => {
                 let mut c = Command::new("bwrap");
                 c.args([
-                    "--ro-bind", "/", "/",
-                    "--dev", "/dev",
-                    "--proc", "/proc",
-                    "--tmpfs", "/tmp",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--dev",
+                    "/dev",
+                    "--proc",
+                    "/proc",
+                    "--tmpfs",
+                    "/tmp",
                     "--unshare-all",
                     "--new-session",
                     "--die-with-parent",
@@ -147,12 +158,17 @@ impl CodeExecutor {
 
         // Execute with timeout
         let timeout_duration = Duration::from_secs(self.config.execution_timeout_secs);
-        info!(timeout_secs = self.config.execution_timeout_secs, "Running code with timeout");
+        info!(
+            timeout_secs = self.config.execution_timeout_secs,
+            "Running code with timeout"
+        );
 
-        let output = match timeout(timeout_duration, cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()).await {
+        let output = match timeout(
+            timeout_duration,
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output(),
+        )
+        .await
+        {
             Ok(result) => result?,
             Err(_) => {
                 return Err(anyhow!(
@@ -196,10 +212,15 @@ impl CodeExecutor {
             SandboxType::Bubblewrap => {
                 let mut c = Command::new("bwrap");
                 c.args([
-                    "--ro-bind", "/", "/",
-                    "--dev", "/dev",
-                    "--proc", "/proc",
-                    "--tmpfs", "/tmp",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--dev",
+                    "/dev",
+                    "--proc",
+                    "/proc",
+                    "--tmpfs",
+                    "/tmp",
                     "--unshare-all",
                     "--new-session",
                     "--die-with-parent",
@@ -222,10 +243,12 @@ impl CodeExecutor {
         // Execute with timeout
         let timeout_duration = Duration::from_secs(self.config.execution_timeout_secs);
 
-        let output = match timeout(timeout_duration, cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()).await {
+        let output = match timeout(
+            timeout_duration,
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output(),
+        )
+        .await
+        {
             Ok(result) => result?,
             Err(_) => {
                 return Err(anyhow!(
@@ -271,10 +294,15 @@ impl CodeExecutor {
             SandboxType::Bubblewrap => {
                 let mut c = Command::new("bwrap");
                 c.args([
-                    "--ro-bind", "/", "/",
-                    "--dev", "/dev",
-                    "--proc", "/proc",
-                    "--tmpfs", "/tmp",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--dev",
+                    "/dev",
+                    "--proc",
+                    "/proc",
+                    "--tmpfs",
+                    "/tmp",
                     "--unshare-all",
                     "--new-session",
                     "--die-with-parent",
@@ -286,17 +314,21 @@ impl CodeExecutor {
             }
             SandboxType::None => {
                 // Without sandbox, refuse to run shell regardless of config
-                return Err(anyhow!("Shell execution ALWAYS requires sandboxing. Install firejail or bubblewrap."));
+                return Err(anyhow!(
+                    "Shell execution ALWAYS requires sandboxing. Install firejail or bubblewrap."
+                ));
             }
         };
 
         // Execute with timeout
         let timeout_duration = Duration::from_secs(self.config.execution_timeout_secs);
 
-        let output = match timeout(timeout_duration, cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()).await {
+        let output = match timeout(
+            timeout_duration,
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output(),
+        )
+        .await
+        {
             Ok(result) => result?,
             Err(_) => {
                 return Err(anyhow!(
@@ -344,32 +376,32 @@ impl CodeExecutor {
 
         // Bypass attempt patterns - catch common evasion techniques
         let bypass_patterns = [
-            "getattr(",           // getattr(__builtins__, '__import__')
-            "__builtins__",       // Direct builtins access
-            "__class__",          // Class introspection
-            "__bases__",          // Class hierarchy access
-            "__subclasses__",     // Subclass enumeration
-            "__mro__",            // Method resolution order
-            "__globals__",        // Global namespace access
-            "__code__",           // Code object access
-            "compile(",           // Dynamic compilation
-            "chr(",               // Character code bypass: chr(111)+chr(115) = 'os'
-            "ord(",               // Often used with chr for obfuscation
-            "globals(",           // Accessing global namespace
-            "locals(",            // Accessing local namespace
-            "vars(",              // Variable access
-            "dir(",               // Directory listing (can be used for discovery)
-            "type(",              // Type manipulation
-            "setattr(",           // Setting attributes
-            "delattr(",           // Deleting attributes
-            "importlib",          // Import library
-            "pkgutil",            // Package utilities
-            "sys.modules",        // Module cache access
-            "ctypes",             // C type interface (dangerous)
-            "cffi",               // C FFI (dangerous)
-            "pickle",             // Deserialization attacks
-            "marshal",            // Code serialization
-            "codecs",             // Can be used for encoding tricks
+            "getattr(",       // getattr(__builtins__, '__import__')
+            "__builtins__",   // Direct builtins access
+            "__class__",      // Class introspection
+            "__bases__",      // Class hierarchy access
+            "__subclasses__", // Subclass enumeration
+            "__mro__",        // Method resolution order
+            "__globals__",    // Global namespace access
+            "__code__",       // Code object access
+            "compile(",       // Dynamic compilation
+            "chr(",           // Character code bypass: chr(111)+chr(115) = 'os'
+            "ord(",           // Often used with chr for obfuscation
+            "globals(",       // Accessing global namespace
+            "locals(",        // Accessing local namespace
+            "vars(",          // Variable access
+            "dir(",           // Directory listing (can be used for discovery)
+            "type(",          // Type manipulation
+            "setattr(",       // Setting attributes
+            "delattr(",       // Deleting attributes
+            "importlib",      // Import library
+            "pkgutil",        // Package utilities
+            "sys.modules",    // Module cache access
+            "ctypes",         // C type interface (dangerous)
+            "cffi",           // C FFI (dangerous)
+            "pickle",         // Deserialization attacks
+            "marshal",        // Code serialization
+            "codecs",         // Can be used for encoding tricks
         ];
 
         for pattern in bypass_patterns {
@@ -420,7 +452,7 @@ impl CodeExecutor {
             "process.kill",
             "process.env",
             "eval(",
-            "Function(",       // Function constructor can execute code
+            "Function(", // Function constructor can execute code
             "new Function",
             "child_process",
             "spawn(",
@@ -442,13 +474,13 @@ impl CodeExecutor {
 
         // Check for dynamic require (common bypass)
         let bypass_patterns = [
-            "require(variable",    // Dynamic require
-            "require(String",      // String manipulation
-            "require([",           // Array-based require
-            "import(",             // Dynamic import
-            "globalThis",          // Global context access
-            "Reflect.",            // Reflection API
-            "Proxy(",              // Proxy objects
+            "require(variable", // Dynamic require
+            "require(String",   // String manipulation
+            "require([",        // Array-based require
+            "import(",          // Dynamic import
+            "globalThis",       // Global context access
+            "Reflect.",         // Reflection API
+            "Proxy(",           // Proxy objects
         ];
 
         for pattern in bypass_patterns {
@@ -477,10 +509,7 @@ impl CodeExecutor {
 
         for pattern in dangerous_patterns {
             if code.contains(pattern) {
-                return Err(anyhow!(
-                    "Code contains dangerous pattern: {}",
-                    pattern
-                ));
+                return Err(anyhow!("Code contains dangerous pattern: {}", pattern));
             }
         }
 

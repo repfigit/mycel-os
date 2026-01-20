@@ -123,7 +123,9 @@ impl ContextManager {
     /// Update user preferences
     pub async fn set_user_preference(&self, key: &str, value: &str) -> Result<()> {
         let mut user_ctx = self.user_context.write().await;
-        user_ctx.preferences.insert(key.to_string(), value.to_string());
+        user_ctx
+            .preferences
+            .insert(key.to_string(), value.to_string());
         user_ctx.save(&self.config.context_path).await?;
         Ok(())
     }
@@ -225,7 +227,7 @@ pub struct UserContext {
 impl UserContext {
     pub async fn load_or_default(path: &str) -> Result<Self> {
         let context_file = format!("{}/user_context.json", path);
-        
+
         if std::path::Path::new(&context_file).exists() {
             let content = tokio::fs::read_to_string(&context_file).await?;
             Ok(serde_json::from_str(&content)?)

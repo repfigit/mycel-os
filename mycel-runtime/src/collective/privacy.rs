@@ -4,11 +4,42 @@
 //! still being useful to the collective.
 
 use anyhow::{anyhow, Result};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use super::patterns::{Pattern, PatternSolution};
 use super::Interaction;
+
+// Lazy-initialized regexes to avoid compilation on every use
+static EMAIL_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"[\w.-]+@[\w.-]+\.\w+").expect("Invalid email regex"));
+
+static PHONE_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b").expect("Invalid phone regex"));
+
+static SSN_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").expect("Invalid SSN regex"));
+
+static CREDITCARD_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b").expect("Invalid CC regex")
+});
+
+static VARIABLE_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\{\{(\w+)\}\}").expect("Invalid variable regex"));
+
+static PATH_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"/[\w/.-]+").expect("Invalid path regex"));
+
+static URL_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"https?://[\w./%-]+").expect("Invalid URL regex"));
+
+static NUMBERS_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b\d+\b").expect("Invalid numbers regex"));
+
+static DATES_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b").expect("Invalid dates regex"));
 
 /// Privacy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,8 +286,8 @@ fn extract_template(response: &str) -> String {
 
 fn extract_variables(template: &str) -> Vec<String> {
     // Find {{variable}} patterns
-    let re = regex::Regex::new(r"\{\{(\w+)\}\}").unwrap();
-    re.captures_iter(template)
+    VARIABLE_REGEX
+        .captures_iter(template)
         .map(|c| c[1].to_string())
         .collect()
 }
@@ -298,8 +329,7 @@ fn detect_pii(text: &str) -> Vec<PiiMatch> {
     let mut matches = Vec::new();
 
     // Email addresses
-    let email_re = regex::Regex::new(r"[\w.-]+@[\w.-]+\.\w+").unwrap();
-    for m in email_re.find_iter(text) {
+    for m in EMAIL_REGEX.find_iter(text) {
         matches.push(PiiMatch {
             pii_type: PiiType::Email,
             value: m.as_str().to_string(),
@@ -309,8 +339,7 @@ fn detect_pii(text: &str) -> Vec<PiiMatch> {
     }
 
     // Phone numbers (simplified US format)
-    let phone_re = regex::Regex::new(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b").unwrap();
-    for m in phone_re.find_iter(text) {
+    for m in PHONE_REGEX.find_iter(text) {
         matches.push(PiiMatch {
             pii_type: PiiType::Phone,
             value: m.as_str().to_string(),
@@ -320,8 +349,7 @@ fn detect_pii(text: &str) -> Vec<PiiMatch> {
     }
 
     // SSN (simplified)
-    let ssn_re = regex::Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap();
-    for m in ssn_re.find_iter(text) {
+    for m in SSN_REGEX.find_iter(text) {
         matches.push(PiiMatch {
             pii_type: PiiType::Ssn,
             value: m.as_str().to_string(),
@@ -331,8 +359,7 @@ fn detect_pii(text: &str) -> Vec<PiiMatch> {
     }
 
     // Credit card numbers (simplified)
-    let cc_re = regex::Regex::new(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b").unwrap();
-    for m in cc_re.find_iter(text) {
+    for m in CREDITCARD_REGEX.find_iter(text) {
         matches.push(PiiMatch {
             pii_type: PiiType::CreditCard,
             value: m.as_str().to_string(),
@@ -400,12 +427,12 @@ fn generalize_specifics(insight: &ExtractedInsight) -> ExtractedInsight {
     let mut result = insight.clone();
 
     // Replace specific file paths with generic ones
-    let path_re = regex::Regex::new(r"/[\w/.-]+").unwrap();
-    result.template = path_re.replace_all(&result.template, "[PATH]").to_string();
+    result.template = PATH_REGEX
+        .replace_all(&result.template, "[PATH]")
+        .to_string();
 
     // Replace URLs
-    let url_re = regex::Regex::new(r"https?://[\w./%-]+").unwrap();
-    result.template = url_re.replace_all(&result.template, "[URL]").to_string();
+    result.template = URL_REGEX.replace_all(&result.template, "[URL]").to_string();
 
     result
 }
@@ -451,12 +478,12 @@ fn assess_sensitivity(text: &str, blocked_categories: &[String]) -> SensitivityA
     }
 }
 
-fn apply_dp_noise(insight: &ExtractedInsight, epsilon: f64) -> Result<ExtractedInsight> {
+fn apply_dp_noise(insight: &ExtractedInsight, _epsilon: f64) -> Result<ExtractedInsight> {
     // For text, DP is tricky. We use a simplified approach:
     // - Add noise to numeric values
     // - Randomly drop some specific words
 
-    let mut result = insight.clone();
+    let result = insight.clone();
 
     // For now, just pass through
     // In production, would apply text-specific DP mechanisms
@@ -519,13 +546,11 @@ fn compress_gradients(gradients: &[f32]) -> Result<Vec<u8>> {
 // Regex helper functions (simplified implementations)
 
 fn regex_replace_numbers(text: &str, replacement: &str) -> String {
-    let re = regex::Regex::new(r"\b\d+\b").unwrap();
-    re.replace_all(text, replacement).to_string()
+    NUMBERS_REGEX.replace_all(text, replacement).to_string()
 }
 
 fn regex_replace_dates(text: &str, replacement: &str) -> String {
-    let re = regex::Regex::new(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b").unwrap();
-    re.replace_all(text, replacement).to_string()
+    DATES_REGEX.replace_all(text, replacement).to_string()
 }
 
 fn regex_replace_names(text: &str, _replacement: &str) -> String {

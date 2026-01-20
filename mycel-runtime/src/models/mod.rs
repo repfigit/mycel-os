@@ -291,7 +291,8 @@ impl ModelManager {
 
     async fn list_huggingface_models(&self) -> Result<Vec<ModelInfo>> {
         // Query Hugging Face API for GGUF models suitable for local inference
-        let url = "https://huggingface.co/api/models?filter=gguf&sort=downloads&direction=-1&limit=50";
+        let url =
+            "https://huggingface.co/api/models?filter=gguf&sort=downloads&direction=-1&limit=50";
 
         let mut request = self.http_client.get(url);
         if let Some(token) = &self.config.hf_token {
@@ -439,17 +440,9 @@ impl ModelManager {
                 "codellama:13b",
             ]
         } else if ram_gb >= 8 {
-            vec![
-                "phi3:medium",
-                "llama3.2:3b",
-                "gemma2:2b",
-            ]
+            vec!["phi3:medium", "llama3.2:3b", "gemma2:2b"]
         } else {
-            vec![
-                "phi3:mini",
-                "llama3.2:1b",
-                "tinyllama",
-            ]
+            vec!["phi3:mini", "llama3.2:1b", "tinyllama"]
         };
 
         Ok(recommended_models
@@ -494,7 +487,7 @@ mod tests {
     #[test]
     fn test_compatibility_check() {
         let hardware = HardwareInfo {
-            total_ram_bytes: 16 * 1024 * 1024 * 1024, // 16GB
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,     // 16GB
             available_ram_bytes: 12 * 1024 * 1024 * 1024, // 12GB available
             gpu_vram_bytes: 0,
             gpu_type: Some(GpuType::None),

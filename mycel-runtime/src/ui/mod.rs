@@ -212,9 +212,7 @@ impl UiFactory {
     </div>
 </body>
 </html>"#,
-                CSP_STRICT,
-                column_count,
-                columns
+                CSP_STRICT, column_count, columns
             ),
             interactive: true,
             state: SurfaceState::Created,
