@@ -3,6 +3,8 @@
 //! Runs AI-generated code in a secure sandbox to prevent
 //! unintended system modifications or security issues.
 
+#![allow(dead_code)]
+
 use anyhow::{anyhow, Result};
 use std::process::Stdio;
 use std::time::Duration;

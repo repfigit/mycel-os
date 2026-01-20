@@ -7,6 +7,8 @@
 //! - Minimal external resource loading
 //! - XSS protection via HTML escaping
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

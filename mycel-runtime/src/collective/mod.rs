@@ -2,6 +2,9 @@
 //!
 //! Integrates Clay OS with decentralized networks (NEAR Protocol + Bittensor)
 //! to enable instances to learn from each other.
+//!
+//! Note: This module is scaffolded - blockchain integration is deferred.
+#![allow(dead_code)]
 
 pub mod bittensor;
 pub mod discovery;

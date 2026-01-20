@@ -1,6 +1,9 @@
 //! Code Generation utilities
 //!
 //! Helpers for generating, validating, and managing AI-generated code.
+//!
+//! Note: This module is scaffolded for future implementation.
+#![allow(dead_code)]
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

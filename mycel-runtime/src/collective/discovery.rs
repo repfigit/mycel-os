@@ -1,6 +1,10 @@
 //! Discovery - Find relevant patterns from local cache and network
 //!
 //! Implements multi-source pattern discovery with intelligent ranking.
+//!
+//! Note: This module is scaffolded - full implementation deferred.
+#![allow(dead_code)]
+#![allow(clippy::double_ended_iterator_last)]
 
 use anyhow::Result;
 use std::sync::Arc;

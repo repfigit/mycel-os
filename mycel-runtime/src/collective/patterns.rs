@@ -2,6 +2,12 @@
 //!
 //! A pattern is a reusable solution to a class of problems, extracted
 //! from successful interactions.
+//!
+//! Note: This module is scaffolded - full implementation deferred.
+#![allow(dead_code)]
+#![allow(clippy::unnecessary_map_or)]
+#![allow(clippy::or_fun_call)]
+#![allow(clippy::unwrap_or_default)]
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

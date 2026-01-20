@@ -3,6 +3,9 @@
 //! Handles communication with Bittensor network for:
 //! - Distributed inference
 //! - Pattern evaluation
+//!
+//! Note: This module is scaffolded - blockchain integration is deferred.
+#![allow(dead_code)]
 //! - Federated learning
 //! - TAO rewards
 

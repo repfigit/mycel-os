@@ -4,6 +4,8 @@
 //! preventing accidental destructive operations and requiring
 //! explicit confirmation for high-risk actions.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 

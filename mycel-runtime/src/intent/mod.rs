@@ -3,6 +3,8 @@
 //! Intents represent what the user wants to accomplish, extracted from
 //! their natural language input.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 /// The type of action an intent requires

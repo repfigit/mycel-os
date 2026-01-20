@@ -2,6 +2,11 @@
 //!
 //! Ensures that shared patterns don't leak private information while
 //! still being useful to the collective.
+//!
+//! Note: This module is scaffolded - full implementation deferred.
+#![allow(dead_code)]
+#![allow(clippy::unnecessary_map_or)]
+#![allow(clippy::let_and_return)]
 
 use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;

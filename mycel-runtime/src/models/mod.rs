@@ -7,6 +7,9 @@
 //! - Local files (user-provided models)
 //!
 //! Hardware compatibility is checked before model download/load.
+//!
+//! Note: This module is scaffolded - full implementation deferred.
+#![allow(dead_code)]
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -14,20 +17,15 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 
 /// Model provider backends
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ModelBackend {
     /// Ollama - default, handles hardware detection automatically
+    #[default]
     Ollama,
     /// Hugging Face models via llama.cpp (GGUF format)
     HuggingFace,
     /// Local model files
     LocalFile,
-}
-
-impl Default for ModelBackend {
-    fn default() -> Self {
-        Self::Ollama
-    }
 }
 
 /// Hardware capabilities detected on the system
@@ -309,7 +307,7 @@ impl ModelManager {
 
                 Some(ModelInfo {
                     id: id.clone(),
-                    name: id.split('/').last().unwrap_or(&id).to_string(),
+                    name: id.split('/').next_back().unwrap_or(&id).to_string(),
                     description: m["description"].as_str().unwrap_or("").to_string(),
                     size_bytes: 0, // Would need to fetch from model card
                     backend: ModelBackend::HuggingFace,

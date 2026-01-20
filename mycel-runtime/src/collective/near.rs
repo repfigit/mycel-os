@@ -3,6 +3,11 @@
 //! Handles communication with NEAR blockchain for:
 //! - Pattern registry
 //! - Reputation system
+//!
+//! Note: This module is scaffolded - blockchain integration is deferred.
+#![allow(dead_code)]
+#![allow(clippy::needless_borrow)]
+#![allow(clippy::unnecessary_lazy_evaluations)]
 //! - Micropayments
 
 use anyhow::{anyhow, Result};

@@ -9,6 +9,8 @@
 //! - Rate limiting per connection (100 req/min)
 //! - Message size limit (1MB)
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -388,5 +390,154 @@ impl IpcClient {
             message: message.to_string(),
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Rate limiter tests
+
+    #[test]
+    fn test_rate_limiter_allows_within_limit() {
+        let mut limiter = RateLimiter::new(10, Duration::from_secs(60));
+
+        // Should allow 10 requests
+        for _ in 0..10 {
+            assert!(limiter.check(), "Should allow requests within limit");
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_blocks_over_limit() {
+        let mut limiter = RateLimiter::new(5, Duration::from_secs(60));
+
+        // Use up the limit
+        for _ in 0..5 {
+            assert!(limiter.check());
+        }
+
+        // Should block the 6th request
+        assert!(!limiter.check(), "Should block requests over limit");
+    }
+
+    #[test]
+    fn test_rate_limiter_resets_after_window() {
+        let mut limiter = RateLimiter::new(2, Duration::from_millis(10));
+
+        // Use up the limit
+        assert!(limiter.check());
+        assert!(limiter.check());
+        assert!(!limiter.check());
+
+        // Wait for window to pass
+        std::thread::sleep(Duration::from_millis(15));
+
+        // Should allow again
+        assert!(limiter.check(), "Should allow requests after window resets");
+    }
+
+    // Request/Response serialization tests
+
+    #[test]
+    fn test_authenticate_request_serialization() {
+        let request = IpcRequest::Authenticate {
+            token: "test-token".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("Authenticate"));
+        assert!(json.contains("test-token"));
+
+        let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            IpcRequest::Authenticate { token } => assert_eq!(token, "test-token"),
+            _ => panic!("Expected Authenticate request"),
+        }
+    }
+
+    #[test]
+    fn test_chat_request_serialization() {
+        let request = IpcRequest::Chat {
+            message: "Hello, world!".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("Chat"));
+        assert!(json.contains("Hello, world!"));
+    }
+
+    #[test]
+    fn test_ping_request_serialization() {
+        let request = IpcRequest::Ping;
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("Ping"));
+
+        let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, IpcRequest::Ping));
+    }
+
+    #[test]
+    fn test_error_response_serialization() {
+        let response = IpcResponse::Error {
+            message: "Something went wrong".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("Error"));
+        assert!(json.contains("Something went wrong"));
+    }
+
+    #[test]
+    fn test_ok_response_serialization() {
+        let response = IpcResponse::Ok {
+            message: "Success".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("Ok"));
+        assert!(json.contains("Success"));
+    }
+
+    #[test]
+    fn test_pong_response_serialization() {
+        let response = IpcResponse::Pong;
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("Pong"));
+    }
+
+    // Message size validation tests
+
+    #[test]
+    fn test_max_message_size_constant() {
+        assert_eq!(MAX_MESSAGE_SIZE, 1024 * 1024); // 1MB
+    }
+
+    #[test]
+    fn test_rate_limit_constants() {
+        assert_eq!(RATE_LIMIT_REQUESTS, 100);
+        assert_eq!(RATE_LIMIT_WINDOW, Duration::from_secs(60));
+    }
+
+    // Request type coverage tests
+
+    #[test]
+    fn test_all_request_types_deserialize() {
+        let test_cases = [
+            r#"{"type":"Authenticate","token":"abc"}"#,
+            r#"{"type":"Chat","message":"hello"}"#,
+            r#"{"type":"SetSession","id":"sess-1"}"#,
+            r#"{"type":"GetContext"}"#,
+            r#"{"type":"Ping"}"#,
+        ];
+
+        for json in test_cases {
+            let result: Result<IpcRequest, _> = serde_json::from_str(json);
+            assert!(result.is_ok(), "Failed to deserialize: {}", json);
+        }
+    }
+
+    #[test]
+    fn test_invalid_request_fails() {
+        let invalid_json = r#"{"type":"InvalidType"}"#;
+        let result: Result<IpcRequest, _> = serde_json::from_str(invalid_json);
+        assert!(result.is_err(), "Should fail on invalid request type");
     }
 }
