@@ -71,6 +71,9 @@ base64 = "0.21"
 regex = "1.10"
 rand = "0.8"
 
+# System information for hardware detection
+sysinfo = "0.31"
+
 [features]
 default = ["ollama"]
 ollama = []

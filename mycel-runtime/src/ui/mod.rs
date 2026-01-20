@@ -1,6 +1,11 @@
 //! UI Factory - Dynamic interface generation
 //!
 //! Creates surfaces (UI elements) on-demand based on AI specifications.
+//!
+//! Security features:
+//! - Content Security Policy (CSP) headers on all HTML surfaces
+//! - Minimal external resource loading
+//! - XSS protection via HTML escaping
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -8,6 +13,12 @@ use uuid::Uuid;
 
 use crate::ai::UiSpec;
 use crate::config::MycelConfig;
+
+/// Content Security Policy for surfaces without external resources
+const CSP_STRICT: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none';";
+
+/// Content Security Policy for surfaces with CodeMirror CDN
+const CSP_CODEMIRROR: &str = "default-src 'none'; script-src https://cdnjs.cloudflare.com 'unsafe-inline'; style-src 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none';";
 
 /// Factory for creating UI surfaces
 #[derive(Clone)]
@@ -57,6 +68,9 @@ impl UiFactory {
                 r#"<!DOCTYPE html>
 <html>
 <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Security-Policy" content="{}">
+    <meta name="referrer" content="no-referrer">
     <style>
         body {{
             font-family: system-ui, sans-serif;
@@ -77,6 +91,7 @@ impl UiFactory {
     <pre>{}</pre>
 </body>
 </html>"#,
+                CSP_STRICT,
                 html_escape::encode_text(content)
             ),
             interactive: false,
@@ -96,6 +111,9 @@ impl UiFactory {
                 r#"<!DOCTYPE html>
 <html>
 <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Security-Policy" content="{}">
+    <meta name="referrer" content="no-referrer">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/mode/python/python.min.js"></script>
@@ -115,6 +133,7 @@ impl UiFactory {
     </script>
 </body>
 </html>"#,
+                CSP_CODEMIRROR,
                 html_escape::encode_text(code),
                 language
             ),
@@ -152,6 +171,9 @@ impl UiFactory {
                 r#"<!DOCTYPE html>
 <html>
 <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Security-Policy" content="{}">
+    <meta name="referrer" content="no-referrer">
     <style>
         body {{
             font-family: system-ui, sans-serif;
@@ -190,7 +212,9 @@ impl UiFactory {
     </div>
 </body>
 </html>"#,
-                column_count, columns
+                CSP_STRICT,
+                column_count,
+                columns
             ),
             interactive: true,
             state: SurfaceState::Created,

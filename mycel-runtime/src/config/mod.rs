@@ -45,6 +45,14 @@ pub struct MycelConfig {
     /// Prefer cloud for complex tasks
     #[serde(default = "default_true")]
     pub prefer_cloud_for_complex: bool,
+
+    /// Execution timeout in seconds (default: 30)
+    #[serde(default = "default_execution_timeout")]
+    pub execution_timeout_secs: u64,
+
+    /// Memory limit for code execution in MB (default: 512)
+    #[serde(default = "default_execution_memory")]
+    pub execution_memory_mb: u32,
 }
 
 fn default_ollama_url() -> String {
@@ -83,6 +91,14 @@ fn default_max_tokens() -> u32 {
     2048
 }
 
+fn default_execution_timeout() -> u64 {
+    30
+}
+
+fn default_execution_memory() -> u32 {
+    512
+}
+
 impl Default for MycelConfig {
     fn default() -> Self {
         Self {
@@ -96,6 +112,8 @@ impl Default for MycelConfig {
             sandbox_enabled: true,
             local_max_tokens: 2048,
             prefer_cloud_for_complex: true,
+            execution_timeout_secs: default_execution_timeout(),
+            execution_memory_mb: default_execution_memory(),
         }
     }
 }

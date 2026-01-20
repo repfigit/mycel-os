@@ -6,6 +6,7 @@
 //! - Micropayments
 
 use anyhow::{anyhow, Result};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -246,8 +247,8 @@ impl NearClient {
         // In production, this would sign and send a transaction
         // For now, we'll simulate the call
         
-        let args_base64 = base64::encode(serde_json::to_string(&args)?);
-        
+        let args_base64 = base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&args)?);
+
         let response = self.http_client
             .post(&self.config.rpc_url)
             .json(&serde_json::json!({
@@ -281,7 +282,7 @@ impl NearClient {
         method: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let args_base64 = base64::encode(serde_json::to_string(&args)?);
+        let args_base64 = base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&args)?);
         
         let response = self.http_client
             .post(&self.config.rpc_url)

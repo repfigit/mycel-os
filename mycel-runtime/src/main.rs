@@ -14,8 +14,8 @@
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{info, instrument};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod ai;
 mod codegen;
@@ -24,6 +24,8 @@ mod context;
 mod executor;
 mod intent;
 mod ipc;
+mod models;
+mod policy;
 mod ui;
 mod collective;
 mod sync;
@@ -73,13 +75,22 @@ fn print_banner() {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize logging
-    let log_level = if args.verbose { Level::DEBUG } else { Level::INFO };
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(log_level)
-        .with_target(false)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    // Initialize structured logging with EnvFilter support
+    // Can override with RUST_LOG env var (e.g., RUST_LOG=mycel_runtime=debug)
+    let default_level = if args.verbose { "debug" } else { "info" };
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("mycel_runtime={}", default_level)));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            fmt::layer()
+                .with_target(true)
+                .with_thread_ids(args.verbose)
+                .with_file(args.verbose)
+                .with_line_number(args.verbose),
+        )
+        .init();
 
     print_banner();
     info!("Mycel Runtime starting...");
@@ -135,6 +146,19 @@ async fn main() -> Result<()> {
         tokio::spawn(run_dev_cli(runtime.clone()));
     }
 
+    // Start background session cleanup task (every hour)
+    let cleanup_context_manager = runtime.context_manager.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            let removed = cleanup_context_manager.cleanup_stale_sessions(None).await;
+            if removed > 0 {
+                info!(removed_sessions = removed, "Periodic session cleanup completed");
+            }
+        }
+    });
+
     // Main event loop
     info!("Mycel Runtime ready. The network grows.");
     ipc_server.run().await?;
@@ -155,7 +179,16 @@ pub struct MycelRuntime {
 
 impl MycelRuntime {
     /// Process a user input and generate a response
+    #[instrument(
+        skip(self, input),
+        fields(
+            request_id = %uuid::Uuid::new_v4(),
+            input_len = input.len(),
+        )
+    )]
     pub async fn process_input(&self, input: &str, session_id: &str) -> Result<RuntimeResponse> {
+        info!("Processing user input");
+
         // Get current context
         let context = self.context_manager.get_context(session_id).await?;
 

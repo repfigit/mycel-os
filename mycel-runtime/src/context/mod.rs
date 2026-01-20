@@ -4,15 +4,23 @@
 //! - Current session (what the user is working on)
 //! - User preferences and history
 //! - System state (files, apps, connections)
+//!
+//! Memory management:
+//! - Sessions are cleaned up after configurable TTL (default: 24 hours)
+//! - Call cleanup_stale_sessions() periodically to reclaim memory
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::info;
 
 use crate::config::MycelConfig;
+
+/// Default session TTL in hours
+const DEFAULT_SESSION_TTL_HOURS: i64 = 24;
 
 /// Main context manager
 #[derive(Clone)]
@@ -43,6 +51,9 @@ impl ContextManager {
             .entry(session_id.to_string())
             .or_insert_with(|| SessionContext::new(session_id));
 
+        // Update last accessed time
+        session.touch();
+
         Ok(Context {
             session_id: session_id.to_string(),
             working_directory: session.working_directory.clone(),
@@ -64,6 +75,7 @@ impl ContextManager {
         let mut sessions = self.sessions.write().await;
 
         if let Some(session) = sessions.get_mut(session_id) {
+            session.touch();
             session.conversation_history.push(ConversationTurn {
                 timestamp: Utc::now(),
                 user: user_input.to_string(),
@@ -84,6 +96,7 @@ impl ContextManager {
         let mut sessions = self.sessions.write().await;
 
         if let Some(session) = sessions.get_mut(session_id) {
+            session.touch();
             // Remove if already present, then add to front
             session.recent_files.retain(|f| f != file_path);
             session.recent_files.insert(0, file_path.to_string());
@@ -100,6 +113,7 @@ impl ContextManager {
         let mut sessions = self.sessions.write().await;
 
         if let Some(session) = sessions.get_mut(session_id) {
+            session.touch();
             session.working_directory = path.to_string();
         }
 
@@ -112,6 +126,36 @@ impl ContextManager {
         user_ctx.preferences.insert(key.to_string(), value.to_string());
         user_ctx.save(&self.config.context_path).await?;
         Ok(())
+    }
+
+    /// Clean up sessions that haven't been accessed within the TTL
+    ///
+    /// This prevents unbounded memory growth from accumulated sessions.
+    /// Should be called periodically (e.g., every hour).
+    pub async fn cleanup_stale_sessions(&self, max_age_hours: Option<i64>) -> usize {
+        let ttl = Duration::hours(max_age_hours.unwrap_or(DEFAULT_SESSION_TTL_HOURS));
+        let cutoff = Utc::now() - ttl;
+
+        let mut sessions = self.sessions.write().await;
+        let before_count = sessions.len();
+
+        sessions.retain(|_id, session| session.last_accessed > cutoff);
+
+        let removed = before_count - sessions.len();
+        if removed > 0 {
+            info!(
+                removed_sessions = removed,
+                remaining_sessions = sessions.len(),
+                "Cleaned up stale sessions"
+            );
+        }
+
+        removed
+    }
+
+    /// Get the number of active sessions
+    pub async fn session_count(&self) -> usize {
+        self.sessions.read().await.len()
     }
 }
 
@@ -140,6 +184,7 @@ pub struct ConversationTurn {
 pub struct SessionContext {
     pub id: String,
     pub created_at: DateTime<Utc>,
+    pub last_accessed: DateTime<Utc>,
     pub working_directory: String,
     pub recent_files: Vec<String>,
     pub conversation_history: Vec<ConversationTurn>,
@@ -148,9 +193,11 @@ pub struct SessionContext {
 
 impl SessionContext {
     pub fn new(id: &str) -> Self {
+        let now = Utc::now();
         Self {
             id: id.to_string(),
-            created_at: Utc::now(),
+            created_at: now,
+            last_accessed: now,
             working_directory: dirs::home_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "/home".to_string()),
@@ -158,6 +205,11 @@ impl SessionContext {
             conversation_history: Vec::new(),
             metadata: HashMap::new(),
         }
+    }
+
+    /// Update the last accessed timestamp
+    pub fn touch(&mut self) {
+        self.last_accessed = Utc::now();
     }
 }
 
