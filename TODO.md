@@ -265,19 +265,48 @@ pub fn parse_pairing_code(code: &str) -> Result<PairingInfo> { /* ... */ }
 
 ### Task 10.1: Test Docker Build
 ```bash
-cd docker
-docker compose build mycel-dev
+# Verify Docker works in Codespace
+docker run hello-world
 ```
 
-### Task 10.2: Test ISO Script
+### Task 10.2: Build Minimal ISO
 ```bash
-# Inside container
-./scripts/build-mycel-iso.sh
+./scripts/build-iso.sh quick
 ```
 
-### Task 10.3: Test ISO in VM
+**Expected output:**
+- `output/mycel-os-minimal-*.iso` (~700MB-1GB)
+- Build time: 5-10 minutes
+
+### Task 10.3: Test ISO in QEMU
 ```bash
-qemu-system-x86_64 -enable-kvm -m 4G -cdrom output/mycel-os-latest.iso
+./scripts/test-iso.sh
+```
+
+**In the VM:**
+- Login: `root` (no password or `voidlinux`)
+- Test networking: `ping google.com`
+- Exit QEMU: `Ctrl+A, X`
+
+### Task 10.4: Build Full ISO with Runtime
+```bash
+# First build the runtime
+cd mycel-runtime
+cargo build --release
+
+# Then build full ISO
+cd ..
+./scripts/build-iso.sh full
+```
+
+### Task 10.5: Verify Runtime in ISO
+```bash
+# Boot ISO
+./scripts/test-iso.sh
+
+# In VM, check for runtime
+which mycel-runtime
+mycel-runtime --version
 ```
 
 ---

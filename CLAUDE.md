@@ -134,6 +134,42 @@ cargo build
 
 ---
 
+## Building and Testing ISOs
+
+### Quick ISO Build
+
+```bash
+# Build minimal bootable ISO (~5-10 min)
+./scripts/build-iso.sh quick
+```
+
+### Full ISO Build
+
+```bash
+# Build complete ISO with all packages (~15-30 min)
+./scripts/build-iso.sh full
+```
+
+### Test ISO in QEMU
+
+```bash
+# Serial console (headless, works in Codespaces)
+./scripts/test-iso.sh
+
+# VNC mode (if you need GUI)
+./scripts/test-iso.sh output/mycel-os-*.iso vnc
+```
+
+### SSH into Running VM
+
+```bash
+ssh -p 2222 root@localhost
+```
+
+See `.devcontainer/INSTRUCTIONS.md` for complete ISO build guide.
+
+---
+
 ## Phase 1: Get It Running (Priority)
 
 ### Step 1: Verify Compilation

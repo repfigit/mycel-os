@@ -1,0 +1,31 @@
+# Void Linux ISO Builder
+# Used to create bootable Mycel OS images
+
+FROM ghcr.io/void-linux/void-glibc-full:latest
+
+# Install build dependencies
+RUN xbps-install -Syu && xbps-install -y \
+    base-devel \
+    git \
+    curl \
+    xz \
+    squashfs-tools \
+    liblz4 \
+    grub-x86_64-efi \
+    grub-i386-pc \
+    dosfstools \
+    e2fsprogs \
+    mtools \
+    xorriso \
+    void-mklive
+
+# Create build user
+RUN useradd -m builder
+WORKDIR /build
+
+# Copy build scripts
+COPY scripts/void-build-iso.sh /build/
+RUN chmod +x /build/void-build-iso.sh
+
+# Default command
+CMD ["/build/void-build-iso.sh"]
