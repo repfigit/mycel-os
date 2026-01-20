@@ -279,8 +279,8 @@ impl PatternDiscovery {
         }
         
         // Keyword overlap between trigger and recent activity
-        let trigger_words: std::collections::HashSet<_> = pattern.trigger
-            .to_lowercase()
+        let trigger_lower = pattern.trigger.to_lowercase();
+        let trigger_words: std::collections::HashSet<_> = trigger_lower
             .split_whitespace()
             .collect();
         

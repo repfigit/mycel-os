@@ -26,6 +26,7 @@ mod intent;
 mod ipc;
 mod ui;
 mod collective;
+mod sync;
 
 use crate::config::MycelConfig;
 
@@ -109,6 +110,11 @@ async fn main() -> Result<()> {
     let ui_factory = ui::UiFactory::new(&config)?;
     info!("UI factory ready");
 
+    // Initialize sync service
+    let sync_service = sync::SyncService::new(&config).await?;
+    sync_service.start().await?;
+    info!("Sync service ready");
+
     // Create the main runtime
     let runtime = MycelRuntime {
         config,
@@ -116,6 +122,7 @@ async fn main() -> Result<()> {
         ai_router,
         executor,
         ui_factory,
+        sync_service,
     };
 
     // Start the IPC server (for UI and other components to connect)
@@ -143,6 +150,7 @@ pub struct MycelRuntime {
     pub ai_router: ai::AiRouter,
     pub executor: executor::CodeExecutor,
     pub ui_factory: ui::UiFactory,
+    pub sync_service: sync::SyncService,
 }
 
 impl MycelRuntime {

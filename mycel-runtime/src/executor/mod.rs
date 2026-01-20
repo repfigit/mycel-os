@@ -15,32 +15,48 @@ use crate::config::MycelConfig;
 #[derive(Clone)]
 pub struct CodeExecutor {
     config: MycelConfig,
-    sandbox_enabled: bool,
+    sandbox_type: SandboxType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SandboxType {
+    Firejail,
+    Bubblewrap,
+    None,
 }
 
 impl CodeExecutor {
     pub fn new(config: &MycelConfig) -> Result<Self> {
         // Check if we have sandboxing capabilities
-        let sandbox_enabled = Self::check_sandbox_available();
+        let sandbox_type = Self::check_sandbox_available();
         
-        if !sandbox_enabled {
-            warn!("Sandboxing not available - running in restricted mode");
+        if config.sandbox_enabled && sandbox_type == SandboxType::None {
+            warn!("Sandboxing enabled but no supported sandbox tool found (firejail, bwrap). Execution will be BLOCKED.");
         }
 
         Ok(Self {
             config: config.clone(),
-            sandbox_enabled,
+            sandbox_type,
         })
     }
 
-    fn check_sandbox_available() -> bool {
-        // Check for various sandboxing options
-        // In production, we'd use gVisor, Firecracker, or Linux namespaces
-        // For now, we'll use a simple approach
+    fn check_sandbox_available() -> SandboxType {
+        // Check for firejail
+        if Self::check_command("firejail") {
+            return SandboxType::Firejail;
+        }
         
-        // Check if firejail is available
+        // Check for bwrap
+        if Self::check_command("bwrap") {
+            return SandboxType::Bubblewrap;
+        }
+
+        SandboxType::None
+    }
+
+    fn check_command(cmd: &str) -> bool {
         std::process::Command::new("which")
-            .arg("firejail")
+            .arg(cmd)
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -83,23 +99,45 @@ impl CodeExecutor {
         // Validate code before execution
         self.validate_python_code(code)?;
 
-        let mut cmd = if self.sandbox_enabled {
-            let mut c = Command::new("firejail");
-            c.args([
-                "--quiet",
-                "--private",
-                "--net=none",
-                "--nosound",
-                "--no3d",
-                "python3",
-                "-c",
-            ]);
-            c.arg(code);
-            c
-        } else {
-            let mut c = Command::new("python3");
-            c.arg("-c").arg(code);
-            c
+        let mut cmd = match self.sandbox_type {
+            SandboxType::Firejail => {
+                let mut c = Command::new("firejail");
+                c.args([
+                    "--quiet",
+                    "--private",
+                    "--net=none",
+                    "--nosound",
+                    "--no3d",
+                    "python3",
+                    "-c",
+                ]);
+                c.arg(code);
+                c
+            }
+            SandboxType::Bubblewrap => {
+                let mut c = Command::new("bwrap");
+                c.args([
+                    "--ro-bind", "/", "/",
+                    "--dev", "/dev",
+                    "--proc", "/proc",
+                    "--tmpfs", "/tmp",
+                    "--unshare-all",
+                    "--new-session",
+                    "--die-with-parent",
+                    "python3",
+                    "-c",
+                ]);
+                c.arg(code);
+                c
+            }
+            SandboxType::None => {
+                if self.config.sandbox_enabled {
+                    return Err(anyhow!("Sandbox enabled but no sandbox tool available. Install firejail or bubblewrap, or disable sandbox in config (unsafe)."));
+                }
+                let mut c = Command::new("python3");
+                c.arg("-c").arg(code);
+                c
+            }
         };
 
         let output = cmd
@@ -123,21 +161,43 @@ impl CodeExecutor {
 
         self.validate_js_code(code)?;
 
-        let mut cmd = if self.sandbox_enabled {
-            let mut c = Command::new("firejail");
-            c.args([
-                "--quiet",
-                "--private",
-                "--net=none",
-                "node",
-                "-e",
-            ]);
-            c.arg(code);
-            c
-        } else {
-            let mut c = Command::new("node");
-            c.arg("-e").arg(code);
-            c
+        let mut cmd = match self.sandbox_type {
+            SandboxType::Firejail => {
+                let mut c = Command::new("firejail");
+                c.args([
+                    "--quiet",
+                    "--private",
+                    "--net=none",
+                    "node",
+                    "-e",
+                ]);
+                c.arg(code);
+                c
+            }
+            SandboxType::Bubblewrap => {
+                let mut c = Command::new("bwrap");
+                c.args([
+                    "--ro-bind", "/", "/",
+                    "--dev", "/dev",
+                    "--proc", "/proc",
+                    "--tmpfs", "/tmp",
+                    "--unshare-all",
+                    "--new-session",
+                    "--die-with-parent",
+                    "node",
+                    "-e",
+                ]);
+                c.arg(code);
+                c
+            }
+            SandboxType::None => {
+                if self.config.sandbox_enabled {
+                    return Err(anyhow!("Sandbox enabled but no sandbox tool available. Install firejail or bubblewrap, or disable sandbox in config (unsafe)."));
+                }
+                let mut c = Command::new("node");
+                c.arg("-e").arg(code);
+                c
+            }
         };
 
         let output = cmd
@@ -162,21 +222,40 @@ impl CodeExecutor {
         // Shell is dangerous - extra validation
         self.validate_shell_code(code)?;
 
-        let mut cmd = if self.sandbox_enabled {
-            let mut c = Command::new("firejail");
-            c.args([
-                "--quiet",
-                "--private",
-                "--net=none",
-                "--read-only=/",
-                "bash",
-                "-c",
-            ]);
-            c.arg(code);
-            c
-        } else {
-            // Without sandbox, refuse to run shell
-            return Err(anyhow!("Shell execution requires sandboxing"));
+        let mut cmd = match self.sandbox_type {
+            SandboxType::Firejail => {
+                let mut c = Command::new("firejail");
+                c.args([
+                    "--quiet",
+                    "--private",
+                    "--net=none",
+                    "--read-only=/",
+                    "bash",
+                    "-c",
+                ]);
+                c.arg(code);
+                c
+            }
+            SandboxType::Bubblewrap => {
+                let mut c = Command::new("bwrap");
+                c.args([
+                    "--ro-bind", "/", "/",
+                    "--dev", "/dev",
+                    "--proc", "/proc",
+                    "--tmpfs", "/tmp",
+                    "--unshare-all",
+                    "--new-session",
+                    "--die-with-parent",
+                    "bash",
+                    "-c",
+                ]);
+                c.arg(code);
+                c
+            }
+            SandboxType::None => {
+                // Without sandbox, refuse to run shell regardless of config
+                return Err(anyhow!("Shell execution ALWAYS requires sandboxing. Install firejail or bubblewrap."));
+            }
         };
 
         let output = cmd

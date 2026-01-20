@@ -211,6 +211,34 @@ pub struct Surface {
     pub state: SurfaceState,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MycelConfig;
+
+    #[test]
+    fn test_text_surface_generation() {
+        let config = MycelConfig::default();
+        let factory = UiFactory::new(&config).unwrap();
+        let surface = factory.text_surface("Test Title", "Hello World");
+
+        assert_eq!(surface.title, "Test Title");
+        assert!(surface.content.contains("Hello World"));
+        assert!(surface.content.contains("<!DOCTYPE html>"));
+    }
+
+    #[test]
+    fn test_code_editor_surface() {
+        let config = MycelConfig::default();
+        let factory = UiFactory::new(&config).unwrap();
+        let surface = factory.code_editor_surface("Code", "print('hi')", "python");
+
+        assert!(surface.content.contains("print('hi')"));
+        assert!(surface.content.contains("python"));
+        assert!(surface.interactive);
+    }
+}
+
 /// Types of surfaces
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SurfaceType {

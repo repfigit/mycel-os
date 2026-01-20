@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::config::ClayConfig;
+use crate::config::MycelConfig;
 use crate::context::Context;
 
 /// Main collective intelligence coordinator
@@ -27,8 +27,8 @@ pub struct CollectiveIntelligence {
 }
 
 impl CollectiveIntelligence {
-    pub async fn new(config: &ClayConfig) -> Result<Self> {
-        let collective_config = CollectiveConfig::from_clay_config(config);
+    pub async fn new(config: &MycelConfig) -> Result<Self> {
+        let collective_config = CollectiveConfig::from_mycel_config(config);
         
         // Initialize NEAR client if configured
         let near_client = if collective_config.near_enabled {
@@ -83,7 +83,7 @@ impl CollectiveIntelligence {
         // If pattern is from network, handle payment
         if let Some(ref near) = self.near_client {
             if pattern.source == patterns::PatternSource::Network {
-                near.use_pattern(&pattern.id, pattern.price_per_use).await?;
+                near.use_pattern(&pattern.id, pattern.suggested_price.unwrap_or(0)).await?;
             }
         }
         
@@ -236,7 +236,7 @@ pub struct CollectiveConfig {
 }
 
 impl CollectiveConfig {
-    pub fn from_clay_config(config: &ClayConfig) -> Self {
+    pub fn from_mycel_config(config: &MycelConfig) -> Self {
         // Extract collective config from main config
         // For now, use defaults
         Self::default()
