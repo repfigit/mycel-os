@@ -1,40 +1,20 @@
 {
-  "name": "Mycel OS Development",
+  "name": "Mycel OS",
   "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
-  
   "features": {
     "ghcr.io/devcontainers/features/python:1": {
       "version": "3.11"
     },
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {
-      "moby": true,
-      "dockerDashComposeVersion": "v2"
-    }
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
   },
-
   "customizations": {
     "vscode": {
       "extensions": [
         "rust-lang.rust-analyzer",
-        "tamasfe.even-better-toml",
-        "ms-python.python",
-        "ms-azuretools.vscode-docker"
-      ],
-      "settings": {
-        "rust-analyzer.checkOnSave.command": "clippy"
-      }
+        "tamasfe.even-better-toml"
+      ]
     }
   },
-
-  "forwardPorts": [11434, 5900, 6080],
-  
-  "portsAttributes": {
-    "11434": { "label": "Ollama" },
-    "5900": { "label": "VNC" },
-    "6080": { "label": "noVNC Web" }
-  },
-
-  "postCreateCommand": "bash .devcontainer/setup.sh",
-  
+  "postCreateCommand": "rustup component add clippy rustfmt && sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils",
   "remoteUser": "vscode"
 }
