@@ -18,20 +18,20 @@ This is the definitive guide for Claude Code to build Mycel OS. Read completely 
 
 ### Code Completeness: ~70% Scaffolded
 
-| Module | Lines | Status | Notes |
-|--------|-------|--------|-------|
-| `main.rs` | 256 | ✅ Working | Entry point, CLI, runtime struct |
-| `config/mod.rs` | 140 | ✅ Working | Config loading, defaults |
-| `ai/mod.rs` | 357 | ✅ Working | Ollama + Claude API clients |
-| `context/mod.rs` | 201 | ✅ Working | Session management |
-| `intent/mod.rs` | 152 | ✅ Working | Intent parsing types |
-| `executor/mod.rs` | 284 | ⚠️ Partial | Sandbox scaffolded |
-| `ipc/mod.rs` | 229 | ⚠️ Partial | Socket server scaffolded |
-| `ui/mod.rs` | 233 | ⚠️ Partial | Surface generation scaffolded |
-| `codegen/mod.rs` | 217 | ⚠️ Partial | Code generation scaffolded |
-| `collective/` | 282+ | ⚠️ Partial | NEAR/Bittensor stubs |
-| `sync/` | 0 | ❌ Missing | Device mesh not started |
-| **Total** | ~2,350 | | |
+| Module            | Lines  | Status    | Notes                            |
+| ----------------- | ------ | --------- | -------------------------------- |
+| `main.rs`         | 256    | ✅ Working | Entry point, CLI, runtime struct |
+| `config/mod.rs`   | 140    | ✅ Working | Config loading, defaults         |
+| `ai/mod.rs`       | 357    | ✅ Working | Ollama + Claude API clients      |
+| `context/mod.rs`  | 201    | ✅ Working | Session management               |
+| `intent/mod.rs`   | 152    | ✅ Working | Intent parsing types             |
+| `executor/mod.rs` | 284    | ⚠️ Partial | Sandbox scaffolded               |
+| `ipc/mod.rs`      | 229    | ⚠️ Partial | Socket server scaffolded         |
+| `ui/mod.rs`       | 233    | ⚠️ Partial | Surface generation scaffolded    |
+| `codegen/mod.rs`  | 217    | ⚠️ Partial | Code generation scaffolded       |
+| `collective/`     | 282+   | ⚠️ Partial | NEAR/Bittensor stubs             |
+| `sync/`           | 0      | ❌ Missing | Device mesh not started          |
+| **Total**         | ~2,350 |           |                                  |
 
 ### What Works (Once Compiled)
 - Config loading from TOML with env var overrides
@@ -92,30 +92,20 @@ mycel-os/
 
 ## Development Environment
 
-### Option 1: GitHub Codespaces (Recommended)
+### Option 1: Docker (Recommended)
 
-The easiest way to develop - everything pre-configured:
+```bash
+# Clone and start the dev container
+git clone <repo> mycel-os
+cd mycel-os
+docker compose -f docker/docker-compose.yml up -d mycel-dev
+docker compose -f docker/docker-compose.yml exec mycel-dev bash
 
-1. Click green "Code" button → "Create codespace on main"
-2. Select **4-core** minimum (8-core recommended)
-3. Wait ~3-5 minutes for setup
-4. Pull a model: `ollama pull phi3:mini`
-5. Build: `mb` (alias for `cargo build`)
-6. Run: `mr` (alias for `cargo run -- --dev`)
-
-**Pre-configured aliases:**
-
-| Alias | Command |
-|-------|---------|
-| `mb` | `cargo build` |
-| `mr` | `cargo run -- --dev --verbose` |
-| `mt` | `cargo test` |
-| `mc` | `cargo check` |
-| `mw` | `cargo watch -x check` |
-| `ollama-start` | Start Ollama service |
-| `ollama-pull MODEL` | Pull a model |
-
-See `.devcontainer/CODESPACE_README.md` for full guide.
+# Inside container:
+cd /workspace/mycel-os/mycel-runtime
+cargo build
+cargo run -- --dev
+```
 
 ### Option 2: Local Development
 
@@ -125,7 +115,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Install Ollama
 curl -fsSL https://ollama.com/install.sh | sh
-ollama pull phi3:mini
+ollama pull tinydolphin
 
 # Build
 cd mycel-runtime
@@ -153,7 +143,7 @@ cargo build
 ### Test ISO in QEMU
 
 ```bash
-# Serial console (headless, works in Codespaces)
+# Serial console (headless)
 ./scripts/test-iso.sh
 
 # VNC mode (if you need GUI)
@@ -166,7 +156,7 @@ cargo build
 ssh -p 2222 root@localhost
 ```
 
-See `.devcontainer/INSTRUCTIONS.md` for complete ISO build guide.
+See `docker/` for the Docker-based build environment.
 
 ---
 
@@ -207,7 +197,7 @@ cargo run -- --dev --verbose
 
 Should see:
 ```
-    ███╗   ███╗██╗   ██╗ ██████╗███████╗██╗     
+    ███╗   ███╗██╗   ██╗ ██████╗███████╗██╗
     ...
     Mycel Runtime starting...
     Configuration loaded...
@@ -424,13 +414,13 @@ cargo build --release
 
 ## File Paths
 
-| Purpose | Dev Mode | Production |
-|---------|----------|------------|
-| Config | `./config/config.toml` | `/etc/mycel/config.toml` |
-| Data | `./mycel-data/` | `/var/lib/mycel/` |
-| Code | `./mycel-code/` | `/var/cache/mycel/code/` |
-| Socket | `/tmp/mycel-dev.sock` | `/run/mycel/runtime.sock` |
-| Logs | stdout | `/var/log/mycel/` |
+| Purpose | Dev Mode               | Production                |
+| ------- | ---------------------- | ------------------------- |
+| Config  | `./config/config.toml` | `/etc/mycel/config.toml`  |
+| Data    | `./mycel-data/`        | `/var/lib/mycel/`         |
+| Code    | `./mycel-code/`        | `/var/cache/mycel/code/`  |
+| Socket  | `/tmp/mycel-dev.sock`  | `/run/mycel/runtime.sock` |
+| Logs    | stdout                 | `/var/log/mycel/`         |
 
 ---
 
@@ -467,18 +457,18 @@ cargo build --release
 
 ## Architecture Decisions
 
-| Decision | Choice | Why |
-|----------|--------|-----|
-| Base OS | Void Linux (musl) | Independent, simple, fast |
-| Language | Rust | Safe, fast, good async |
-| Local AI | Ollama | Easy setup, good models |
-| Cloud AI | Claude | Best reasoning |
-| Config | TOML | Human readable |
-| IPC | Unix socket + JSON | Simple, fast, secure |
-| Sandbox | Firejail/bubblewrap | Linux native |
-| Sync | WireGuard + Hypercore | Encrypted, CRDT-friendly |
-| Coordination | NEAR | Low fees, Rust SDK |
-| AI eval | Bittensor | Built for AI |
+| Decision     | Choice                | Why                       |
+| ------------ | --------------------- | ------------------------- |
+| Base OS      | Void Linux (musl)     | Independent, simple, fast |
+| Language     | Rust                  | Safe, fast, good async    |
+| Local AI     | Ollama                | Easy setup, good models   |
+| Cloud AI     | Claude                | Best reasoning            |
+| Config       | TOML                  | Human readable            |
+| IPC          | Unix socket + JSON    | Simple, fast, secure      |
+| Sandbox      | Firejail/bubblewrap   | Linux native              |
+| Sync         | WireGuard + Hypercore | Encrypted, CRDT-friendly  |
+| Coordination | NEAR                  | Low fees, Rust SDK        |
+| AI eval      | Bittensor             | Built for AI              |
 
 ---
 

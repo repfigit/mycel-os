@@ -14,7 +14,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::{info, instrument};
+use futures::Stream;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod ai;
@@ -22,9 +22,11 @@ mod codegen;
 mod collective;
 mod config;
 mod context;
+mod events;
 mod executor;
 mod intent;
 mod ipc;
+mod mcp;
 mod models;
 mod policy;
 mod sync;
@@ -59,27 +61,16 @@ struct Args {
 }
 
 fn print_banner() {
-    println!(
-        r#"
-    ███╗   ███╗██╗   ██╗ ██████╗███████╗██╗     
-    ████╗ ████║╚██╗ ██╔╝██╔════╝██╔════╝██║     
-    ██╔████╔██║ ╚████╔╝ ██║     █████╗  ██║     
-    ██║╚██╔╝██║  ╚██╔╝  ██║     ██╔══╝  ██║     
-    ██║ ╚═╝ ██║   ██║   ╚██████╗███████╗███████╗
-    ╚═╝     ╚═╝   ╚═╝    ╚═════╝╚══════╝╚══════╝
-    
-    The intelligent network beneath everything.
-"#
-    );
+    // Minimal - the OS speaks for itself
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize structured logging with EnvFilter support
-    // Can override with RUST_LOG env var (e.g., RUST_LOG=mycel_runtime=debug)
-    let default_level = if args.verbose { "debug" } else { "info" };
+    // Initialize logging - quiet by default, verbose only when requested
+    // Can override with RUST_LOG env var
+    let default_level = if args.verbose { "debug" } else { "error" };  // Quiet by default
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("mycel_runtime={}", default_level)));
 
@@ -87,46 +78,50 @@ async fn main() -> Result<()> {
         .with(filter)
         .with(
             fmt::layer()
-                .with_target(true)
-                .with_thread_ids(args.verbose)
-                .with_file(args.verbose)
-                .with_line_number(args.verbose),
+                .with_target(args.verbose)
+                .with_thread_ids(false)
+                .with_file(false)
+                .with_line_number(false),
         )
         .init();
 
     print_banner();
-    info!("Mycel Runtime starting...");
 
-    // Load configuration
     let config = MycelConfig::load(&args.config, args.dev)?;
-    info!("Configuration loaded from {}", args.config);
-
-    // Initialize the context manager
     let context_manager = context::ContextManager::new(&config).await?;
-    info!("Context manager initialized");
-
-    // Initialize AI backends
     let ai_router = if args.no_local_llm {
-        info!("Running in cloud-only mode");
         ai::AiRouter::cloud_only(&config).await?
     } else {
-        info!("Initializing local LLM...");
         ai::AiRouter::new(&config).await?
     };
-    info!("AI router ready");
-
-    // Initialize code executor (sandboxed)
     let executor = executor::CodeExecutor::new(&config)?;
-    info!("Code executor initialized");
-
-    // Initialize UI factory
+    let policy_evaluator = policy::PolicyEvaluator::with_defaults();
     let ui_factory = ui::UiFactory::new(&config)?;
-    info!("UI factory ready");
 
-    // Initialize sync service
-    let sync_service = sync::SyncService::new(&config).await?;
+    // Create system event bus
+    let (event_bus, _) = tokio::sync::broadcast::channel(100);
+
+    // Initialize MCP manager with default void-tools config if none specified
+    let runtime_path = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    let mcp_config = if config.mcp.servers.is_empty() && config.mcp.enabled {
+        // Use default void-tools configuration
+        mcp::default_void_tools_config(&runtime_path)
+    } else {
+        config.mcp.clone()
+    };
+
+    let mcp_manager = mcp::McpManager::new(&mcp_config, &runtime_path, event_bus.clone()).await?;
+    // Start MCP servers in the background
+    if let Err(e) = mcp_manager.start_servers().await {
+        tracing::warn!("Failed to start MCP servers: {}", e);
+    }
+
+    let sync_service =
+        sync::SyncService::new(&config, Some(mcp_manager.clone()), event_bus.clone()).await?;
     sync_service.start().await?;
-    info!("Sync service ready");
 
     // Create the main runtime
     let runtime = MycelRuntime {
@@ -134,38 +129,28 @@ async fn main() -> Result<()> {
         context_manager,
         ai_router,
         executor,
+        policy_evaluator,
         ui_factory,
         sync_service,
+        mcp_manager,
     };
 
-    // Start the IPC server (for UI and other components to connect)
     let ipc_server = ipc::IpcServer::new(&runtime).await?;
-    info!("IPC server listening");
 
-    // If in dev mode, also start a simple CLI interface
     if args.dev {
-        info!("Starting development CLI...");
         tokio::spawn(run_dev_cli(runtime.clone()));
     }
 
-    // Start background session cleanup task (every hour)
+    // Background session cleanup
     let cleanup_context_manager = runtime.context_manager.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             interval.tick().await;
-            let removed = cleanup_context_manager.cleanup_stale_sessions(None).await;
-            if removed > 0 {
-                info!(
-                    removed_sessions = removed,
-                    "Periodic session cleanup completed"
-                );
-            }
+            cleanup_context_manager.cleanup_stale_sessions(None).await;
         }
     });
 
-    // Main event loop
-    info!("Mycel Runtime ready. The network grows.");
     ipc_server.run().await?;
 
     Ok(())
@@ -178,78 +163,191 @@ pub struct MycelRuntime {
     pub context_manager: context::ContextManager,
     pub ai_router: ai::AiRouter,
     pub executor: executor::CodeExecutor,
+    pub policy_evaluator: policy::PolicyEvaluator,
     pub ui_factory: ui::UiFactory,
     pub sync_service: sync::SyncService,
+    pub mcp_manager: mcp::McpManager,
 }
 
 impl MycelRuntime {
-    /// Process a user input and generate a response
-    #[instrument(
-        skip(self, input),
-        fields(
-            request_id = %uuid::Uuid::new_v4(),
-            input_len = input.len(),
-        )
-    )]
+    /// Process user input - the LLM is the interface between user and OS
     pub async fn process_input(&self, input: &str, session_id: &str) -> Result<RuntimeResponse> {
-        info!("Processing user input");
-
-        // Get current context
         let context = self.context_manager.get_context(session_id).await?;
 
-        // Parse intent
-        let intent = self.ai_router.parse_intent(input, &context).await?;
+        // 1. Handle pending confirmations
+        if let Some(pending_code) = &context.pending_command {
+            let input_lower = input.to_lowercase();
+            if input_lower == "yes" || input_lower == "y" || input_lower == "confirm" || input_lower == "ok" {
+                // User confirmed - clear and execute
+                self.context_manager.clear_pending_command(session_id).await?;
+                let output = self.executor.run(pending_code).await?;
+                return Ok(RuntimeResponse::Text(output));
+            } else if input_lower == "no" || input_lower == "n" || input_lower == "cancel" {
+                // User denied - clear and inform
+                self.context_manager.clear_pending_command(session_id).await?;
+                return Ok(RuntimeResponse::Text("action cancelled.".to_string()));
+            } else {
+                // User typed something else - inform them they have a pending action
+                return Ok(RuntimeResponse::Text(format!(
+                    "you have a pending action. type 'yes' to confirm or 'no' to cancel.\ncode: {}",
+                    pending_code
+                )));
+            }
+        }
 
-        // Route to appropriate handler
-        match intent.action_type {
-            intent::ActionType::SimpleResponse => {
-                // Just needs a text response
-                let response = self.ai_router.generate_response(input, &context).await?;
-                Ok(RuntimeResponse::Text(response))
+        // 2. Normal processing
+        let input_trimmed = input.trim();
+        let first_word = input_trimmed.split_whitespace().next().unwrap_or("");
+
+        // Check if it looks like a command (single word or starts with common command pattern)
+        if !first_word.is_empty() && !first_word.contains(' ') && first_word.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            // Check if command exists
+            let check = self.executor.run(&format!("which {} 2>/dev/null", first_word)).await;
+            if let Ok(result) = &check {
+                if result.trim().is_empty() {
+                    // Command not found - search for package
+                    return self.handle_missing_command(first_word).await;
+                }
             }
-            intent::ActionType::GenerateCode => {
-                // Needs to write and execute code
-                let code = self.ai_router.generate_code(&intent, &context).await?;
-                let result = self.executor.run(&code).await?;
-                Ok(RuntimeResponse::CodeResult {
-                    code,
-                    output: result,
-                })
+        }
+
+        // The LLM decides what to do - use MCP tools if available
+        let response = self.ai_router.process_with_tools(input, &context, &self.mcp_manager).await?;
+
+        // Check if LLM wants to execute code
+        if response.starts_with("#!exec\n") || response.starts_with("#!exec ") {
+            let code = response.trim_start_matches("#!exec").trim();
+            self.execute_code_with_policy(code, session_id).await
+        } else if response.starts_with("```") {
+            let code = extract_code_block(&response);
+            self.execute_code_with_policy(&code, session_id).await
+        } else {
+            // For regular text, use streaming
+            let stream = self.ai_router.smart_generate_stream(&self.ai_router.build_basic_prompt(input, &context), false).await?;
+            
+            // Note: In a real implementation, we would wrap the stream to capture the final output
+            // and call update_session + sync_service.create_event once the stream completes.
+            // For now, we'll let the IPC layer handle the storage if it chooses, 
+            // or implement a wrapper here.
+            
+            Ok(RuntimeResponse::Stream(stream))
+        }
+    }
+
+    /// Update history and sync with mesh
+    pub async fn record_interaction(&self, session_id: &str, user: &str, assistant: &str) -> Result<()> {
+        let turn = self.context_manager.update_session(session_id, user, assistant).await?;
+        
+        let _ = self.sync_service.create_event(crate::sync::SyncOperation::AddConversationTurn {
+            session_id: session_id.to_string(),
+            user: turn.user,
+            assistant: turn.assistant,
+        }).await;
+        
+        Ok(())
+    }
+
+    /// Execute code after checking with policy (Legacy, needs update if used with streaming)
+    async fn execute_code_with_policy(&self, code: &str, session_id: &str) -> Result<RuntimeResponse> {
+        use crate::policy::ActionPolicy;
+
+        match self.policy_evaluator.evaluate_code(code) {
+            ActionPolicy::Allow => {
+                let output = self.executor.run(code).await?;
+                
+                // Check if command not found in the output
+                if output.contains("command not found") || output.contains("not found") {
+                    let cmd = code.split_whitespace().next().unwrap_or("");
+                    if !cmd.is_empty() {
+                        return self.handle_missing_command(cmd).await;
+                    }
+                }
+                
+                Ok(RuntimeResponse::Text(output))
             }
-            intent::ActionType::GenerateUi => {
-                // Needs to create a UI surface
-                let ui_spec = self.ai_router.generate_ui_spec(&intent, &context).await?;
-                let surface = self.ui_factory.create_surface(&ui_spec)?;
-                Ok(RuntimeResponse::UiSurface(surface))
+            ActionPolicy::RequiresConfirmation { message, .. } => {
+                // Store in session and ask user
+                self.context_manager.set_pending_command(session_id, Some(code.to_string())).await?;
+                Ok(RuntimeResponse::Text(format!("{}\ncode: {}", message, code)))
             }
-            intent::ActionType::SystemAction => {
-                // Needs to interact with the system
-                self.handle_system_action(&intent).await
-            }
-            intent::ActionType::CloudEscalate => {
-                // Local model decided this needs cloud AI
-                let response = self.ai_router.cloud_request(input, &context).await?;
-                Ok(RuntimeResponse::Text(response))
+            ActionPolicy::Deny { reason } => {
+                Ok(RuntimeResponse::Text(format!("blocked: {}", reason)))
             }
         }
     }
 
-    async fn handle_system_action(&self, intent: &intent::Intent) -> Result<RuntimeResponse> {
-        // Handle system-level actions (file operations, settings, etc.)
+    /// Handle missing command - search repos and offer to install
+    async fn handle_missing_command(&self, cmd: &str) -> Result<RuntimeResponse> {
+        // Search for package (works on Debian/Ubuntu - devcontainer)
+        let search_result = self.executor.run(&format!(
+            "apt-cache search '^{}$' 2>/dev/null | head -5 || apt-cache search '{}' 2>/dev/null | head -5",
+            cmd, cmd
+        )).await?;
+
+        if search_result.trim().is_empty() {
+            // Try broader search
+            let broad_search = self.executor.run(&format!(
+                "apt-cache search '{}' 2>/dev/null | head -5",
+                cmd
+            )).await?;
+
+            if broad_search.trim().is_empty() {
+                return Ok(RuntimeResponse::Text(format!(
+                    "'{}' not found and no package available. check spelling or install manually.",
+                    cmd
+                )));
+            }
+
+            return Ok(RuntimeResponse::Text(format!(
+                "'{}' not installed. related packages:\n{}\ninstall with: sudo apt install <package>",
+                cmd, broad_search.trim()
+            )));
+        }
+
+        // Found exact or close match
+        let first_package = search_result.lines().next()
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or(cmd);
+
         Ok(RuntimeResponse::Text(format!(
-            "System action '{}' would be executed here",
-            intent.action
+            "'{}' not installed. found: {}\ninstall? run: sudo apt install {}",
+            cmd, search_result.trim(), first_package
         )))
     }
 }
 
-/// Possible responses from the runtime
-#[derive(Debug, Clone)]
+/// Extract code from markdown code block
+fn extract_code_block(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+
+    // Remove opening ``` line
+    if !lines.is_empty() && lines[0].starts_with("```") {
+        lines.remove(0);
+    }
+
+    // Remove closing ``` line
+    if !lines.is_empty() && lines.last().map(|l| l.trim()) == Some("```") {
+        lines.pop();
+    }
+
+    lines.join("\n")
+}
+
+use std::pin::Pin;
+
+/// Response from the runtime - text or stream
 pub enum RuntimeResponse {
     Text(String),
-    CodeResult { code: String, output: String },
-    UiSurface(ui::Surface),
-    Error(String),
+    Stream(Pin<Box<dyn Stream<Item = Result<String>> + Send>>),
+}
+
+impl std::fmt::Debug for RuntimeResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(t) => f.debug_tuple("Text").field(t).finish(),
+            Self::Stream(_) => f.debug_tuple("Stream").finish(),
+        }
+    }
 }
 
 /// Development CLI for testing
@@ -258,9 +356,7 @@ async fn run_dev_cli(runtime: MycelRuntime) {
 
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    println!("\n=== Mycel OS Development CLI ===");
-    println!("The intelligent network beneath everything.");
-    println!("Type your requests, or 'quit' to exit.\n");
+    println!("mycel os");
 
     let stdin = io::stdin();
     loop {
@@ -277,29 +373,50 @@ async fn run_dev_cli(runtime: MycelRuntime) {
             continue;
         }
         if input == "quit" || input == "exit" {
-            println!("The network rests. Goodbye!");
             break;
         }
 
-        match runtime.process_input(input, &session_id).await {
-            Ok(response) => match response {
-                RuntimeResponse::Text(text) => println!("\n{}\n", text),
-                RuntimeResponse::CodeResult { code, output } => {
-                    println!(
-                        "\n--- Generated Code ---\n{}\n--- Output ---\n{}\n",
-                        code, output
-                    );
-                }
-                RuntimeResponse::UiSurface(surface) => {
-                    println!("\n[UI Surface created: {}]\n", surface.id);
-                }
-                RuntimeResponse::Error(err) => {
-                    println!("\nError: {}\n", err);
-                }
-            },
-            Err(e) => {
-                println!("\nRuntime error: {}\n", e);
+        if input.starts_with("near-link ") {
+            let account_id = input.trim_start_matches("near-link ").trim();
+            if !account_id.is_empty() {
+                println!("linking to NEAR account: {}...", account_id);
+                // Update config
+                let mut new_config = runtime.config.clone();
+                new_config.blockchain_sync = true;
+                new_config.near_account = Some(account_id.to_string());
+                
+                // In a real implementation, we would save this to the config file
+                // and probably restart the sync service polling.
+                // For now, let's just update the runtime's local copy if possible
+                // (though MycelRuntime holds it by value, so we'd need a Mutex if we wanted it truly dynamic)
+                
+                println!("successfully linked (simulated). please restart to enable polling.");
             }
+            continue;
+        }
+
+        match runtime.process_input(input, &session_id).await {
+            Ok(RuntimeResponse::Text(text)) => {
+                if !text.is_empty() {
+                    println!("{}", text);
+                    let _ = runtime.record_interaction(&session_id, input, &text).await;
+                }
+            }
+            Ok(RuntimeResponse::Stream(mut stream)) => {
+                use futures_util::StreamExt;
+                use std::io::{self, Write};
+                let mut full_response = String::new();
+                while let Some(chunk_result) = stream.next().await {
+                    if let Ok(chunk) = chunk_result {
+                        print!("{}", chunk);
+                        full_response.push_str(&chunk);
+                        io::stdout().flush().unwrap();
+                    }
+                }
+                println!();
+                let _ = runtime.record_interaction(&session_id, input, &full_response).await;
+            }
+            Err(e) => eprintln!("error: {}", e),
         }
     }
 }

@@ -62,7 +62,29 @@ impl ContextManager {
             timestamp: Utc::now(),
             user_name: user_ctx.name.clone(),
             user_preferences: user_ctx.preferences.clone(),
+            pending_command: session.pending_command.clone(),
         })
+    }
+
+    /// Set a pending command for a session
+    pub async fn set_pending_command(&self, session_id: &str, command: Option<String>) -> Result<()> {
+        let mut sessions = self.sessions.write().await;
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.touch();
+            session.pending_command = command;
+        }
+        Ok(())
+    }
+
+    /// Get the pending command for a session
+    pub async fn get_pending_command(&self, session_id: &str) -> Option<String> {
+        let sessions = self.sessions.read().await;
+        sessions.get(session_id).and_then(|s| s.pending_command.clone())
+    }
+
+    /// Clear the pending command for a session
+    pub async fn clear_pending_command(&self, session_id: &str) -> Result<()> {
+        self.set_pending_command(session_id, None).await
     }
 
     /// Update session context after an interaction
@@ -71,24 +93,26 @@ impl ContextManager {
         session_id: &str,
         user_input: &str,
         ai_response: &str,
-    ) -> Result<()> {
+    ) -> Result<ConversationTurn> {
         let mut sessions = self.sessions.write().await;
 
         if let Some(session) = sessions.get_mut(session_id) {
             session.touch();
-            session.conversation_history.push(ConversationTurn {
+            let turn = ConversationTurn {
                 timestamp: Utc::now(),
                 user: user_input.to_string(),
                 assistant: ai_response.to_string(),
-            });
+            };
+            session.conversation_history.push(turn.clone());
 
             // Keep only last N turns
             if session.conversation_history.len() > 50 {
                 session.conversation_history.remove(0);
             }
+            Ok(turn)
+        } else {
+            Err(anyhow::anyhow!("Session not found"))
         }
-
-        Ok(())
     }
 
     /// Record that a file was accessed
@@ -171,6 +195,7 @@ pub struct Context {
     pub timestamp: DateTime<Utc>,
     pub user_name: Option<String>,
     pub user_preferences: HashMap<String, String>,
+    pub pending_command: Option<String>,
 }
 
 /// A single conversation turn
@@ -191,6 +216,7 @@ pub struct SessionContext {
     pub recent_files: Vec<String>,
     pub conversation_history: Vec<ConversationTurn>,
     pub metadata: HashMap<String, String>,
+    pub pending_command: Option<String>,
 }
 
 impl SessionContext {
@@ -206,6 +232,7 @@ impl SessionContext {
             recent_files: Vec::new(),
             conversation_history: Vec::new(),
             metadata: HashMap::new(),
+            pending_command: None,
         }
     }
 
@@ -252,4 +279,25 @@ pub struct LearnedPattern {
     pub action: String,
     pub confidence: f32,
     pub times_used: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_creation() {
+        let session = SessionContext::new("test-session");
+        assert_eq!(session.id, "test-session");
+        assert!(session.conversation_history.is_empty());
+    }
+
+    #[test]
+    fn test_session_touch() {
+        let mut session = SessionContext::new("test");
+        let start = session.last_accessed;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        session.touch();
+        assert!(session.last_accessed > start);
+    }
 }

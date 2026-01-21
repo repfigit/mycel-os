@@ -64,34 +64,34 @@ case "$MODE" in
         echo "Press Ctrl+A, X to exit QEMU"
         echo ""
         echo "----------------------------------------"
-        
+
         qemu-system-x86_64 \
             "${QEMU_OPTS[@]}" \
             -nographic \
             -serial mon:stdio
         ;;
-        
+
     vnc)
         echo "Starting in VNC mode..."
         echo ""
         echo "Connect via VNC:"
-        echo "  - VNC port: 5900 (forwarded by Codespace)"
+        echo "  - VNC port: 5900"
         echo "  - Or use noVNC in browser if available"
         echo ""
         echo "Press Ctrl+C to stop QEMU"
         echo ""
-        
+
         qemu-system-x86_64 \
             "${QEMU_OPTS[@]}" \
             -vnc :0 \
             -monitor stdio
         ;;
-        
+
     spice)
         echo "Starting in SPICE mode..."
         echo "Connect to port 5930"
         echo ""
-        
+
         qemu-system-x86_64 \
             "${QEMU_OPTS[@]}" \
             -spice port=5930,disable-ticketing=on \
@@ -100,7 +100,7 @@ case "$MODE" in
             -device virtserialport,chardev=vdagent,name=com.redhat.spice.0 \
             -monitor stdio
         ;;
-        
+
     *)
         echo "Usage: $0 [iso_file] [mode]"
         echo ""

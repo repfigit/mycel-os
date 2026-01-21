@@ -265,7 +265,7 @@ pub fn parse_pairing_code(code: &str) -> Result<PairingInfo> { /* ... */ }
 
 ### Task 10.1: Test Docker Build
 ```bash
-# Verify Docker works in Codespace
+# Verify Docker works
 docker run hello-world
 ```
 

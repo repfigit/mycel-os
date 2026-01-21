@@ -237,12 +237,69 @@ async fn handle_connection(
                             }
                         }
 
-                        let response = process_request(&request, &runtime, &mut session_id).await;
-                        let response_json = serde_json::to_string(&response)? + "\n";
+                        // Process request
+                        match &request {
+                            IpcRequest::Chat { message } => {
+                                match runtime.process_input(message, &session_id).await {
+                                    Ok(crate::RuntimeResponse::Text(text)) => {
+                                        // Record the interaction for history and sync
+                                        let _ = runtime.record_interaction(&session_id, message, &text).await;
 
-                        let mut w = writer.lock().await;
-                        w.write_all(response_json.as_bytes()).await?;
-                        w.flush().await?;
+                                        let response = IpcResponse::Chat {
+                                            response: text,
+                                            surface: None,
+                                        };
+                                        let json = serde_json::to_string(&response)? + "\n";
+                                        let mut w = writer.lock().await;
+                                        w.write_all(json.as_bytes()).await?;
+                                        w.flush().await?;
+                                    }
+                                    Ok(crate::RuntimeResponse::Stream(mut stream)) => {
+                                        use futures_util::StreamExt;
+                                        let mut full_response = String::new();
+                                        
+                                        while let Some(chunk_result) = stream.next().await {
+                                            if let Ok(chunk) = chunk_result {
+                                                full_response.push_str(&chunk);
+                                                let chunk_response = IpcResponse::ChatChunk { delta: chunk };
+                                                if let Ok(json) = serde_json::to_string(&chunk_response) {
+                                                    let mut w = writer.lock().await;
+                                                    let _ = w.write_all((json + "\n").as_bytes()).await;
+                                                    let _ = w.flush().await;
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Record the interaction for history and sync
+                                        let _ = runtime.record_interaction(&session_id, message, &full_response).await;
+
+                                        // Send final full message
+                                        let final_response = IpcResponse::Chat {
+                                            response: full_response,
+                                            surface: None,
+                                        };
+                                        let json = serde_json::to_string(&final_response)? + "\n";
+                                        let mut w = writer.lock().await;
+                                        w.write_all(json.as_bytes()).await?;
+                                        w.flush().await?;
+                                    }
+                                    Err(e) => {
+                                        let response = IpcResponse::Error { message: e.to_string() };
+                                        let json = serde_json::to_string(&response)? + "\n";
+                                        let mut w = writer.lock().await;
+                                        w.write_all(json.as_bytes()).await?;
+                                        w.flush().await?;
+                                    }
+                                }
+                            }
+                            _ => {
+                                let response = process_request(&request, &runtime, &mut session_id).await;
+                                let json = serde_json::to_string(&response)? + "\n";
+                                let mut w = writer.lock().await;
+                                w.write_all(json.as_bytes()).await?;
+                                w.flush().await?;
+                            }
+                        }
                     }
                     Err(e) => {
                         let error_response = IpcResponse::Error {
@@ -279,27 +336,10 @@ async fn process_request(
                 message: "Already authenticated".to_string(),
             }
         }
-        IpcRequest::Chat { message } => match runtime.process_input(message, session_id).await {
-            Ok(response) => match response {
-                crate::RuntimeResponse::Text(text) => IpcResponse::Chat {
-                    response: text,
-                    surface: None,
-                },
-                crate::RuntimeResponse::CodeResult { code, output } => IpcResponse::CodeResult {
-                    code,
-                    output,
-                    success: true,
-                },
-                crate::RuntimeResponse::UiSurface(surface) => IpcResponse::Chat {
-                    response: format!("Created surface: {}", surface.title),
-                    surface: Some(surface),
-                },
-                crate::RuntimeResponse::Error(err) => IpcResponse::Error { message: err },
-            },
-            Err(e) => IpcResponse::Error {
-                message: e.to_string(),
-            },
-        },
+        IpcRequest::Chat { .. } => {
+            // Handled separately in handle_connection for streaming
+            IpcResponse::Error { message: "Internal error: Chat should be handled by streaming handler".to_string() }
+        }
         IpcRequest::SetSession { id } => {
             *session_id = id.clone();
             IpcResponse::Ok {
@@ -313,6 +353,27 @@ async fn process_request(
             },
             Err(e) => IpcResponse::Error {
                 message: e.to_string(),
+            },
+        },
+        IpcRequest::Status => {
+            let session_count = runtime.context_manager.session_count().await;
+            IpcResponse::Status {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                uptime: 0, // TODO: Track uptime
+                sessions: session_count,
+                llm_model: runtime.config.local_model.clone(),
+            }
+        }
+        IpcRequest::ExecuteCode { code } => match runtime.executor.run(code).await {
+            Ok(output) => IpcResponse::CodeResult {
+                code: code.clone(),
+                output,
+                success: true,
+            },
+            Err(e) => IpcResponse::CodeResult {
+                code: code.clone(),
+                output: e.to_string(),
+                success: false,
             },
         },
         IpcRequest::Ping => IpcResponse::Pong,
@@ -331,6 +392,10 @@ pub enum IpcRequest {
     SetSession { id: String },
     /// Get current context
     GetContext,
+    /// Get system status
+    Status,
+    /// Direct code execution
+    ExecuteCode { code: String },
     /// Ping for health check (allowed without auth)
     Ping,
 }
@@ -344,6 +409,10 @@ pub enum IpcResponse {
         response: String,
         surface: Option<crate::ui::Surface>,
     },
+    /// Chat chunk (for streaming)
+    ChatChunk {
+        delta: String,
+    },
     /// Code execution result
     CodeResult {
         code: String,
@@ -354,6 +423,13 @@ pub enum IpcResponse {
     Context {
         working_directory: String,
         recent_files: Vec<String>,
+    },
+    /// System status
+    Status {
+        version: String,
+        uptime: u64,
+        sessions: usize,
+        llm_model: String,
     },
     /// Generic OK response
     Ok { message: String },
@@ -467,6 +543,30 @@ mod tests {
     }
 
     #[test]
+    fn test_status_request_serialization() {
+        let request = IpcRequest::Status;
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("Status"));
+
+        let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, IpcRequest::Status));
+    }
+
+    #[test]
+    fn test_exec_request_serialization() {
+        let request = IpcRequest::ExecuteCode { code: "ls".to_string() };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("ExecuteCode"));
+        assert!(json.contains("ls"));
+
+        let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            IpcRequest::ExecuteCode { code } => assert_eq!(code, "ls"),
+            _ => panic!("Expected ExecuteCode request"),
+        }
+    }
+
+    #[test]
     fn test_ping_request_serialization() {
         let request = IpcRequest::Ping;
         let json = serde_json::to_string(&request).unwrap();
@@ -525,6 +625,8 @@ mod tests {
             r#"{"type":"Chat","message":"hello"}"#,
             r#"{"type":"SetSession","id":"sess-1"}"#,
             r#"{"type":"GetContext"}"#,
+            r#"{"type":"Status"}"#,
+            r#"{"type":"ExecuteCode","code":"ls"}"#,
             r#"{"type":"Ping"}"#,
         ];
 

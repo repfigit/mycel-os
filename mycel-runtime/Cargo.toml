@@ -9,6 +9,8 @@ repository = "https://github.com/mycel-os/mycel"
 [dependencies]
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
+futures = "0.3"
+futures-util = "0.3"
 
 # HTTP client for cloud API
 reqwest = { version = "0.11", features = ["json", "stream"] }
@@ -74,6 +76,10 @@ rand = "0.8"
 
 # System information for hardware detection
 sysinfo = "0.31"
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+mdns-sd = "0.17.2"
+chacha20poly1305 = "0.10.1"
+tokio-util = { version = "0.7.18", features = ["codec"] }
 
 [features]
 default = ["ollama"]

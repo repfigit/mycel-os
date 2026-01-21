@@ -99,6 +99,66 @@ impl PolicyEvaluator {
         }
     }
 
+    /// Evaluate generated code for safety
+    pub fn evaluate_code(&self, code: &str) -> ActionPolicy {
+        if !self.config.allow_code_execution {
+            return ActionPolicy::Deny {
+                reason: "Code execution is disabled by policy".to_string(),
+            };
+        }
+
+        let code_lower = code.to_lowercase();
+
+        // Critical patterns - always require confirmation
+        let critical_patterns = [
+            "rm -rf",
+            "sudo ",
+            "mkfs",
+            "dd if=",
+            "> /dev/",
+            "drop database",
+            "format disk",
+            ":(){ :|:& };:", // Fork bomb
+        ];
+
+        for pattern in critical_patterns {
+            if code_lower.contains(pattern) {
+                warn!(pattern = pattern, "Critical code pattern detected");
+                return ActionPolicy::RequiresConfirmation {
+                    message: format!(
+                        "Dangerous command detected: '{}'. This could cause permanent data loss. Proceed?",
+                        pattern.trim()
+                    ),
+                    risk_level: RiskLevel::Critical,
+                };
+            }
+        }
+
+        // High-risk patterns
+        let high_risk_patterns = [
+            "chmod -r 777",
+            "chown -r",
+            "mv /etc/",
+            "cp /etc/",
+            "mv /boot/",
+            "rm ",
+            "apt-get remove",
+            "apt remove",
+            "uninstall",
+        ];
+
+        for pattern in high_risk_patterns {
+            if code_lower.contains(pattern) {
+                return ActionPolicy::RequiresConfirmation {
+                    message: format!("Potentially risky command: '{}'. Proceed?", pattern.trim()),
+                    risk_level: RiskLevel::High,
+                };
+            }
+        }
+
+        ActionPolicy::Allow
+    }
+
     fn evaluate_code_execution(&self, intent: &Intent, _context: &Context) -> ActionPolicy {
         if !self.config.allow_code_execution {
             return ActionPolicy::Deny {
@@ -256,6 +316,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             user_name: None,
             user_preferences: std::collections::HashMap::new(),
+            pending_command: None,
         }
     }
 
@@ -318,6 +379,33 @@ mod tests {
         match evaluator.evaluate(&intent, &context) {
             ActionPolicy::Deny { .. } => {}
             _ => panic!("Expected Deny"),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_dangerous_code() {
+        let evaluator = PolicyEvaluator::with_defaults();
+
+        // Test critical pattern
+        match evaluator.evaluate_code("rm -rf /") {
+            ActionPolicy::RequiresConfirmation { risk_level, .. } => {
+                assert_eq!(risk_level, RiskLevel::Critical);
+            }
+            _ => panic!("Expected RequiresConfirmation for rm -rf"),
+        }
+
+        // Test high risk pattern
+        match evaluator.evaluate_code("chmod -R 777 /home/user") {
+            ActionPolicy::RequiresConfirmation { risk_level, .. } => {
+                assert_eq!(risk_level, RiskLevel::High);
+            }
+            _ => panic!("Expected RequiresConfirmation for chmod"),
+        }
+
+        // Test safe code
+        match evaluator.evaluate_code("ls -la") {
+            ActionPolicy::Allow => {}
+            _ => panic!("Expected Allow for ls -la"),
         }
     }
 }

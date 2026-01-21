@@ -152,3 +152,38 @@ impl IntentCategory {
         Self::Unknown
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_intent_helpers() {
+        let intent = Intent::simple_response("hello");
+        assert_eq!(intent.action_type, ActionType::SimpleResponse);
+        assert_eq!(intent.confidence, 1.0);
+
+        let intent = Intent::generate_code("calculate pi", serde_json::Value::Null);
+        assert_eq!(intent.action_type, ActionType::GenerateCode);
+    }
+
+    #[test]
+    fn test_intent_categorization() {
+        assert!(matches!(
+            IntentCategory::from_action("create a file"),
+            IntentCategory::Creation
+        ));
+        assert!(matches!(
+            IntentCategory::from_action("what is the time"),
+            IntentCategory::Information
+        ));
+        assert!(matches!(
+            IntentCategory::from_action("run the script"),
+            IntentCategory::Action
+        ));
+        assert!(matches!(
+            IntentCategory::from_action("convert image"),
+            IntentCategory::Transformation
+        ));
+    }
+}

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build Mycel OS ISO from Codespace
+# Build Mycel OS ISO
 # This script orchestrates the Docker-based build
 
 set -e
@@ -28,7 +28,7 @@ fi
 quick_build() {
     echo "Using quick build method..."
     echo ""
-    
+
     docker run --rm \
         --privileged \
         -v "$PROJECT_DIR:/workspace:ro" \
@@ -39,12 +39,12 @@ quick_build() {
             echo "Installing build tools..."
             xbps-install -Syu -y
             xbps-install -y git xorriso squashfs-tools dosfstools e2fsprogs mtools grub-x86_64-efi grub-i386-pc liblz4
-            
+
             echo "Cloning void-mklive..."
             cd /tmp
             git clone --depth 1 https://github.com/void-linux/void-mklive.git
             cd void-mklive
-            
+
             echo "Building minimal ISO..."
             ./mklive.sh \
                 -a x86_64 \
@@ -53,7 +53,7 @@ quick_build() {
                 -o "/output/mycel-os-minimal-$(date +%Y%m%d).iso" \
                 -T "Mycel OS" \
                 2>&1 | tee /output/build.log
-            
+
             echo "Build complete!"
             ls -lh /output/*.iso
         '
@@ -63,7 +63,7 @@ quick_build() {
 full_build() {
     echo "Building custom Void Linux builder image..."
     docker build -t mycel-iso-builder -f "$PROJECT_DIR/docker/Dockerfile.void-builder" "$PROJECT_DIR"
-    
+
     echo "Running ISO build..."
     docker run --rm \
         --privileged \

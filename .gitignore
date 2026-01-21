@@ -32,3 +32,4 @@ plans/
 *.swp
 *~
 .DS_Store
+.env
