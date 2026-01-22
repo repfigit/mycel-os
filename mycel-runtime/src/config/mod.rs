@@ -23,10 +23,6 @@ pub struct MycelConfig {
     #[serde(default)]
     pub openrouter_api_key: String,
 
-    /// Anthropic API key (direct Claude access - faster than OpenRouter)
-    #[serde(default)]
-    pub anthropic_api_key: String,
-
     /// Prefer cloud over local LLM (useful in low-resource environments)
     #[serde(default)]
     pub prefer_cloud: bool,
@@ -170,7 +166,6 @@ impl Default for MycelConfig {
             local_model: default_local_model(),
             cloud_model: default_cloud_model(),
             openrouter_api_key: String::new(),
-            anthropic_api_key: String::new(),
             prefer_cloud: false,
             context_path: default_context_path(),
             code_path: default_code_path(),
@@ -199,10 +194,7 @@ impl MycelConfig {
         // Environment variable overrides
         if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
             config.openrouter_api_key = key;
-        }
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            config.anthropic_api_key = key;
-            // Auto-prefer cloud when Anthropic key is set
+            // Auto-prefer cloud when OpenRouter key is set
             config.prefer_cloud = true;
         }
         if let Ok(url) = std::env::var("OLLAMA_URL") {

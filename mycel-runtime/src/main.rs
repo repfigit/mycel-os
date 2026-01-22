@@ -58,6 +58,10 @@ struct Args {
     /// Skip collective network connection (local-only mode)
     #[arg(long)]
     no_collective: bool,
+
+    /// Run as daemon (no interactive CLI)
+    #[arg(long)]
+    daemon: bool,
 }
 
 fn print_banner() {
@@ -70,7 +74,7 @@ async fn main() -> Result<()> {
 
     // Initialize logging - quiet by default, verbose only when requested
     // Can override with RUST_LOG env var
-    let default_level = if args.verbose { "debug" } else { "error" };  // Quiet by default
+    let default_level = if args.verbose { "debug" } else { "error" }; // Quiet by default
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("mycel_runtime={}", default_level)));
 
@@ -88,6 +92,14 @@ async fn main() -> Result<()> {
     print_banner();
 
     let config = MycelConfig::load(&args.config, args.dev)?;
+
+    // Log config status
+    tracing::info!(
+        "Config: prefer_cloud={}, has_openrouter_key={}",
+        config.prefer_cloud,
+        !config.openrouter_api_key.is_empty()
+    );
+
     let context_manager = context::ContextManager::new(&config).await?;
     let ai_router = if args.no_local_llm {
         ai::AiRouter::cloud_only(&config).await?
@@ -138,7 +150,11 @@ async fn main() -> Result<()> {
     let ipc_server = ipc::IpcServer::new(&runtime).await?;
 
     if args.dev {
-        tokio::spawn(run_dev_cli(runtime.clone()));
+        // Only spawn interactive CLI if running with a tty and not in daemon mode
+        let run_cli = !args.daemon && atty::is(atty::Stream::Stdin);
+        if run_cli {
+            tokio::spawn(run_dev_cli(runtime.clone()));
+        }
     }
 
     // Background session cleanup
@@ -177,14 +193,22 @@ impl MycelRuntime {
         // 1. Handle pending confirmations
         if let Some(pending_code) = &context.pending_command {
             let input_lower = input.to_lowercase();
-            if input_lower == "yes" || input_lower == "y" || input_lower == "confirm" || input_lower == "ok" {
+            if input_lower == "yes"
+                || input_lower == "y"
+                || input_lower == "confirm"
+                || input_lower == "ok"
+            {
                 // User confirmed - clear and execute
-                self.context_manager.clear_pending_command(session_id).await?;
+                self.context_manager
+                    .clear_pending_command(session_id)
+                    .await?;
                 let output = self.executor.run(pending_code).await?;
                 return Ok(RuntimeResponse::Text(output));
             } else if input_lower == "no" || input_lower == "n" || input_lower == "cancel" {
                 // User denied - clear and inform
-                self.context_manager.clear_pending_command(session_id).await?;
+                self.context_manager
+                    .clear_pending_command(session_id)
+                    .await?;
                 return Ok(RuntimeResponse::Text("action cancelled.".to_string()));
             } else {
                 // User typed something else - inform them they have a pending action
@@ -200,9 +224,17 @@ impl MycelRuntime {
         let first_word = input_trimmed.split_whitespace().next().unwrap_or("");
 
         // Check if it looks like a command (single word or starts with common command pattern)
-        if !first_word.is_empty() && !first_word.contains(' ') && first_word.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        if !first_word.is_empty()
+            && !first_word.contains(' ')
+            && first_word
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
             // Check if command exists
-            let check = self.executor.run(&format!("which {} 2>/dev/null", first_word)).await;
+            let check = self
+                .executor
+                .run(&format!("which {} 2>/dev/null", first_word))
+                .await;
             if let Ok(result) = &check {
                 if result.trim().is_empty() {
                     // Command not found - search for package
@@ -212,7 +244,10 @@ impl MycelRuntime {
         }
 
         // The LLM decides what to do - use MCP tools if available
-        let response = self.ai_router.process_with_tools(input, &context, &self.mcp_manager).await?;
+        let response = self
+            .ai_router
+            .process_with_tools(input, &context, &self.mcp_manager)
+            .await?;
 
         // Check if LLM wants to execute code
         if response.starts_with("#!exec\n") || response.starts_with("#!exec ") {
@@ -222,39 +257,47 @@ impl MycelRuntime {
             let code = extract_code_block(&response);
             self.execute_code_with_policy(&code, session_id).await
         } else {
-            // For regular text, use streaming
-            let stream = self.ai_router.smart_generate_stream(&self.ai_router.build_basic_prompt(input, &context), false).await?;
-            
-            // Note: In a real implementation, we would wrap the stream to capture the final output
-            // and call update_session + sync_service.create_event once the stream completes.
-            // For now, we'll let the IPC layer handle the storage if it chooses, 
-            // or implement a wrapper here.
-            
-            Ok(RuntimeResponse::Stream(stream))
+            // Return the response from process_with_tools directly
+            Ok(RuntimeResponse::Text(response))
         }
     }
 
     /// Update history and sync with mesh
-    pub async fn record_interaction(&self, session_id: &str, user: &str, assistant: &str) -> Result<()> {
-        let turn = self.context_manager.update_session(session_id, user, assistant).await?;
-        
-        let _ = self.sync_service.create_event(crate::sync::SyncOperation::AddConversationTurn {
-            session_id: session_id.to_string(),
-            user: turn.user,
-            assistant: turn.assistant,
-        }).await;
-        
+    pub async fn record_interaction(
+        &self,
+        session_id: &str,
+        user: &str,
+        assistant: &str,
+    ) -> Result<()> {
+        let turn = self
+            .context_manager
+            .update_session(session_id, user, assistant)
+            .await?;
+
+        let _ = self
+            .sync_service
+            .create_event(crate::sync::SyncOperation::AddConversationTurn {
+                session_id: session_id.to_string(),
+                user: turn.user,
+                assistant: turn.assistant,
+            })
+            .await;
+
         Ok(())
     }
 
     /// Execute code after checking with policy (Legacy, needs update if used with streaming)
-    async fn execute_code_with_policy(&self, code: &str, session_id: &str) -> Result<RuntimeResponse> {
+    async fn execute_code_with_policy(
+        &self,
+        code: &str,
+        session_id: &str,
+    ) -> Result<RuntimeResponse> {
         use crate::policy::ActionPolicy;
 
         match self.policy_evaluator.evaluate_code(code) {
             ActionPolicy::Allow => {
                 let output = self.executor.run(code).await?;
-                
+
                 // Check if command not found in the output
                 if output.contains("command not found") || output.contains("not found") {
                     let cmd = code.split_whitespace().next().unwrap_or("");
@@ -262,13 +305,18 @@ impl MycelRuntime {
                         return self.handle_missing_command(cmd).await;
                     }
                 }
-                
+
                 Ok(RuntimeResponse::Text(output))
             }
             ActionPolicy::RequiresConfirmation { message, .. } => {
                 // Store in session and ask user
-                self.context_manager.set_pending_command(session_id, Some(code.to_string())).await?;
-                Ok(RuntimeResponse::Text(format!("{}\ncode: {}", message, code)))
+                self.context_manager
+                    .set_pending_command(session_id, Some(code.to_string()))
+                    .await?;
+                Ok(RuntimeResponse::Text(format!(
+                    "{}\ncode: {}",
+                    message, code
+                )))
             }
             ActionPolicy::Deny { reason } => {
                 Ok(RuntimeResponse::Text(format!("blocked: {}", reason)))
@@ -286,10 +334,10 @@ impl MycelRuntime {
 
         if search_result.trim().is_empty() {
             // Try broader search
-            let broad_search = self.executor.run(&format!(
-                "apt-cache search '{}' 2>/dev/null | head -5",
-                cmd
-            )).await?;
+            let broad_search = self
+                .executor
+                .run(&format!("apt-cache search '{}' 2>/dev/null | head -5", cmd))
+                .await?;
 
             if broad_search.trim().is_empty() {
                 return Ok(RuntimeResponse::Text(format!(
@@ -305,13 +353,17 @@ impl MycelRuntime {
         }
 
         // Found exact or close match
-        let first_package = search_result.lines().next()
+        let first_package = search_result
+            .lines()
+            .next()
             .and_then(|l| l.split_whitespace().next())
             .unwrap_or(cmd);
 
         Ok(RuntimeResponse::Text(format!(
             "'{}' not installed. found: {}\ninstall? run: sudo apt install {}",
-            cmd, search_result.trim(), first_package
+            cmd,
+            search_result.trim(),
+            first_package
         )))
     }
 }
@@ -384,12 +436,12 @@ async fn run_dev_cli(runtime: MycelRuntime) {
                 let mut new_config = runtime.config.clone();
                 new_config.blockchain_sync = true;
                 new_config.near_account = Some(account_id.to_string());
-                
+
                 // In a real implementation, we would save this to the config file
                 // and probably restart the sync service polling.
                 // For now, let's just update the runtime's local copy if possible
                 // (though MycelRuntime holds it by value, so we'd need a Mutex if we wanted it truly dynamic)
-                
+
                 println!("successfully linked (simulated). please restart to enable polling.");
             }
             continue;
@@ -414,7 +466,9 @@ async fn run_dev_cli(runtime: MycelRuntime) {
                     }
                 }
                 println!();
-                let _ = runtime.record_interaction(&session_id, input, &full_response).await;
+                let _ = runtime
+                    .record_interaction(&session_id, input, &full_response)
+                    .await;
             }
             Err(e) => eprintln!("error: {}", e),
         }

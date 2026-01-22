@@ -290,26 +290,24 @@ impl AiRouter {
 
         // Build the enhanced prompt with tools
         let prompt = format!(
-            r#"You are Mycel OS. You ARE the operating system, not a chatbot.
+            r#"You are Mycel OS - an AI-native operating system assistant.
 
 {tools_prompt}
 
-EVOLUTION RULES:
-- If the user asks for a capability you don't have, USE 'evolve_os_add_capability' to write a new MCP server.
-- You can write servers in JavaScript (Node.js) or Python.
-- Always provide complete, production-ready code for new servers.
-- You can also publish these to the global registry using 'near_publish_capability'.
+WHEN TO USE TOOLS:
+- Use tools proactively to get real data instead of guessing
+- Use 'shell_command' for system commands, 'xbps_*' for packages
+- Use 'system_info' for hardware/OS info
 
-GENERAL RULES:
-- TERSE responses only. No fluff.
-- Use tools when they would help answer the user's question.
-- After getting a tool result, provide a concise response to the user.
-- If no tool is needed, just answer directly.
+HOW TO RESPOND:
+- Be helpful and specific with commands, paths, details
+- After tool results, summarize what you found
+- For simple questions, answer directly without tools
 
 cwd: {cwd}
 user: {input}
 
-Reply:"#,
+Reply (use <tool_call>{{...}}</tool_call> for tools):"#,
             tools_prompt = tools_prompt,
             cwd = context.working_directory,
             input = input
@@ -344,18 +342,13 @@ Reply:"#,
 
         // Build continuation prompt with tool results
         let continuation_prompt = format!(
-            r#"You are Mycel OS. Continue the conversation with tool results.
-
-Previous context:
-User asked: {}
-You responded: {}
+            r#"User asked: {}
 
 Tool results:
 {}
 
-Now provide a concise final response to the user based on these tool results. Be terse."#,
+Provide a helpful response based on these results. Include relevant details, commands, or next steps."#,
             input,
-            parsed.prefix_text.trim(),
             tool_results.join("\n\n")
         );
 
@@ -429,17 +422,12 @@ Now provide a concise final response to the user based on these tool results. Be
 
     pub fn build_basic_prompt(&self, input: &str, context: &Context) -> String {
         format!(
-            r#"You are Mycel OS. You ARE the operating system, not a chatbot.
+            r#"You are Mycel OS, an AI assistant. Answer the user's question or help with their task.
 
-RULES:
-- TERSE responses only. No fluff. No explanations unless asked.
-- Answer in 1-2 sentences max. Shorter is better.
-- No greetings, no sign-offs.
+Current directory: {}
+User: {}
 
-cwd: {}
-user: {}
-
-Reply:"#,
+Respond directly and helpfully:"#,
             context.working_directory, input
         )
     }
@@ -502,26 +490,19 @@ Reply:"#,
 
         // Build the enhanced prompt with tools
         let prompt = format!(
-            r#"You are Mycel OS. You ARE the operating system, not a chatbot.
+            r#"You are Mycel OS, an AI assistant with system access.
 
 {tools_prompt}
 
-EVOLUTION RULES:
-- If the user asks for a capability you don't have, USE 'evolve_os_add_capability' to write a new MCP server.
-- You can write servers in JavaScript (Node.js) or Python.
-- Always provide complete, production-ready code for new servers.
-- You can also publish these to the global registry using 'near_publish_capability'.
+IMPORTANT:
+- For simple questions (jokes, explanations, chat), just answer directly - no tools needed.
+- Use tools only when the user asks for system info, file operations, or commands.
+- Be concise and helpful.
 
-GENERAL RULES:
-- TERSE responses only. No fluff.
-- Use tools when they would help answer the user's question.
-- After getting a tool result, provide a concise response to the user.
-- If no tool is needed, just answer directly.
+Current directory: {cwd}
+User: {input}
 
-cwd: {cwd}
-user: {input}
-
-Reply:"#,
+Respond:"#,
             tools_prompt = tools_prompt,
             cwd = context.working_directory,
             input = input
@@ -723,14 +704,15 @@ action_type:
     /// Generate a simple text response
     pub async fn generate_response(&self, input: &str, context: &Context) -> Result<String> {
         let prompt = format!(
-            r#"You are Mycel OS. You ARE the operating system, not a chatbot.
+            r#"You are Mycel OS - an AI operating system assistant.
 
-RULES:
-- TERSE responses only. No fluff. No explanations unless asked.
-- You execute code directly. You have full system access.
-- Answer in 1-2 sentences max. Shorter is better.
-- For tasks: just say "Done" or state the result.
-- No greetings, no sign-offs, no politeness filler.
+Your capabilities: run commands, file operations, package management, system info.
+
+Be HELPFUL and SPECIFIC:
+- For questions: give direct, informative answers
+- For tasks: explain what command or action would accomplish it
+- Include relevant file paths, commands, or configuration details
+- If something needs clarification, ask
 
 cwd: {}
 user: {}
@@ -802,51 +784,54 @@ Reply (1-2 sentences max):"#,
 
     /// Smart routing between local and cloud
     async fn smart_generate(&self, prompt: &str, force_cloud: bool) -> Result<String> {
+        let start = std::time::Instant::now();
+
         // If prefer_cloud is set and we have a cloud API, use cloud first
-        // This is useful when cloud API is preferred over local LLM
         let use_cloud_first = force_cloud || (self.config.prefer_cloud && self.has_cloud_api());
 
-        if use_cloud_first {
+        info!(
+            "AI routing: prefer_cloud={}, has_api={}, using_cloud={}",
+            self.config.prefer_cloud,
+            self.has_cloud_api(),
+            use_cloud_first
+        );
+
+        let result = if use_cloud_first {
             // Cloud first mode
             match self.cloud_generate(prompt).await {
-                Ok(response) => return Ok(response),
+                Ok(response) => Ok(response),
                 Err(e) => {
                     if self.local_available {
                         warn!("Cloud failed, falling back to local: {}", e);
-                        return self.local_generate(prompt).await;
+                        self.local_generate(prompt).await
+                    } else {
+                        Err(e)
                     }
-                    return Err(e);
                 }
             }
-        }
+        } else {
+            // Local first mode
+            if self.local_available {
+                match self.local_generate(prompt).await {
+                    Ok(response) => Ok(response),
+                    Err(e) => {
+                        warn!("Local LLM failed, escalating to cloud: {}", e);
+                        self.cloud_generate(prompt).await
+                    }
+                }
+            } else {
+                self.cloud_generate(prompt).await
+            }
+        };
 
-        // Default: Local LLM first (the kernel's brain)
-        if self.local_available {
-            match self.local_generate(prompt).await {
-                Ok(response) => return Ok(response),
-                Err(e) => {
-                    warn!("Local LLM failed, escalating to cloud: {}", e);
-                }
-            }
-        }
+        let elapsed = start.elapsed();
+        let source = if use_cloud_first { "cloud" } else { "local" };
+        info!("AI response time: {:?} ({})", elapsed, source);
 
-        // Fall back to cloud
-        match self.cloud_generate(prompt).await {
-            Ok(response) => Ok(response),
-            Err(e) => {
-                if self.local_available {
-                    warn!("Cloud failed, trying local as fallback: {}", e);
-                    self.local_generate(prompt).await
-                } else {
-                    Err(anyhow!(
-                        "No AI backend available. Start Ollama with 'ollama serve' or set ANTHROPIC_API_KEY for cloud mode."
-                    ))
-                }
-            }
-        }
+        result
     }
 
-    /// Generate using local Ollama - the primary brain of Mycel OS
+    /// Generate using local Ollama - the primary brain of Mycel OS    /// Generate using local Ollama - the primary brain of Mycel OS
     async fn local_generate(&self, prompt: &str) -> Result<String> {
         debug!("🧠 Generating with local LLM (kernel brain)");
 
@@ -882,64 +867,20 @@ Reply (1-2 sentences max):"#,
             .ok_or_else(|| anyhow!("Ollama returned empty response"))
     }
 
-    /// Generate using cloud API - tries Anthropic first, falls back to OpenRouter
+    /// Generate using cloud API via OpenRouter
     async fn cloud_generate(&self, prompt: &str) -> Result<String> {
-        // Prefer direct Anthropic API (faster, no middleman)
-        if !self.config.anthropic_api_key.is_empty() {
-            return self.anthropic_generate(prompt).await;
+        if self.config.openrouter_api_key.is_empty() {
+            return Err(anyhow!(
+                "No cloud API configured. Set OPENROUTER_API_KEY environment variable."
+            ));
         }
 
-        // Fall back to OpenRouter
-        if !self.config.openrouter_api_key.is_empty() {
-            return self.openrouter_generate(prompt).await;
-        }
-
-        Err(anyhow!(
-            "No cloud API configured. Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY"
-        ))
-    }
-
-    /// Generate using Anthropic API directly (fastest cloud option)
-    async fn anthropic_generate(&self, prompt: &str) -> Result<String> {
-        debug!("☁️  Generating with Claude via Anthropic API");
-
-        let request = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 4096,
-            "messages": [{
-                "role": "user",
-                "content": prompt
-            }]
-        });
-
-        let response = self
-            .http_client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.config.anthropic_api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(anyhow!("Anthropic API error: {}", error_text));
-        }
-
-        let response: serde_json::Value = response.json().await?;
-
-        response["content"]
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|block| block["text"].as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("Empty response from Anthropic"))
+        self.openrouter_generate(prompt).await
     }
 
     /// Generate using OpenRouter API
     async fn openrouter_generate(&self, prompt: &str) -> Result<String> {
-        debug!("☁️  Generating with cloud LLM via OpenRouter");
+        info!("☁️  Generating with cloud LLM: {}", self.config.cloud_model);
 
         let request = OpenRouterRequest {
             model: self.config.cloud_model.clone(),
@@ -980,7 +921,7 @@ Reply (1-2 sentences max):"#,
 
     /// Check if cloud API is available
     fn has_cloud_api(&self) -> bool {
-        !self.config.anthropic_api_key.is_empty() || !self.config.openrouter_api_key.is_empty()
+        !self.config.openrouter_api_key.is_empty()
     }
 }
 

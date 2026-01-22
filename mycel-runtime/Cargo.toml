@@ -28,6 +28,9 @@ llama_cpp_rs = { version = "0.3", optional = true }
 # Command line parsing
 clap = { version = "4.4", features = ["derive"] }
 
+# TTY detection
+atty = "0.2"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

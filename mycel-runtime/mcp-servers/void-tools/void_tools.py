@@ -74,6 +74,122 @@ async def list_tools() -> list[Tool]:
     """Return list of available tools."""
     tools = []
 
+    # Shell command tool - the most useful for an OS assistant
+    tools.append(Tool(
+        name="shell_command",
+        description="Execute a shell command and return the output. Use for: listing files, checking status, running scripts, etc.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to execute (e.g., 'ls -la', 'cat /etc/os-release', 'df -h')"
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for the command (optional)"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default: 30)"
+                }
+            },
+            "required": ["command"]
+        }
+    ))
+
+    # File read tool
+    tools.append(Tool(
+        name="file_read",
+        description="Read the contents of a file. Returns the text content.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to read"
+                },
+                "lines": {
+                    "type": "integer",
+                    "description": "Maximum lines to read (default: all, use to limit large files)"
+                }
+            },
+            "required": ["path"]
+        }
+    ))
+
+    # File write tool
+    tools.append(Tool(
+        name="file_write",
+        description="Write content to a file. Creates the file if it doesn't exist.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to write"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Content to write to the file"
+                },
+                "append": {
+                    "type": "boolean",
+                    "description": "Append instead of overwrite (default: false)"
+                }
+            },
+            "required": ["path", "content"]
+        }
+    ))
+
+    # File list tool
+    tools.append(Tool(
+        name="file_list",
+        description="List files in a directory with details.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path to list (default: current directory)"
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Filter by glob pattern (e.g., '*.py', '*.txt')"
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "List recursively (default: false)"
+                }
+            },
+            "required": []
+        }
+    ))
+
+    # File search tool
+    tools.append(Tool(
+        name="file_search",
+        description="Search for files by name or content.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory to search in"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "File name pattern to search for"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Search for files containing this text"
+                }
+            },
+            "required": ["path"]
+        }
+    ))
+
     # Package search tool
     tools.append(Tool(
         name="xbps_search",
@@ -237,7 +353,38 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
     """Handle tool calls."""
 
-    if name == "xbps_search":
+    # Core shell/file tools (most useful)
+    if name == "shell_command":
+        return await shell_command(
+            arguments.get("command", ""),
+            arguments.get("cwd"),
+            arguments.get("timeout", 30)
+        )
+    elif name == "file_read":
+        return await file_read(
+            arguments.get("path", ""),
+            arguments.get("lines")
+        )
+    elif name == "file_write":
+        return await file_write(
+            arguments.get("path", ""),
+            arguments.get("content", ""),
+            arguments.get("append", False)
+        )
+    elif name == "file_list":
+        return await file_list(
+            arguments.get("path", "."),
+            arguments.get("pattern"),
+            arguments.get("recursive", False)
+        )
+    elif name == "file_search":
+        return await file_search(
+            arguments.get("path", "."),
+            arguments.get("name"),
+            arguments.get("content")
+        )
+    # Package management tools
+    elif name == "xbps_search":
         return await xbps_search(arguments.get("query", ""))
     elif name == "xbps_info":
         return await xbps_info(arguments.get("package", ""))
@@ -273,6 +420,276 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
             isError=True
         )
 
+
+# ============================================================================
+# CORE TOOLS - Shell & File Operations
+# ============================================================================
+
+async def shell_command(command: str, cwd: str | None = None, timeout: int = 30) -> CallToolResult:
+    """Execute a shell command."""
+    if not command:
+        return CallToolResult(
+            content=[TextContent(type="text", text="Error: command is required")],
+            isError=True
+        )
+
+    # Security: block obviously dangerous commands
+    dangerous = ["rm -rf /", "mkfs", ":(){:|:&};:", "dd if=/dev/zero of=/dev/"]
+    for d in dangerous:
+        if d in command:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Error: Blocked dangerous command pattern: {d}")],
+                isError=True
+            )
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd
+        )
+
+        output = ""
+        if result.stdout:
+            output += result.stdout
+        if result.stderr:
+            if output:
+                output += "\n--- stderr ---\n"
+            output += result.stderr
+
+        if not output.strip():
+            output = "(no output)"
+
+        # Limit output size
+        if len(output) > 10000:
+            output = output[:10000] + "\n... (output truncated)"
+
+        return CallToolResult(
+            content=[TextContent(type="text", text=output.strip())]
+        )
+    except subprocess.TimeoutExpired:
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Error: Command timed out after {timeout}s")],
+            isError=True
+        )
+    except Exception as e:
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Error: {str(e)}")],
+            isError=True
+        )
+
+
+async def file_read(path: str, lines: int | None = None) -> CallToolResult:
+    """Read file contents."""
+    if not path:
+        return CallToolResult(
+            content=[TextContent(type="text", text="Error: path is required")],
+            isError=True
+        )
+
+    try:
+        # Expand ~ and resolve path
+        path = os.path.expanduser(path)
+
+        if not os.path.exists(path):
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Error: File not found: {path}")],
+                isError=True
+            )
+
+        if os.path.isdir(path):
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Error: '{path}' is a directory, not a file")],
+                isError=True
+            )
+
+        with open(path, "r", errors="replace") as f:
+            if lines:
+                content = "".join(f.readline() for _ in range(lines))
+            else:
+                content = f.read()
+
+        # Limit output size
+        if len(content) > 50000:
+            content = content[:50000] + "\n... (file truncated, use 'lines' parameter to read specific sections)"
+
+        return CallToolResult(
+            content=[TextContent(type="text", text=content if content else "(empty file)")]
+        )
+    except PermissionError:
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Error: Permission denied: {path}")],
+            isError=True
+        )
+    except Exception as e:
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Error reading file: {str(e)}")],
+            isError=True
+        )
+
+
+async def file_write(path: str, content: str, append: bool = False) -> CallToolResult:
+    """Write content to a file."""
+    if not path:
+        return CallToolResult(
+            content=[TextContent(type="text", text="Error: path is required")],
+            isError=True
+        )
+
+    try:
+        path = os.path.expanduser(path)
+
+        # Create parent directories if needed
+        parent = os.path.dirname(path)
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent)
+
+        mode = "a" if append else "w"
+        with open(path, mode) as f:
+            f.write(content)
+
+        action = "appended to" if append else "written to"
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Successfully {action} {path} ({len(content)} bytes)")]
+        )
+    except PermissionError:
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Error: Permission denied: {path}")],
+            isError=True
+        )
+    except Exception as e:
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Error writing file: {str(e)}")],
+            isError=True
+        )
+
+
+async def file_list(path: str = ".", pattern: str | None = None, recursive: bool = False) -> CallToolResult:
+    """List files in a directory."""
+    try:
+        path = os.path.expanduser(path)
+
+        if not os.path.exists(path):
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Error: Path not found: {path}")],
+                isError=True
+            )
+
+        if not os.path.isdir(path):
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Error: '{path}' is not a directory")],
+                isError=True
+            )
+
+        import glob
+
+        if recursive:
+            search_pattern = os.path.join(path, "**", pattern or "*")
+            files = glob.glob(search_pattern, recursive=True)
+        else:
+            search_pattern = os.path.join(path, pattern or "*")
+            files = glob.glob(search_pattern)
+
+        if not files:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"No files found in {path}" + (f" matching '{pattern}'" if pattern else ""))]
+            )
+
+        # Sort and format output
+        files.sort()
+
+        results = []
+        for f in files[:100]:  # Limit to 100 entries
+            try:
+                stat = os.stat(f)
+                size = stat.st_size
+                is_dir = os.path.isdir(f)
+                name = os.path.relpath(f, path)
+                if is_dir:
+                    name += "/"
+                if size > 1024 * 1024:
+                    size_str = f"{size / (1024*1024):.1f}M"
+                elif size > 1024:
+                    size_str = f"{size / 1024:.1f}K"
+                else:
+                    size_str = f"{size}B"
+                results.append(f"{size_str:>8}  {name}")
+            except:
+                results.append(f"{'?':>8}  {os.path.relpath(f, path)}")
+
+        output = "\n".join(results)
+        if len(files) > 100:
+            output += f"\n... and {len(files) - 100} more files"
+
+        return CallToolResult(
+            content=[TextContent(type="text", text=output)]
+        )
+    except Exception as e:
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Error listing files: {str(e)}")],
+            isError=True
+        )
+
+
+async def file_search(path: str, name: str | None = None, content: str | None = None) -> CallToolResult:
+    """Search for files by name or content."""
+    try:
+        path = os.path.expanduser(path)
+
+        if not os.path.exists(path):
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Error: Path not found: {path}")],
+                isError=True
+            )
+
+        if not name and not content:
+            return CallToolResult(
+                content=[TextContent(type="text", text="Error: Provide either 'name' pattern or 'content' to search for")],
+                isError=True
+            )
+
+        results = []
+
+        # Use find for name search, grep for content search
+        if name and not content:
+            cmd = ["find", path, "-name", name, "-type", "f"]
+            stdout, stderr, code = run_command(cmd, timeout=30)
+            if stdout.strip():
+                results = stdout.strip().split("\n")[:50]
+        elif content:
+            cmd = ["grep", "-rl", content, path]
+            if name:
+                cmd = ["grep", "-rl", "--include", name, content, path]
+            stdout, stderr, code = run_command(cmd, timeout=30)
+            if stdout.strip():
+                results = stdout.strip().split("\n")[:50]
+
+        if not results:
+            msg = f"No files found"
+            if name:
+                msg += f" matching '{name}'"
+            if content:
+                msg += f" containing '{content}'"
+            return CallToolResult(
+                content=[TextContent(type="text", text=msg)]
+            )
+
+        return CallToolResult(
+            content=[TextContent(type="text", text="\n".join(results))]
+        )
+    except Exception as e:
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Error searching: {str(e)}")],
+            isError=True
+        )
+
+
+# ============================================================================
+# PACKAGE MANAGEMENT TOOLS
+# ============================================================================
 
 async def xbps_search(query: str) -> CallToolResult:
     """Search for packages."""
