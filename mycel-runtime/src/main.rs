@@ -262,6 +262,40 @@ impl MycelRuntime {
         }
     }
 
+    /// Process user input with a specific LLM provider
+    pub async fn process_input_with_provider(
+        &self,
+        input: &str,
+        session_id: &str,
+        provider: ipc::LlmProvider,
+    ) -> Result<RuntimeResponse> {
+        use ipc::LlmProvider;
+
+        // If auto, use normal process_input
+        if provider == LlmProvider::Auto {
+            return self.process_input(input, session_id).await;
+        }
+
+        let context = self.context_manager.get_context(session_id).await?;
+
+        // Use provider-aware processing
+        let response = self
+            .ai_router
+            .process_with_tools_provider(input, &context, &self.mcp_manager, provider)
+            .await?;
+
+        // Check if LLM wants to execute code
+        if response.starts_with("#!exec\n") || response.starts_with("#!exec ") {
+            let code = response.trim_start_matches("#!exec").trim();
+            self.execute_code_with_policy(code, session_id).await
+        } else if response.starts_with("```") {
+            let code = extract_code_block(&response);
+            self.execute_code_with_policy(&code, session_id).await
+        } else {
+            Ok(RuntimeResponse::Text(response))
+        }
+    }
+
     /// Update history and sync with mesh
     pub async fn record_interaction(
         &self,

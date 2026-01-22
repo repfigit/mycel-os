@@ -239,11 +239,16 @@ async fn handle_connection(
 
                         // Process request
                         match &request {
-                            IpcRequest::Chat { message } => {
-                                match runtime.process_input(message, &session_id).await {
+                            IpcRequest::Chat { message, provider } => {
+                                match runtime
+                                    .process_input_with_provider(message, &session_id, *provider)
+                                    .await
+                                {
                                     Ok(crate::RuntimeResponse::Text(text)) => {
                                         // Record the interaction for history and sync
-                                        let _ = runtime.record_interaction(&session_id, message, &text).await;
+                                        let _ = runtime
+                                            .record_interaction(&session_id, message, &text)
+                                            .await;
 
                                         let response = IpcResponse::Chat {
                                             response: text,
@@ -257,21 +262,31 @@ async fn handle_connection(
                                     Ok(crate::RuntimeResponse::Stream(mut stream)) => {
                                         use futures_util::StreamExt;
                                         let mut full_response = String::new();
-                                        
+
                                         while let Some(chunk_result) = stream.next().await {
                                             if let Ok(chunk) = chunk_result {
                                                 full_response.push_str(&chunk);
-                                                let chunk_response = IpcResponse::ChatChunk { delta: chunk };
-                                                if let Ok(json) = serde_json::to_string(&chunk_response) {
+                                                let chunk_response =
+                                                    IpcResponse::ChatChunk { delta: chunk };
+                                                if let Ok(json) =
+                                                    serde_json::to_string(&chunk_response)
+                                                {
                                                     let mut w = writer.lock().await;
-                                                    let _ = w.write_all((json + "\n").as_bytes()).await;
+                                                    let _ =
+                                                        w.write_all((json + "\n").as_bytes()).await;
                                                     let _ = w.flush().await;
                                                 }
                                             }
                                         }
-                                        
+
                                         // Record the interaction for history and sync
-                                        let _ = runtime.record_interaction(&session_id, message, &full_response).await;
+                                        let _ = runtime
+                                            .record_interaction(
+                                                &session_id,
+                                                message,
+                                                &full_response,
+                                            )
+                                            .await;
 
                                         // Send final full message
                                         let final_response = IpcResponse::Chat {
@@ -284,7 +299,9 @@ async fn handle_connection(
                                         w.flush().await?;
                                     }
                                     Err(e) => {
-                                        let response = IpcResponse::Error { message: e.to_string() };
+                                        let response = IpcResponse::Error {
+                                            message: e.to_string(),
+                                        };
                                         let json = serde_json::to_string(&response)? + "\n";
                                         let mut w = writer.lock().await;
                                         w.write_all(json.as_bytes()).await?;
@@ -293,7 +310,8 @@ async fn handle_connection(
                                 }
                             }
                             _ => {
-                                let response = process_request(&request, &runtime, &mut session_id).await;
+                                let response =
+                                    process_request(&request, &runtime, &mut session_id).await;
                                 let json = serde_json::to_string(&response)? + "\n";
                                 let mut w = writer.lock().await;
                                 w.write_all(json.as_bytes()).await?;
@@ -337,8 +355,10 @@ async fn process_request(
             }
         }
         IpcRequest::Chat { .. } => {
-            // Handled separately in handle_connection for streaming
-            IpcResponse::Error { message: "Internal error: Chat should be handled by streaming handler".to_string() }
+            // Handled separately in handle_connection for streaming/provider routing
+            IpcResponse::Error {
+                message: "Internal error: Chat should be handled by streaming handler".to_string(),
+            }
         }
         IpcRequest::SetSession { id } => {
             *session_id = id.clone();
@@ -380,6 +400,19 @@ async fn process_request(
     }
 }
 
+/// LLM provider selection
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmProvider {
+    /// Automatically choose based on config (default)
+    #[default]
+    Auto,
+    /// Force local LLM (Ollama)
+    Local,
+    /// Force cloud LLM (OpenRouter)
+    Cloud,
+}
+
 /// Requests that can be sent to the runtime
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -387,7 +420,12 @@ pub enum IpcRequest {
     /// Authenticate with token (required before other requests)
     Authenticate { token: String },
     /// Send a chat message
-    Chat { message: String },
+    Chat {
+        message: String,
+        /// Optional: force a specific LLM provider (local, cloud, or auto)
+        #[serde(default)]
+        provider: LlmProvider,
+    },
     /// Set the session ID
     SetSession { id: String },
     /// Get current context
@@ -410,9 +448,7 @@ pub enum IpcResponse {
         surface: Option<crate::ui::Surface>,
     },
     /// Chat chunk (for streaming)
-    ChatChunk {
-        delta: String,
-    },
+    ChatChunk { delta: String },
     /// Code execution result
     CodeResult {
         code: String,
@@ -462,8 +498,17 @@ impl IpcClient {
     }
 
     pub async fn chat(&mut self, message: &str) -> Result<IpcResponse> {
+        self.chat_with_provider(message, LlmProvider::Auto).await
+    }
+
+    pub async fn chat_with_provider(
+        &mut self,
+        message: &str,
+        provider: LlmProvider,
+    ) -> Result<IpcResponse> {
         self.send(&IpcRequest::Chat {
             message: message.to_string(),
+            provider,
         })
         .await
     }
@@ -554,7 +599,9 @@ mod tests {
 
     #[test]
     fn test_exec_request_serialization() {
-        let request = IpcRequest::ExecuteCode { code: "ls".to_string() };
+        let request = IpcRequest::ExecuteCode {
+            code: "ls".to_string(),
+        };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("ExecuteCode"));
         assert!(json.contains("ls"));

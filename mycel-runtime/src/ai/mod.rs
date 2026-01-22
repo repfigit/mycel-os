@@ -919,6 +919,126 @@ Reply (1-2 sentences max):"#,
             .ok_or_else(|| anyhow!("Empty response from OpenRouter"))
     }
 
+    /// Generate with a specific provider (for IPC provider selection)
+    pub async fn generate_with_provider(
+        &self,
+        prompt: &str,
+        provider: crate::ipc::LlmProvider,
+    ) -> Result<String> {
+        use crate::ipc::LlmProvider;
+        let start = std::time::Instant::now();
+
+        let result = match provider {
+            LlmProvider::Auto => self.smart_generate(prompt, false).await,
+            LlmProvider::Local => {
+                if !self.local_available {
+                    return Err(anyhow!("Local LLM (Ollama) is not available"));
+                }
+                self.local_generate(prompt).await
+            }
+            LlmProvider::Cloud => {
+                if !self.has_cloud_api() {
+                    return Err(anyhow!(
+                        "Cloud LLM is not configured. Set OPENROUTER_API_KEY."
+                    ));
+                }
+                self.cloud_generate(prompt).await
+            }
+        };
+
+        let elapsed = start.elapsed();
+        let source = match provider {
+            LlmProvider::Auto => "auto",
+            LlmProvider::Local => "local",
+            LlmProvider::Cloud => "cloud",
+        };
+        info!("AI response time: {:?} ({})", elapsed, source);
+
+        result
+    }
+
+    /// Process with tools using a specific provider
+    pub async fn process_with_tools_provider(
+        &self,
+        input: &str,
+        context: &Context,
+        mcp_manager: &McpManager,
+        provider: crate::ipc::LlmProvider,
+    ) -> Result<String> {
+        let tools_prompt = mcp_manager.get_tools_prompt().await;
+
+        if tools_prompt.is_empty() {
+            return self
+                .generate_with_provider(&self.build_basic_prompt(input, context), provider)
+                .await;
+        }
+
+        let prompt = format!(
+            r#"You are Mycel OS. You ARE the operating system.
+
+{tools_prompt}
+
+RULES:
+- TERSE responses only.
+- Use tools when helpful for the task.
+- For simple questions, just respond directly.
+- After getting tool results, provide a final response.
+
+cwd: {cwd}
+user: {input}
+
+Reply:"#,
+            tools_prompt = tools_prompt,
+            cwd = context.working_directory,
+            input = input
+        );
+
+        let response = self.generate_with_provider(&prompt, provider).await?;
+        let parsed = mcp::parse_tool_calls(&response);
+
+        if !parsed.has_tool_calls() {
+            return Ok(strip_markdown_formatting(&response));
+        }
+
+        // Process tool calls
+        let mut tool_results = Vec::new();
+        for call in &parsed.tool_calls {
+            if mcp_manager.requires_confirmation(&call.name).await {
+                tool_results.push(format!("Tool '{}' requires user confirmation.", call.name));
+            } else {
+                match mcp_manager.process_tool_call(call).await {
+                    Ok(result) => tool_results.push(result),
+                    Err(e) => tool_results.push(format!("Tool error: {}", e)),
+                }
+            }
+        }
+
+        // Continuation prompt
+        let continuation_prompt = format!(
+            r#"Previous context:
+User asked: {}
+You responded: {}
+
+Tool results:
+{}
+
+Provide a concise final response based on these tool results."#,
+            input,
+            parsed.prefix_text.trim(),
+            tool_results.join("\n\n")
+        );
+
+        let final_response = self
+            .generate_with_provider(&continuation_prompt, provider)
+            .await?;
+        Ok(strip_markdown_formatting(&final_response))
+    }
+
+    /// Check if local LLM is available
+    pub fn is_local_available(&self) -> bool {
+        self.local_available
+    }
+
     /// Check if cloud API is available
     fn has_cloud_api(&self) -> bool {
         !self.config.openrouter_api_key.is_empty()
