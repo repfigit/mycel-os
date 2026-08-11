@@ -102,7 +102,7 @@ This document captures key decisions made during Mycel OS design. Claude Code sh
 | **Anthropic** | Best reasoning, safety-focused | Cost | ✅ |
 
 **Consequences:**
-- Requires ANTHROPIC_API_KEY
+- Requires OPENROUTER_API_KEY (see supersession note above)
 - Use claude-sonnet-4-20250514 model
 - Implement smart routing (local first, cloud for complex)
 - Handle API errors gracefully

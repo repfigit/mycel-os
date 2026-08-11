@@ -56,10 +56,10 @@ mod tests {
     
     #[test]
     fn test_env_override() {
-        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        std::env::set_var("OPENROUTER_API_KEY", "test-key");
         let config = MycelConfig::load("/nonexistent", true).unwrap();
         assert_eq!(config.anthropic_api_key, "test-key");
-        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("OPENROUTER_API_KEY");
     }
 }
 ```
