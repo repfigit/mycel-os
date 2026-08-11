@@ -126,10 +126,17 @@ impl McpManager {
             return Ok(());
         }
 
+        // Start servers concurrently in the background so a slow or failing
+        // server (e.g. missing Python deps) doesn't block runtime startup.
+        // Each server has its own init_timeout; failures are logged, not fatal.
         for server_config in &self.config.servers {
-            if let Err(e) = self.start_server(server_config).await {
-                warn!("Failed to start MCP server '{}': {}", server_config.name, e);
-            }
+            let manager = self.clone();
+            let server_config = server_config.clone();
+            tokio::spawn(async move {
+                if let Err(e) = manager.start_server(&server_config).await {
+                    warn!("Failed to start MCP server '{}': {}", server_config.name, e);
+                }
+            });
         }
 
         // Load dynamic servers
