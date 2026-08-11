@@ -25,15 +25,34 @@ cd mycel-os
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
 ollama serve &  # Start Ollama server
-ollama pull phi3:medium  # Download the model (about 8GB)
+ollama pull qwen3:8b  # Download the model (about 5GB)
 ```
 
-### 3. Set Up Anthropic API (Optional but Recommended)
+#### Choosing a Model
 
-For cloud AI features, get an API key from [console.anthropic.com](https://console.anthropic.com):
+Mycel's core loop (chat → tool calls → code generation → execution) needs a
+model with **native tool-calling** and **strong code generation**. The qwen3
+family is the default and recommended choice:
+
+| Hardware | Model | Download | Notes |
+|----------|-------|----------|-------|
+| <8GB RAM, no GPU | `qwen3:4b` | ~2.5GB | Fast, capable; weaker code gen |
+| 8–16GB RAM | **`qwen3:8b`** (default) | ~5GB | Best balance; verified in E2E tests |
+| GPU 8GB+ VRAM | `qwen3:14b` | ~9GB | Much better reasoning |
+| GPU 16GB+ VRAM | `qwen3:32b` | ~20GB | Near-cloud quality |
+
+For code-heavy use, `deepseek-coder-v2:16b-lite` is the strongest local code
+model, but weaker at conversation and tool-calling than qwen3.
+
+Safety note: command safety is enforced by Mycel's **policy evaluator** (which
+gates dangerous commands for confirmation), not by the model refusing requests.
+
+### 3. Set Up Cloud AI via OpenRouter (Optional)
+
+For cloud AI features, get an API key from [openrouter.ai](https://openrouter.ai/keys):
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-your-key-here"
+export OPENROUTER_API_KEY="sk-or-your-key-here"
 ```
 
 ### 4. Run in Development Mode
@@ -213,21 +232,20 @@ systemctl restart ollama
 ### Out of GPU memory
 Use a smaller model:
 ```bash
-ollama pull phi3:mini  # 2GB instead of 8GB
+ollama pull qwen3:4b  # 2.5GB instead of 5GB
 ```
 Update config:
 ```toml
-local_model = "phi3:mini"
+local_model = "qwen3:4b"
 ```
 
 ### Cloud API errors
-Check your API key:
+Check your OpenRouter API key:
 ```bash
-curl https://api.anthropic.com/v1/messages \
-  -H "x-api-key: $ANTHROPIC_API_KEY" \
-  -H "anthropic-version: 2023-06-01" \
+curl https://openrouter.ai/api/v1/chat/completions \
+  -H "Authorization: Bearer $OPENROUTER_API_KEY" \
   -H "content-type: application/json" \
-  -d '{"model":"claude-sonnet-4-20250514","max_tokens":100,"messages":[{"role":"user","content":"Hi"}]}'
+  -d '{"model":"anthropic/claude-3.5-sonnet","messages":[{"role":"user","content":"Hi"}]}'
 ```
 
 ## Contributing

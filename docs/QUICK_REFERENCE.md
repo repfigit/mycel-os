@@ -33,7 +33,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Install Ollama
 curl -fsSL https://ollama.com/install.sh | sh
-ollama pull phi3:medium
+ollama pull qwen3:8b
 
 # Build Mycel OS
 cd mycel-os
@@ -112,12 +112,12 @@ docker compose -f docker/docker-compose.yml build --no-cache
 ollama list
 
 # Pull a model
-ollama pull phi3:medium
+ollama pull qwen3:8b
 ollama pull mistral:7b
 ollama pull llama3.2:3b
 
 # Run model directly
-ollama run phi3:medium "Hello!"
+ollama run qwen3:8b "Hello!"
 
 # Check API
 curl http://localhost:11434/api/tags
@@ -170,11 +170,11 @@ mycel-os/
 
 ```bash
 # Required for cloud AI
-export ANTHROPIC_API_KEY="sk-ant-..."
+export OPENROUTER_API_KEY="sk-or-..."
 
 # Optional
 export OLLAMA_URL="http://localhost:11434"
-export CLAY_LOCAL_MODEL="phi3:medium"
+export MYCEL_LOCAL_MODEL="qwen3:8b"
 export RUST_LOG="info"  # debug, info, warn, error
 ```
 
@@ -233,10 +233,10 @@ sudo systemctl restart ollama
 ### Out of memory
 ```bash
 # Use smaller model
-ollama pull phi3:mini
+ollama pull qwen3:4b
 
 # Update config
-sed -i 's/phi3:medium/phi3:mini/' config/config.toml
+sed -i 's/qwen3:8b/qwen3:4b/' config/config.toml
 ```
 
 ### VNC not connecting

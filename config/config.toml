@@ -14,7 +14,7 @@ config_dir = "/etc/mycel"
 [ai]
 # Local AI (Ollama)
 local_enabled = true
-local_model = "phi3:medium"
+local_model = "qwen3:8b"  # Native tool-calling + strong code gen; use qwen3:4b on <8GB RAM
 local_url = "http://localhost:11434"
 local_timeout_secs = 120
 

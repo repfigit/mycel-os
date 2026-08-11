@@ -392,7 +392,7 @@ fi
 
 # 2. Ensure model is available
 echo "Checking model..."
-ollama pull phi3:mini 2>/dev/null || true
+ollama pull qwen3:4b 2>/dev/null || true
 
 # 3. Build runtime
 echo "Building runtime..."
@@ -504,7 +504,7 @@ path = "tests/integration/mod.rs"
 pub fn create_test_config() -> MycelConfig {
     MycelConfig {
         ollama_url: "http://localhost:11434".to_string(),
-        local_model: "phi3:mini".to_string(),
+        local_model: "qwen3:4b".to_string(),
         ipc_socket_path: "/tmp/mycel-test.sock".to_string(),
         context_path: tempfile::tempdir().unwrap().path().to_string_lossy().to_string(),
         ..Default::default()
@@ -586,7 +586,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: |
-          curl http://localhost:11434/api/pull -d '{"name":"phi3:mini"}'
+          curl http://localhost:11434/api/pull -d '{"name":"qwen3:4b"}'
           cargo test --test integration
 
   lint:

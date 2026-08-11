@@ -168,8 +168,8 @@ cp config/config.toml /etc/mycel/
 ollama list
 
 # Pull the model
-ollama pull phi3:mini    # Small, fast
-ollama pull phi3:medium  # Better quality
+ollama pull qwen3:4b    # Small, fast
+ollama pull qwen3:8b  # Better quality
 ```
 
 ### "out of memory"
@@ -179,7 +179,7 @@ ollama pull phi3:medium  # Better quality
 **Solution:**
 ```bash
 # Use smaller model
-ollama pull phi3:mini      # ~2GB
+ollama pull qwen3:4b      # ~2.5GB
 # Instead of
 ollama pull llama3:70b     # ~40GB
 
@@ -511,7 +511,7 @@ mod tests {
 
 ```bash
 curl http://localhost:11434/api/generate -d '{
-  "model": "phi3:mini",
+  "model": "qwen3:4b",
   "prompt": "Hello",
   "stream": false
 }'

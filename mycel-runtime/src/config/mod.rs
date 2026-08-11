@@ -120,7 +120,10 @@ fn default_ollama_url() -> String {
 }
 
 fn default_local_model() -> String {
-    "tinydolphin".to_string() // Uncensored + fast (636MB) - won't refuse commands
+    // qwen3:8b - best balance for Mycel's core loop: native tool-calling
+    // (required by MCP), strong code generation, 40K context, runs on CPU
+    // in a pinch. Safety is enforced by the policy evaluator, not the model.
+    "qwen3:8b".to_string()
 }
 
 fn default_cloud_model() -> String {
@@ -232,7 +235,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = MycelConfig::default();
-        assert_eq!(config.local_model, "tinydolphin");
+        assert_eq!(config.local_model, "qwen3:8b");
         assert_eq!(config.ollama_url, "http://localhost:11434");
         assert!(!config.force_cloud_for_complex);
     }

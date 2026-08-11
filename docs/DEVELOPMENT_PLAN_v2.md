@@ -407,7 +407,7 @@ auto_update = true
 enabled = ["clay-runtime", "ollama", "sshd"]
 
 [ai]
-local_model = "phi3:medium"
+local_model = "qwen3:8b"
 cloud_enabled = true
 auto_share_patterns = false
 

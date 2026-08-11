@@ -78,7 +78,7 @@ This document captures key decisions made during Mycel OS design. Claude Code sh
 - Ollama runs as separate service
 - HTTP API at localhost:11434
 - Models managed via `ollama pull`
-- Support phi3, mistral, llama models
+- Support qwen3 (default), mistral, llama models
 
 ---
 

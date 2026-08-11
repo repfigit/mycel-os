@@ -122,7 +122,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Install Ollama
 curl -fsSL https://ollama.com/install.sh | sh
-ollama pull tinydolphin
+ollama pull qwen3:8b
 
 # Build
 cd mycel-runtime
@@ -188,9 +188,9 @@ Fix any errors. Common issues:
 curl -fsSL https://ollama.com/install.sh | sh
 
 # Pull a model
-ollama pull phi3:mini    # Fast, small
+ollama pull qwen3:4b   # Fast, small (<8GB RAM)
 # OR
-ollama pull phi3:medium  # Better quality
+ollama pull qwen3:8b   # Better quality (recommended)
 
 # Verify running
 curl http://localhost:11434/api/tags
@@ -338,7 +338,7 @@ Needed:
 ```rust
 // POST http://localhost:11434/api/generate
 {
-    "model": "phi3:medium",
+    "model": "qwen3:8b",
     "prompt": "...",
     "stream": false
 }
@@ -383,7 +383,7 @@ OPENROUTER_API_KEY=sk-or-...
 
 # Optional overrides
 OLLAMA_URL=http://localhost:11434
-MYCEL_LOCAL_MODEL=phi3:medium
+MYCEL_LOCAL_MODEL=qwen3:8b
 RUST_LOG=debug
 RUST_BACKTRACE=1
 ```

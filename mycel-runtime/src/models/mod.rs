@@ -72,7 +72,7 @@ pub struct ModelRequirements {
 /// Information about an available model
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
-    /// Unique identifier (e.g., "phi3:medium" for Ollama, "TheBloke/Mistral-7B-GGUF" for HF)
+    /// Unique identifier (e.g., "qwen3:8b" for Ollama, "TheBloke/Mistral-7B-GGUF" for HF)
     pub id: String,
     /// Human-readable name
     pub name: String,
@@ -427,23 +427,21 @@ impl ModelManager {
     pub async fn get_recommended(&self) -> Result<Vec<ModelInfo>> {
         let ram_gb = self.hardware.total_ram_bytes / (1024 * 1024 * 1024);
 
-        // Recommend models based on available RAM
+        // Recommend models based on available RAM.
+        // Mycel's core loop needs native tool-calling (MCP) and strong code
+        // generation, so qwen3 family is preferred at every tier it fits.
         let recommended_models = if ram_gb >= 32 {
             vec![
+                "qwen3:32b",
+                "deepseek-coder-v2:16b",
                 "llama3.1:70b-instruct-q4_K_M",
-                "mixtral:8x7b",
-                "codellama:34b",
             ]
         } else if ram_gb >= 16 {
-            vec![
-                "llama3.1:8b-instruct-q8_0",
-                "mistral:7b-instruct",
-                "codellama:13b",
-            ]
+            vec!["qwen3:14b", "deepseek-coder-v2:16b-lite", "qwen3:8b"]
         } else if ram_gb >= 8 {
-            vec!["phi3:medium", "llama3.2:3b", "gemma2:2b"]
+            vec!["qwen3:8b", "qwen3:4b", "llama3.2:3b"]
         } else {
-            vec!["phi3:mini", "llama3.2:1b", "tinyllama"]
+            vec!["qwen3:4b", "qwen3:1.7b", "llama3.2:1b"]
         };
 
         Ok(recommended_models
