@@ -84,6 +84,8 @@ This document captures key decisions made during Mycel OS design. Claude Code sh
 
 ## ADR-004: Cloud AI Backend
 
+> **Superseded in implementation:** The runtime uses **OpenRouter** (OpenAI-compatible API) as the cloud gateway rather than the Anthropic API directly. This gives model flexibility (Claude, GPT, etc.) through one API. Set `OPENROUTER_API_KEY`. The reasoning below still applies to model *selection* (Claude remains the default cloud model via `anthropic/claude-3.5-sonnet`).
+
 **Decision:** Anthropic Claude API for complex reasoning
 
 **Context:** Local models have limits. Need cloud for:

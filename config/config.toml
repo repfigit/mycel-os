@@ -18,10 +18,10 @@ local_model = "phi3:medium"
 local_url = "http://localhost:11434"
 local_timeout_secs = 120
 
-# Cloud AI (Anthropic Claude)
+# Cloud AI (via OpenRouter - OpenAI-compatible API)
 cloud_enabled = false
-cloud_api_key = ""  # Set via ANTHROPIC_API_KEY env var
-cloud_model = "claude-sonnet-4-20250514"
+cloud_api_key = ""  # Set via OPENROUTER_API_KEY env var
+cloud_model = "anthropic/claude-3.5-sonnet"  # OpenRouter model format
 cloud_timeout_secs = 60
 
 # Routing preferences

@@ -16,38 +16,45 @@ This is the definitive guide for Claude Code to build Mycel OS. Read completely 
 
 ## Current State (Accurate Assessment)
 
-### Code Completeness: ~70% Scaffolded
+> Last verified: cargo check/clippy/test all pass, 60 tests green.
 
-| Module            | Lines  | Status    | Notes                            |
-| ----------------- | ------ | --------- | -------------------------------- |
-| `main.rs`         | 256    | ✅ Working | Entry point, CLI, runtime struct |
-| `config/mod.rs`   | 140    | ✅ Working | Config loading, defaults         |
-| `ai/mod.rs`       | 357    | ✅ Working | Ollama + Claude API clients      |
-| `context/mod.rs`  | 201    | ✅ Working | Session management               |
-| `intent/mod.rs`   | 152    | ✅ Working | Intent parsing types             |
-| `executor/mod.rs` | 284    | ⚠️ Partial | Sandbox scaffolded               |
-| `ipc/mod.rs`      | 229    | ⚠️ Partial | Socket server scaffolded         |
-| `ui/mod.rs`       | 233    | ⚠️ Partial | Surface generation scaffolded    |
-| `codegen/mod.rs`  | 217    | ⚠️ Partial | Code generation scaffolded       |
-| `collective/`     | 282+   | ⚠️ Partial | NEAR/Bittensor stubs             |
-| `sync/`           | 0      | ❌ Missing | Device mesh not started          |
-| **Total**         | ~2,350 |           |                                  |
+### Code Completeness: ~10,600 lines, core runtime functional
 
-### What Works (Once Compiled)
+| Module            | Lines  | Status    | Notes                                     |
+| ----------------- | ------ | --------- | ----------------------------------------- |
+| `main.rs`         | 510    | ✅ Working | Entry point, CLI, runtime struct          |
+| `config/mod.rs`   | 248    | ✅ Working | Config loading, defaults                  |
+| `ai/mod.rs`       | 1,150  | ✅ Working | Ollama + OpenRouter/Claude, tool use      |
+| `context/mod.rs`  | 309    | ✅ Working | Session management                        |
+| `intent/mod.rs`   | 189    | ✅ Working | Intent parsing types                      |
+| `executor/mod.rs` | 253    | ✅ Working | Sandboxed execution + policy gate         |
+| `ipc/mod.rs`      | 693    | ✅ Working | Socket server, streaming, auth, rate limit|
+| `ui/mod.rs`       | 285    | ⚠️ Partial | Surface generation scaffolded             |
+| `codegen/mod.rs`  | 150    | ⚠️ Partial | Code generation scaffolded                |
+| `policy/mod.rs`   | 411    | ✅ Working | Action policy evaluation                  |
+| `models/mod.rs`   | 519    | ✅ Working | Model registry/detection                  |
+| `sync/mod.rs`     | 682    | ✅ Working | Device mesh: mDNS, WireGuard keys, CRDT   |
+| `mcp/`            | ~2,400 | ✅ Working | MCP client/servers, tool parser, evolver  |
+| `collective/`     | ~2,800 | ⚠️ Partial | NEAR/Bittensor/privacy stubs + logic      |
+| `events/mod.rs`   | 20     | ✅ Working | Event bus types                           |
+| **Total**         | ~10,600|           |                                           |
+
+### What Works
+- Compiles clean: `cargo check`, `cargo clippy` (0 warnings), `cargo test` (60 passing)
 - Config loading from TOML with env var overrides
-- Ollama API client (generate, check availability)
-- Claude API client (messages endpoint)
-- Intent routing between local/cloud
-- Session context management
-- Conversation history tracking
+- Ollama API client + OpenRouter/Claude cloud routing with provider selection
+- MCP tool integration (void-tools, web-tools, near-identity servers)
+- IPC server with streaming, auth tokens, rate limiting
+- Policy-gated code execution with user confirmation flow
+- Device sync: mDNS discovery, WireGuard key exchange, vector-clock CRDT events
+- TLS via rustls (no OpenSSL system dependency — musl-friendly)
 
 ### What Needs Work
-1. **Verify compilation** - May have type mismatches or missing imports
-2. **Test Ollama integration** - Need live Ollama instance
-3. **IPC server** - Has structure but needs testing
-4. **Executor sandbox** - Firejail/bubblewrap integration incomplete
-5. **Collective** - NEAR/Bittensor are stubs only
-6. **Sync** - Module doesn't exist yet
+1. **Live Ollama testing** - Need running Ollama instance for E2E verification
+2. **Executor sandbox** - Verify firejail/bubblewrap on a real Void system
+3. **Collective** - NEAR/Bittensor need testnet deployment, not more code
+4. **GUI** - Wayland compositor (Smithay) not started
+5. **ISO** - Build scripts exist but unverified end-to-end
 
 ---
 
@@ -338,17 +345,18 @@ Needed:
 // Response: { "response": "..." }
 ```
 
-### Claude API
+### Cloud API (OpenRouter)
+
+The runtime uses OpenRouter (OpenAI-compatible) for cloud AI, not the Anthropic API directly.
 
 ```rust
-// POST https://api.anthropic.com/v1/messages
-// Headers: x-api-key, anthropic-version: 2023-06-01
+// POST https://openrouter.ai/api/v1/chat/completions
+// Headers: Authorization: Bearer $OPENROUTER_API_KEY
 {
-    "model": "claude-sonnet-4-20250514",
-    "max_tokens": 4096,
+    "model": "anthropic/claude-3.5-sonnet",
     "messages": [{"role": "user", "content": "..."}]
 }
-// Response: { "content": [{"text": "..."}] }
+// Response: { "choices": [{"message": {"content": "..."}}] }
 ```
 
 ### IPC Protocol
@@ -371,7 +379,7 @@ Needed:
 
 ```bash
 # Required for cloud AI
-ANTHROPIC_API_KEY=sk-ant-...
+OPENROUTER_API_KEY=sk-or-...
 
 # Optional overrides
 OLLAMA_URL=http://localhost:11434
@@ -426,8 +434,8 @@ cargo build --release
 
 ## Success Milestones
 
-### Milestone 1: Compiles and Runs ⬜
-- [ ] `cargo build` succeeds
+### Milestone 1: Compiles and Runs ✅ (build green)
+- [x] `cargo build` succeeds
 - [ ] `cargo run -- --dev` starts without crash
 - [ ] Connects to Ollama
 
@@ -497,10 +505,11 @@ ssh mycel@localhost -p 2222   # Connect (password: mycel)
 
 ```bash
 cd mycel-runtime
-cargo build
+cargo test    # verify green
+cargo run -- --dev --verbose
 ```
 
-Fix any compilation errors, then proceed to testing with Ollama.
+Compilation is green. Focus on live Ollama testing and E2E chat → code execution flow.
 
 ---
 
