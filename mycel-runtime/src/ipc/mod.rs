@@ -384,18 +384,40 @@ async fn process_request(
                 llm_model: runtime.config.local_model.clone(),
             }
         }
-        IpcRequest::ExecuteCode { code } => match runtime.executor.run(code).await {
-            Ok(output) => IpcResponse::CodeResult {
-                code: code.clone(),
-                output,
-                success: true,
-            },
-            Err(e) => IpcResponse::CodeResult {
-                code: code.clone(),
-                output: e.to_string(),
-                success: false,
-            },
-        },
+        IpcRequest::ExecuteCode { code } => {
+            // Gate direct execution through the policy evaluator, same as the
+            // chat flow. Denied commands are rejected outright; commands
+            // requiring confirmation are refused here (IPC has no interactive
+            // prompt) with an explanatory message.
+            use crate::policy::ActionPolicy;
+            match runtime.policy_evaluator.evaluate_code(code) {
+                ActionPolicy::Allow => match runtime.executor.run(code).await {
+                    Ok(output) => IpcResponse::CodeResult {
+                        code: code.clone(),
+                        output,
+                        success: true,
+                    },
+                    Err(e) => IpcResponse::CodeResult {
+                        code: code.clone(),
+                        output: e.to_string(),
+                        success: false,
+                    },
+                },
+                ActionPolicy::RequiresConfirmation { message, .. } => IpcResponse::CodeResult {
+                    code: code.clone(),
+                    output: format!(
+                        "requires confirmation (use chat flow to approve): {}",
+                        message
+                    ),
+                    success: false,
+                },
+                ActionPolicy::Deny { reason } => IpcResponse::CodeResult {
+                    code: code.clone(),
+                    output: format!("denied by policy: {}", reason),
+                    success: false,
+                },
+            }
+        }
         IpcRequest::Ping => IpcResponse::Pong,
     }
 }
