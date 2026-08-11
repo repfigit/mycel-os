@@ -5,7 +5,9 @@ description = "MCP server for Void Linux system tools"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.0.0",
+    # Pin to 1.x: the server uses the @server.list_tools()/@server.call_tool()
+    # decorator API, which was removed in mcp 2.0.
+    "mcp>=1.0.0,<2.0.0",
 ]
 
 [build-system]

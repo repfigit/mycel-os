@@ -301,13 +301,34 @@ impl McpServer {
         match tokio::time::timeout(self.config.init_timeout, self.initialize()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                let err_msg = format!("Initialize failed: {}", e);
+                // Surface any captured stderr (e.g. missing Python deps) to aid debugging
+                let stderr_hint = self
+                    .health
+                    .read()
+                    .await
+                    .last_error
+                    .as_deref()
+                    .map(|s| format!(" (stderr: {})", s))
+                    .unwrap_or_default();
+                let err_msg = format!("Initialize failed: {}{}", e, stderr_hint);
                 *self.state.write().await = ServerState::Failed(err_msg.clone());
                 self.health.write().await.last_error = Some(err_msg.clone());
                 return Err(anyhow!(err_msg));
             }
             Err(_) => {
-                let err_msg = "Initialize timed out".to_string();
+                let stderr_hint = self
+                    .health
+                    .read()
+                    .await
+                    .last_error
+                    .as_deref()
+                    .map(|s| format!(" (stderr: {})", s))
+                    .unwrap_or_default();
+                let err_msg = format!(
+                    "Initialize timed out after {:?}{}. If this is a Python MCP server, \
+                     its dependencies may be missing - run scripts/setup-mcp-servers.sh",
+                    self.config.init_timeout, stderr_hint
+                );
                 *self.state.write().await = ServerState::Failed(err_msg.clone());
                 self.health.write().await.last_error = Some(err_msg.clone());
                 return Err(anyhow!(err_msg));

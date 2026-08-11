@@ -705,16 +705,25 @@ server.connect(transport);"
 
 /// Create default MCP configuration for Void Linux tools
 pub fn default_void_tools_config(runtime_path: &str) -> McpConfig {
+    let server_dir = format!("{}/mcp-servers/void-tools", runtime_path);
+
+    // Prefer the server's virtualenv Python (where its `mcp` dependency is
+    // installed) over the system python3. PEP 668 systems refuse pip installs
+    // into the system environment, so each Python MCP server gets its own venv.
+    let venv_python = format!("{}/.venv/bin/python3", server_dir);
+    let command = if Path::new(&venv_python).exists() {
+        venv_python
+    } else {
+        "python3".to_string()
+    };
+
     McpConfig {
         enabled: true,
         servers: vec![
             McpServerConfig {
                 name: "void-tools".to_string(),
-                command: "python3".to_string(),
-                args: vec![format!(
-                    "{}/mcp-servers/void-tools/void_tools.py",
-                    runtime_path
-                )],
+                command,
+                args: vec![format!("{}/void_tools.py", server_dir)],
                 env: HashMap::new(),
                 requires_confirmation: vec![
                     "xbps_install".to_string(),
