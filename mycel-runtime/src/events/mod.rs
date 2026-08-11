@@ -16,7 +16,5 @@ pub enum SystemEvent {
         response_time_ms: u64,
     },
     /// Fired when an MCP server is restarted after failure
-    McpServerRestarted {
-        name: String,
-    },
+    McpServerRestarted { name: String },
 }

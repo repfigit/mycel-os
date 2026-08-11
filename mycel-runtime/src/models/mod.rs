@@ -339,7 +339,10 @@ impl ModelManager {
                 let path = entry.path();
 
                 if path.extension().map(|e| e == "gguf").unwrap_or(false) {
-                    let name = path.file_stem().unwrap().to_string_lossy().to_string();
+                    let Some(stem) = path.file_stem() else {
+                        continue;
+                    };
+                    let name = stem.to_string_lossy().to_string();
                     let size = entry.metadata()?.len();
 
                     models.push(ModelInfo {

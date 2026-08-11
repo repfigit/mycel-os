@@ -67,7 +67,11 @@ impl ContextManager {
     }
 
     /// Set a pending command for a session
-    pub async fn set_pending_command(&self, session_id: &str, command: Option<String>) -> Result<()> {
+    pub async fn set_pending_command(
+        &self,
+        session_id: &str,
+        command: Option<String>,
+    ) -> Result<()> {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
             session.touch();
@@ -79,7 +83,9 @@ impl ContextManager {
     /// Get the pending command for a session
     pub async fn get_pending_command(&self, session_id: &str) -> Option<String> {
         let sessions = self.sessions.read().await;
-        sessions.get(session_id).and_then(|s| s.pending_command.clone())
+        sessions
+            .get(session_id)
+            .and_then(|s| s.pending_command.clone())
     }
 
     /// Clear the pending command for a session

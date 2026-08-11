@@ -98,8 +98,8 @@ fn strip_markdown_formatting(text: &str) -> String {
             // Look for matching ]
             let link_start = i + 1;
             let mut link_end = None;
-            for j in (i + 1)..chars.len() {
-                if chars[j] == ']' {
+            for (j, &c) in chars.iter().enumerate().skip(i + 1) {
+                if c == ']' {
                     link_end = Some(j);
                     break;
                 }
@@ -109,8 +109,8 @@ fn strip_markdown_formatting(text: &str) -> String {
                 if end + 1 < chars.len() && chars[end + 1] == '(' {
                     // Find matching )
                     let mut url_end = None;
-                    for k in (end + 2)..chars.len() {
-                        if chars[k] == ')' {
+                    for (k, &c) in chars.iter().enumerate().skip(end + 2) {
+                        if c == ')' {
                             url_end = Some(k);
                             break;
                         }

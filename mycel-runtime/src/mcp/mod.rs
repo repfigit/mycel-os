@@ -143,9 +143,15 @@ impl McpManager {
 
                     // Detect language and setup config
                     let (command, args) = if server_dir.join("index.js").exists() {
-                        ("node".to_string(), vec![server_dir.join("index.js").to_string_lossy().to_string()])
+                        (
+                            "node".to_string(),
+                            vec![server_dir.join("index.js").to_string_lossy().to_string()],
+                        )
                     } else if server_dir.join("server.py").exists() {
-                        ("python3".to_string(), vec![server_dir.join("server.py").to_string_lossy().to_string()])
+                        (
+                            "python3".to_string(),
+                            vec![server_dir.join("server.py").to_string_lossy().to_string()],
+                        )
                     } else {
                         continue;
                     };
@@ -182,9 +188,8 @@ impl McpManager {
                         match server.restart_if_needed().await {
                             Ok(true) => {
                                 info!("[{}] Server restarted successfully", name);
-                                let _ = event_bus.send(SystemEvent::McpServerRestarted {
-                                    name: name.clone(),
-                                });
+                                let _ = event_bus
+                                    .send(SystemEvent::McpServerRestarted { name: name.clone() });
                             }
                             Ok(false) => {}
                             Err(e) => {
@@ -213,13 +218,21 @@ impl McpManager {
 
         server.start().await?;
 
-        self.servers.lock().await.insert(config.name.clone(), server);
+        self.servers
+            .lock()
+            .await
+            .insert(config.name.clone(), server);
 
         Ok(())
     }
 
     /// Hot-load a new MCP server from a directory
-    pub async fn add_dynamic_server(&self, name: &str, command: &str, args: Vec<String>) -> Result<()> {
+    pub async fn add_dynamic_server(
+        &self,
+        name: &str,
+        command: &str,
+        args: Vec<String>,
+    ) -> Result<()> {
         let config = McpServerConfig {
             name: name.to_string(),
             command: command.to_string(),
@@ -251,7 +264,8 @@ impl McpManager {
             .map(|arg| {
                 if arg.contains('/') && !arg.starts_with('/') && !arg.starts_with("--") {
                     let full_path = Path::new(&self.runtime_path).join(arg);
-                    if full_path.exists() || full_path.parent().map(|p| p.exists()).unwrap_or(false) {
+                    if full_path.exists() || full_path.parent().map(|p| p.exists()).unwrap_or(false)
+                    {
                         return full_path.to_string_lossy().to_string();
                     }
                 }
@@ -304,12 +318,15 @@ impl McpManager {
         arguments: HashMap<String, serde_json::Value>,
     ) -> Result<protocol::CallToolResult> {
         let start = Instant::now();
-        let server_name = self.find_tool_server(tool_name).await
+        let server_name = self
+            .find_tool_server(tool_name)
+            .await
             .ok_or_else(|| anyhow!("No server provides tool '{}'", tool_name))?;
 
         let result = {
             let mut servers = self.servers.lock().await;
-            let server = servers.get_mut(&server_name)
+            let server = servers
+                .get_mut(&server_name)
                 .ok_or_else(|| anyhow!("Server '{}' not found", server_name))?;
 
             server.call_tool(tool_name, arguments.clone()).await
@@ -325,7 +342,8 @@ impl McpManager {
             response_time_ms: elapsed.as_millis() as u64,
             error: result.as_ref().err().map(|e| e.to_string()),
             server_name: server_name.clone(),
-        }).await;
+        })
+        .await;
 
         // Send event
         let _ = self.event_bus.send(SystemEvent::ToolCalled {
@@ -365,10 +383,13 @@ impl McpManager {
         // Store in cache
         {
             let mut cache = self.cache.write().await;
-            cache.insert(cache_key, CachedResult {
-                result: formatted.clone(),
-                expires_at: Instant::now() + ttl,
-            });
+            cache.insert(
+                cache_key,
+                CachedResult {
+                    result: formatted.clone(),
+                    expires_at: Instant::now() + ttl,
+                },
+            );
 
             // Cleanup expired entries periodically
             if cache.len() > 100 {
@@ -381,17 +402,13 @@ impl McpManager {
     }
 
     /// Execute multiple tool calls in parallel
-    pub async fn call_tools_parallel(
-        &self,
-        calls: &[ToolCall],
-    ) -> Vec<Result<String>> {
-        let futures: Vec<_> = calls.iter()
+    pub async fn call_tools_parallel(&self, calls: &[ToolCall]) -> Vec<Result<String>> {
+        let futures: Vec<_> = calls
+            .iter()
             .map(|call| {
                 let manager = self.clone();
                 let call = call.clone();
-                async move {
-                    manager.process_tool_call(&call).await
-                }
+                async move { manager.process_tool_call(&call).await }
             })
             .collect();
 
@@ -413,11 +430,7 @@ impl McpManager {
     /// Get recent audit log entries
     pub async fn get_audit_log(&self, limit: usize) -> Vec<ToolAuditEntry> {
         let log = self.audit_log.read().await;
-        log.iter()
-            .rev()
-            .take(limit)
-            .cloned()
-            .collect()
+        log.iter().rev().take(limit).cloned().collect()
     }
 
     /// Clear the cache
@@ -447,16 +460,28 @@ impl McpManager {
         let description = match tool_name {
             "xbps_install" => format!(
                 "Install package: {}",
-                arguments.get("package").and_then(|v| v.as_str()).unwrap_or("unknown")
+                arguments
+                    .get("package")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
             ),
             "xbps_remove" => format!(
                 "Remove package: {}",
-                arguments.get("package").and_then(|v| v.as_str()).unwrap_or("unknown")
+                arguments
+                    .get("package")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
             ),
             "service_control" => format!(
                 "{} service: {}",
-                arguments.get("action").and_then(|v| v.as_str()).unwrap_or("control"),
-                arguments.get("service").and_then(|v| v.as_str()).unwrap_or("unknown")
+                arguments
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("control"),
+                arguments
+                    .get("service")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
             ),
             _ => format!("Execute tool '{}' with arguments", tool_name),
         };
@@ -471,7 +496,11 @@ impl McpManager {
     }
 
     /// Assess the risk level of a tool call
-    fn assess_risk_level(&self, tool_name: &str, _arguments: &HashMap<String, serde_json::Value>) -> RiskLevel {
+    fn assess_risk_level(
+        &self,
+        tool_name: &str,
+        _arguments: &HashMap<String, serde_json::Value>,
+    ) -> RiskLevel {
         match tool_name {
             // Read-only operations
             "xbps_search" | "xbps_info" | "service_status" | "system_info" => RiskLevel::Low,
@@ -504,7 +533,8 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const server = new Server({name: 'my-server', version: '1.0.0'}, {capabilities: {tools: {}}});
 // ... define tools ...
 const transport = new StdioServerTransport();
-server.connect(transport);".to_string(),
+server.connect(transport);"
+                    .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -527,7 +557,7 @@ server.connect(transport);".to_string(),
                     },
                     "required": ["name", "language", "code"]
                 }),
-            }
+            },
         ];
 
         tools.extend(meta_tools);
@@ -543,11 +573,20 @@ server.connect(transport);".to_string(),
         );
 
         if call.name == "evolve_os_add_capability" || call.name == "evolve_os_install_capability" {
-            let name = call.arguments.get("name").and_then(|v| v.as_str())
+            let name = call
+                .arguments
+                .get("name")
+                .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("Missing 'name' argument"))?;
-            let lang = call.arguments.get("language").and_then(|v| v.as_str())
+            let lang = call
+                .arguments
+                .get("language")
+                .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("Missing 'language' argument"))?;
-            let code = call.arguments.get("code").and_then(|v| v.as_str())
+            let code = call
+                .arguments
+                .get("code")
+                .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("Missing 'code' argument"))?;
 
             let evolver = McpEvolver::new(self.clone(), &self.runtime_path);
@@ -646,7 +685,10 @@ pub fn default_void_tools_config(runtime_path: &str) -> McpConfig {
             McpServerConfig {
                 name: "void-tools".to_string(),
                 command: "python3".to_string(),
-                args: vec![format!("{}/mcp-servers/void-tools/void_tools.py", runtime_path)],
+                args: vec![format!(
+                    "{}/mcp-servers/void-tools/void_tools.py",
+                    runtime_path
+                )],
                 env: HashMap::new(),
                 requires_confirmation: vec![
                     "xbps_install".to_string(),
@@ -671,7 +713,9 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].name, "void-tools");
-        assert!(config.servers[0].requires_confirmation.contains(&"xbps_install".to_string()));
+        assert!(config.servers[0]
+            .requires_confirmation
+            .contains(&"xbps_install".to_string()));
     }
 
     #[tokio::test]
@@ -702,7 +746,7 @@ mod tests {
 
     #[test]
     fn test_risk_assessment() {
-        let config = McpConfig {
+        let _config = McpConfig {
             enabled: false,
             servers: vec![],
         };

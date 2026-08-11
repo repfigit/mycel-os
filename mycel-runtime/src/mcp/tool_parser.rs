@@ -37,10 +37,10 @@ pub struct ParsedResponse {
 /// The format in which tool calls were detected
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCallFormat {
-    XmlTags,          // <tool_call>...</tool_call>
-    JsonCodeBlock,    // ```json ... ```
-    FunctionSyntax,   // tool_name({...})
-    DirectJson,       // {"name": "...", "arguments": {...}}
+    XmlTags,        // <tool_call>...</tool_call>
+    JsonCodeBlock,  // ```json ... ```
+    FunctionSyntax, // tool_name({...})
+    DirectJson,     // {"name": "...", "arguments": {...}}
 }
 
 impl ParsedResponse {
@@ -205,7 +205,8 @@ fn try_parse_json_code_blocks(response: &str) -> Option<ParsedResponse> {
             last_end = full_match.end();
         } else if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(json_content) {
             // Check for wrapped format: {"tool_call": {...}} or {"function_call": {...}}
-            let inner = wrapper.get("tool_call")
+            let inner = wrapper
+                .get("tool_call")
                 .or_else(|| wrapper.get("function_call"))
                 .or_else(|| wrapper.get("tool"));
 
@@ -250,7 +251,11 @@ fn try_parse_function_syntax(response: &str) -> Option<ParsedResponse> {
         let args_json = cap.get(2)?.as_str();
 
         // Skip common false positives
-        if ["if", "while", "for", "function", "return", "var", "let", "const"].contains(&func_name) {
+        if [
+            "if", "while", "for", "function", "return", "var", "let", "const",
+        ]
+        .contains(&func_name)
+        {
             continue;
         }
 
@@ -326,7 +331,10 @@ fn try_parse_direct_json(response: &str) -> Option<ParsedResponse> {
                     if let Ok(call) = serde_json::from_str::<ToolCall>(&json_str) {
                         // Validate it looks like a real tool call
                         if !call.name.is_empty()
-                            && call.name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                            && call
+                                .name
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
                         {
                             if !found_any {
                                 prefix_text = chars[..start].iter().collect();
@@ -399,7 +407,8 @@ fn parse_tool_call_json(json_str: &str) -> Result<ToolCall> {
             // Try parsing as generic JSON and extracting fields
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_part) {
                 if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
-                    let arguments = value.get("arguments")
+                    let arguments = value
+                        .get("arguments")
                         .or_else(|| value.get("args"))
                         .or_else(|| value.get("params"))
                         .and_then(|v| v.as_object())

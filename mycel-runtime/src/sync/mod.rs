@@ -7,6 +7,10 @@ use crate::config::MycelConfig;
 use crate::events::SystemEvent;
 use crate::mcp::{McpEvolver, McpManager};
 use anyhow::{anyhow, Result};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    ChaCha20Poly1305,
+};
 use chrono::{DateTime, Utc};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
@@ -17,10 +21,6 @@ use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305,
-};
 
 /// Vector Clock for tracking causality across devices
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -207,9 +207,7 @@ impl SyncService {
             near_account: config.near_account.clone(),
         };
 
-        let runtime_path = std::env::current_dir()?
-            .to_string_lossy()
-            .to_string();
+        let runtime_path = std::env::current_dir()?.to_string_lossy().to_string();
 
         let socket = match UdpSocket::bind(format!("0.0.0.0:{}", sync_config.mesh_port)).await {
             Ok(s) => s,
@@ -310,12 +308,15 @@ impl SyncService {
                         );
 
                         let mut state = self.state.write().await;
-                        state.peers.entry(peer_id.clone()).or_insert_with(|| PeerInfo {
-                            id: peer_id,
-                            name: format!("peer-{}", addr),
-                            status: PeerStatus::Connected,
-                            addresses: vec![addr.to_string()],
-                        });
+                        state
+                            .peers
+                            .entry(peer_id.clone())
+                            .or_insert_with(|| PeerInfo {
+                                id: peer_id,
+                                name: format!("peer-{}", addr),
+                                status: PeerStatus::Connected,
+                                addresses: vec![addr.to_string()],
+                            });
                         debug!("Received handshake from {}", addr);
                     }
                 }
@@ -344,7 +345,8 @@ impl SyncService {
                                         aad: &[],
                                     },
                                 ) {
-                                    if let Ok(event) = serde_json::from_slice::<SyncEvent>(&decrypted)
+                                    if let Ok(event) =
+                                        serde_json::from_slice::<SyncEvent>(&decrypted)
                                     {
                                         let _ = self.apply_event(event).await;
                                         break;
@@ -391,32 +393,32 @@ impl SyncService {
 
         tokio::spawn(async move {
             while let Ok(event) = receiver.recv_async().await {
-                match event {
-                    mdns_sd::ServiceEvent::ServiceResolved(info) => {
-                        debug!("Found Mycel device via mDNS: {:?}", info.get_fullname());
-                        if let Some(pubkey) = info.get_property_val_str("pubkey") {
-                            let mut state = service.state.write().await;
-                            let addresses: Vec<String> = info
-                                .get_addresses()
-                                .iter()
-                                .map(|a| format!("{}:{}", a, info.get_port()))
-                                .collect();
+                if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
+                    debug!("Found Mycel device via mDNS: {:?}", info.get_fullname());
+                    if let Some(pubkey) = info.get_property_val_str("pubkey") {
+                        let mut state = service.state.write().await;
+                        let addresses: Vec<String> = info
+                            .get_addresses()
+                            .iter()
+                            .map(|a| format!("{}:{}", a, info.get_port()))
+                            .collect();
 
-                            state.peers.entry(pubkey.to_string()).or_insert_with(|| PeerInfo {
+                        state
+                            .peers
+                            .entry(pubkey.to_string())
+                            .or_insert_with(|| PeerInfo {
                                 id: pubkey.to_string(),
                                 name: info.get_fullname().to_string(),
                                 status: PeerStatus::Connected,
                                 addresses: addresses.clone(),
                             });
 
-                            for addr_str in addresses {
-                                if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-                                    let _ = service.send_handshake(addr).await;
-                                }
+                        for addr_str in addresses {
+                            if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                                let _ = service.send_handshake(addr).await;
                             }
                         }
                     }
-                    _ => {}
                 }
             }
         });
@@ -446,7 +448,8 @@ impl SyncService {
                     debug!("Polling NEAR for global updates for {}", acc);
 
                     // 1. Poll for Peers
-                    let peer_args = HashMap::from([("accountId".to_string(), serde_json::json!(acc))]);
+                    let peer_args =
+                        HashMap::from([("accountId".to_string(), serde_json::json!(acc))]);
                     if let Ok(result) = mcp.call_tool("near_get_peers", peer_args).await {
                         for content in result.content {
                             if let crate::mcp::protocol::ToolContent::Text { text } = content {
@@ -467,10 +470,13 @@ impl SyncService {
 
                     // 2. Poll for Shared Capabilities
                     let cap_args = HashMap::from([("query".to_string(), serde_json::json!(acc))]);
-                    if let Ok(result) = mcp.call_tool("near_discover_capabilities", cap_args).await {
+                    if let Ok(result) = mcp.call_tool("near_discover_capabilities", cap_args).await
+                    {
                         for content in result.content {
                             if let crate::mcp::protocol::ToolContent::Text { text } = content {
-                                if let Ok(caps) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                                if let Ok(caps) =
+                                    serde_json::from_str::<Vec<serde_json::Value>>(&text)
+                                {
                                     for cap in caps {
                                         // If discovery returns code, we could auto-install.
                                         // For now, discovery just lists them.
@@ -597,19 +603,17 @@ impl SyncService {
         info!(event_id = %event.id, "Event integrated into local mesh log");
 
         // 5. React to the event
-        match event.operation {
-            SyncOperation::AddCapability {
-                name,
-                language,
-                code,
-            } => {
-                if let Some(mcp) = &*self.mcp_manager {
-                    info!("Installing shared capability from mesh: {}", name);
-                    let evolver = McpEvolver::new(mcp.clone(), &self.runtime_path);
-                    let _ = evolver.create_server(&name, &language, &code, false).await;
-                }
+        if let SyncOperation::AddCapability {
+            name,
+            language,
+            code,
+        } = event.operation
+        {
+            if let Some(mcp) = &*self.mcp_manager {
+                info!("Installing shared capability from mesh: {}", name);
+                let evolver = McpEvolver::new(mcp.clone(), &self.runtime_path);
+                let _ = evolver.create_server(&name, &language, &code, false).await;
             }
-            _ => {}
         }
 
         Ok(())

@@ -1,7 +1,7 @@
+use super::McpManager;
 use anyhow::{anyhow, Result};
 use tokio::fs;
 use tracing::info;
-use super::McpManager;
 
 pub struct McpEvolver {
     manager: McpManager,
@@ -75,7 +75,9 @@ impl McpEvolver {
         };
 
         // Register with the manager
-        self.manager.add_dynamic_server(name, &command, args).await?;
+        self.manager
+            .add_dynamic_server(name, &command, args)
+            .await?;
 
         // Broadcast to mesh if requested
         if emit_event {

@@ -581,6 +581,7 @@ mod tests {
     fn test_chat_request_serialization() {
         let request = IpcRequest::Chat {
             message: "Hello, world!".to_string(),
+            provider: LlmProvider::Auto,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("Chat"));

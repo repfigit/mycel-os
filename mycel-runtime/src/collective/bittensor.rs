@@ -285,7 +285,9 @@ impl BittensorClient {
         let client = self.http_client.clone();
 
         for neuron in top_miners {
-            let axon = neuron.axon_info.as_ref().unwrap();
+            let Some(axon) = neuron.axon_info.as_ref() else {
+                continue;
+            };
             let url = format!("http://{}:{}/forward", axon.ip, axon.port);
 
             let request = MinerRequest {
@@ -329,7 +331,9 @@ impl BittensorClient {
             .collect();
 
         for validator in validators {
-            let axon = validator.axon_info.as_ref().unwrap();
+            let Some(axon) = validator.axon_info.as_ref() else {
+                continue;
+            };
             let url = format!("http://{}:{}/validator", axon.ip, axon.port);
 
             // Fire and forget
@@ -369,7 +373,10 @@ impl BittensorClient {
             if let MycelSynapseResult::Inference(result) = resp.result {
                 let score = result.quality_score * resp.stake_weight;
 
-                if best.is_none() || score > best.as_ref().unwrap().0 {
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_score, _)| score > *best_score)
+                {
                     best = Some((score, result));
                 }
             }
@@ -393,7 +400,11 @@ impl BittensorClient {
         }
 
         // Sort by similarity and deduplicate
-        all_matches.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+        all_matches.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         all_matches.dedup_by(|a, b| a.pattern_id == b.pattern_id);
         all_matches.truncate(k);
 

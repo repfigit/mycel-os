@@ -47,23 +47,33 @@ impl CodeExecutor {
         let first_line = code.lines().next().unwrap_or("");
 
         // Check shebang first
-        if first_line.starts_with("#!/usr/bin/python") || first_line.starts_with("#!/usr/bin/env python") {
+        if first_line.starts_with("#!/usr/bin/python")
+            || first_line.starts_with("#!/usr/bin/env python")
+        {
             return Language::Python;
         }
         if first_line.starts_with("#!/bin/bash") || first_line.starts_with("#!/bin/sh") {
             return Language::Shell;
         }
-        if first_line.starts_with("#!/usr/bin/node") || first_line.starts_with("#!/usr/bin/env node") {
+        if first_line.starts_with("#!/usr/bin/node")
+            || first_line.starts_with("#!/usr/bin/env node")
+        {
             return Language::JavaScript;
         }
 
         // Python indicators
-        if code_lower.contains("import ") || code_lower.contains("def ") || code_lower.contains("print(") {
+        if code_lower.contains("import ")
+            || code_lower.contains("def ")
+            || code_lower.contains("print(")
+        {
             return Language::Python;
         }
 
         // JavaScript indicators
-        if code_lower.contains("const ") || code_lower.contains("function ") || code_lower.contains("console.log") {
+        if code_lower.contains("const ")
+            || code_lower.contains("function ")
+            || code_lower.contains("console.log")
+        {
             return Language::JavaScript;
         }
 
@@ -77,10 +87,10 @@ impl CodeExecutor {
 
         // Ensure directory exists
         tokio::fs::create_dir_all(&self.config.code_path).await?;
-        
+
         // Write code to file
         tokio::fs::write(&path, code).await?;
-        
+
         Ok(path)
     }
 
@@ -94,10 +104,10 @@ impl CodeExecutor {
         cmd.arg(&path_str);
 
         let result = self.execute_with_timeout(cmd).await;
-        
+
         // Cleanup
         let _ = tokio::fs::remove_file(path).await;
-        
+
         result
     }
 
@@ -111,10 +121,10 @@ impl CodeExecutor {
         cmd.arg(&path_str);
 
         let result = self.execute_with_timeout(cmd).await;
-        
+
         // Cleanup
         let _ = tokio::fs::remove_file(path).await;
-        
+
         result
     }
 
@@ -125,7 +135,7 @@ impl CodeExecutor {
         // But for consistency we could write to .sh file
         // Let's stick to -c for shell as it usually doesn't hit arg limits for simple tasks
         // and setting +x permissions on a temp file is extra work
-        
+
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(code);
 
@@ -168,7 +178,7 @@ impl CodeExecutor {
             }
             if !stdout.is_empty() {
                 if !result.is_empty() {
-                    result.push_str("\n");
+                    result.push('\n');
                 }
                 result.push_str(&stdout);
             }

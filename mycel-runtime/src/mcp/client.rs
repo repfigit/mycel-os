@@ -80,6 +80,9 @@ impl Default for ServerConfig {
     }
 }
 
+/// Channel sender for pending JSON-RPC requests awaiting responses
+type RequestSender = mpsc::Sender<(JsonRpcRequest, oneshot::Sender<Result<JsonRpcResponse>>)>;
+
 /// MCP Server instance
 pub struct McpServer {
     pub name: String,
@@ -90,7 +93,7 @@ pub struct McpServer {
     pub config: ServerConfig,
     state: Arc<RwLock<ServerState>>,
     process: Arc<Mutex<Option<Child>>>,
-    request_tx: Arc<Mutex<Option<mpsc::Sender<(JsonRpcRequest, oneshot::Sender<Result<JsonRpcResponse>>)>>>>,
+    request_tx: Arc<Mutex<Option<RequestSender>>>,
     next_id: AtomicU64,
     tools: Arc<RwLock<Vec<McpTool>>>,
     server_info: Arc<RwLock<Option<ServerInfo>>>,
@@ -107,7 +110,14 @@ impl McpServer {
         env: HashMap<String, String>,
         requires_confirmation: Vec<String>,
     ) -> Self {
-        Self::with_config(name, command, args, env, requires_confirmation, ServerConfig::default())
+        Self::with_config(
+            name,
+            command,
+            args,
+            env,
+            requires_confirmation,
+            ServerConfig::default(),
+        )
     }
 
     /// Create a new MCP server instance with custom configuration
@@ -147,7 +157,12 @@ impl McpServer {
         }
 
         *self.state.write().await = ServerState::Starting;
-        info!("Starting MCP server: {} ({} {})", self.name, self.command, self.args.join(" "));
+        info!(
+            "Starting MCP server: {} ({} {})",
+            self.name,
+            self.command,
+            self.args.join(" ")
+        );
 
         // Spawn the subprocess
         let mut cmd = Command::new(&self.command);
@@ -172,12 +187,22 @@ impl McpServer {
             }
         };
 
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("Failed to get stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to get stdout"))?;
-        let stderr = child.stderr.take().ok_or_else(|| anyhow!("Failed to get stderr"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Failed to get stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("Failed to get stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("Failed to get stderr"))?;
 
         // Create channels for request/response coordination
-        let (request_tx, mut request_rx) = mpsc::channel::<(JsonRpcRequest, oneshot::Sender<Result<JsonRpcResponse>>)>(32);
+        let (request_tx, mut request_rx) =
+            mpsc::channel::<(JsonRpcRequest, oneshot::Sender<Result<JsonRpcResponse>>)>(32);
 
         // Pending requests map
         let pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<JsonRpcResponse>>>>> =
@@ -203,7 +228,10 @@ impl McpServer {
                         }
                     }
                     Err(e) => {
-                        warn!("[{}] Failed to parse response: {} - {}", server_name, e, line);
+                        warn!(
+                            "[{}] Failed to parse response: {} - {}",
+                            server_name, e, line
+                        );
                     }
                 }
             }
@@ -212,7 +240,8 @@ impl McpServer {
             // Mark server as failed when reader exits unexpectedly
             let current_state = state_clone.read().await.clone();
             if current_state == ServerState::Ready {
-                *state_clone.write().await = ServerState::Failed("Server process exited".to_string());
+                *state_clone.write().await =
+                    ServerState::Failed("Server process exited".to_string());
             }
         });
 
@@ -224,7 +253,9 @@ impl McpServer {
             while let Ok(Some(line)) = reader.next_line().await {
                 debug!("[{}] stderr: {}", server_name_err, line);
                 // Capture last error for health reporting
-                if line.to_lowercase().contains("error") || line.to_lowercase().contains("exception") {
+                if line.to_lowercase().contains("error")
+                    || line.to_lowercase().contains("exception")
+                {
                     health_clone.write().await.last_error = Some(line);
                 }
             }
@@ -241,7 +272,10 @@ impl McpServer {
                     Ok(json) => {
                         debug!("[{}] -> {}", server_name_write, json);
                         // Store pending request
-                        pending_clone.lock().await.insert(id.clone(), response_sender);
+                        pending_clone
+                            .lock()
+                            .await
+                            .insert(id.clone(), response_sender);
                         // Write to stdin
                         if let Err(e) = stdin.write_all(format!("{}\n", json).as_bytes()).await {
                             error!("[{}] Write error: {}", server_name_write, e);
@@ -252,7 +286,8 @@ impl McpServer {
                         }
                     }
                     Err(e) => {
-                        let _ = response_sender.send(Err(anyhow!("Failed to serialize request: {}", e)));
+                        let _ = response_sender
+                            .send(Err(anyhow!("Failed to serialize request: {}", e)));
                     }
                 }
             }
@@ -286,26 +321,36 @@ impl McpServer {
         self.restart_attempts.store(0, Ordering::SeqCst); // Reset restart count on successful start
 
         let tool_count = self.tools.read().await.len();
-        info!("MCP server '{}' is ready with {} tools", self.name, tool_count);
+        info!(
+            "MCP server '{}' is ready with {} tools",
+            self.name, tool_count
+        );
 
         Ok(())
     }
 
     /// Send a JSON-RPC request and wait for response with configured timeout
     async fn send_request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
-        self.send_request_with_timeout(request, self.config.tool_timeout).await
+        self.send_request_with_timeout(request, self.config.tool_timeout)
+            .await
     }
 
     /// Send a JSON-RPC request with custom timeout
-    async fn send_request_with_timeout(&self, request: JsonRpcRequest, timeout: Duration) -> Result<JsonRpcResponse> {
+    async fn send_request_with_timeout(
+        &self,
+        request: JsonRpcRequest,
+        timeout: Duration,
+    ) -> Result<JsonRpcResponse> {
         let tx_guard = self.request_tx.lock().await;
-        let tx = tx_guard.as_ref()
+        let tx = tx_guard
+            .as_ref()
             .ok_or_else(|| anyhow!("Server not started"))?;
 
         let (response_tx, response_rx) = oneshot::channel();
         let start = Instant::now();
 
-        tx.send((request, response_tx)).await
+        tx.send((request, response_tx))
+            .await
             .map_err(|_| anyhow!("Failed to send request - server may have crashed"))?;
 
         let result = tokio::time::timeout(timeout, response_rx)
@@ -322,7 +367,9 @@ impl McpServer {
                 health.last_success = Some(Instant::now());
                 // Update moving average
                 let total = health.requests_success + health.requests_failed;
-                health.avg_response_ms = (health.avg_response_ms * (total - 1) as f64 + elapsed.as_millis() as f64) / total as f64;
+                health.avg_response_ms = (health.avg_response_ms * (total - 1) as f64
+                    + elapsed.as_millis() as f64)
+                    / total as f64;
             }
             Err(e) => {
                 health.requests_failed += 1;
@@ -350,7 +397,9 @@ impl McpServer {
             Some(serde_json::to_value(params)?),
         );
 
-        let response = self.send_request_with_timeout(request, self.config.init_timeout).await?;
+        let response = self
+            .send_request_with_timeout(request, self.config.init_timeout)
+            .await?;
 
         if let Some(error) = response.error {
             return Err(anyhow!("Initialize failed: {}", error.message));
@@ -406,8 +455,13 @@ impl McpServer {
     }
 
     /// Call a tool with configured timeout
-    pub async fn call_tool(&self, name: &str, arguments: HashMap<String, serde_json::Value>) -> Result<CallToolResult> {
-        self.call_tool_with_timeout(name, arguments, self.config.tool_timeout).await
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        arguments: HashMap<String, serde_json::Value>,
+    ) -> Result<CallToolResult> {
+        self.call_tool_with_timeout(name, arguments, self.config.tool_timeout)
+            .await
     }
 
     /// Call a tool with custom timeout
@@ -434,7 +488,8 @@ impl McpServer {
             return Err(anyhow!("Tool call failed: {}", error.message));
         }
 
-        let result = response.result
+        let result = response
+            .result
             .ok_or_else(|| anyhow!("Empty result from tool call"))?;
 
         serde_json::from_value(result).map_err(|e| anyhow!("Failed to parse tool result: {}", e))
@@ -484,11 +539,19 @@ impl McpServer {
 
         let attempts = self.restart_attempts.load(Ordering::SeqCst);
         if attempts >= self.config.max_restart_attempts {
-            warn!("[{}] Max restart attempts ({}) reached", self.name, self.config.max_restart_attempts);
+            warn!(
+                "[{}] Max restart attempts ({}) reached",
+                self.name, self.config.max_restart_attempts
+            );
             return Err(anyhow!("Max restart attempts reached"));
         }
 
-        info!("[{}] Restarting server (attempt {}/{})", self.name, attempts + 1, self.config.max_restart_attempts);
+        info!(
+            "[{}] Restarting server (attempt {}/{})",
+            self.name,
+            attempts + 1,
+            self.config.max_restart_attempts
+        );
         *self.state.write().await = ServerState::Restarting;
         self.restart_attempts.fetch_add(1, Ordering::SeqCst);
         self.health.write().await.restart_count += 1;

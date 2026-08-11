@@ -447,7 +447,7 @@ async fn run_dev_cli(runtime: MycelRuntime) {
     let stdin = io::stdin();
     loop {
         print!("mycel> ");
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush();
 
         let mut line = String::new();
         if stdin.lock().read_line(&mut line).is_err() {
@@ -496,7 +496,7 @@ async fn run_dev_cli(runtime: MycelRuntime) {
                     if let Ok(chunk) = chunk_result {
                         print!("{}", chunk);
                         full_response.push_str(&chunk);
-                        io::stdout().flush().unwrap();
+                        let _ = io::stdout().flush();
                     }
                 }
                 println!();
