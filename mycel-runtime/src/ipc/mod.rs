@@ -279,6 +279,52 @@ async fn handle_connection(
                                             }
                                         }
 
+                                        // If the model requested shell execution
+                                        // (#!exec marker), route through the
+                                        // policy-gated executor instead of
+                                        // returning the marker as text.
+                                        if full_response.starts_with("#!exec\n")
+                                            || full_response.starts_with("#!exec ")
+                                        {
+                                            let code =
+                                                full_response.trim_start_matches("#!exec").trim();
+                                            match runtime
+                                                .execute_code_with_policy(code, &session_id)
+                                                .await
+                                            {
+                                                Ok(crate::RuntimeResponse::Text(text)) => {
+                                                    let _ = runtime
+                                                        .record_interaction(
+                                                            &session_id,
+                                                            message,
+                                                            &text,
+                                                        )
+                                                        .await;
+                                                    let resp = IpcResponse::Chat {
+                                                        response: text,
+                                                        surface: None,
+                                                    };
+                                                    let json = serde_json::to_string(&resp)? + "\n";
+                                                    let mut w = writer.lock().await;
+                                                    w.write_all(json.as_bytes()).await?;
+                                                    w.flush().await?;
+                                                }
+                                                Ok(crate::RuntimeResponse::Stream(_)) => {
+                                                    // Executor doesn't return streams
+                                                }
+                                                Err(e) => {
+                                                    let resp = IpcResponse::Error {
+                                                        message: e.to_string(),
+                                                    };
+                                                    let json = serde_json::to_string(&resp)? + "\n";
+                                                    let mut w = writer.lock().await;
+                                                    w.write_all(json.as_bytes()).await?;
+                                                    w.flush().await?;
+                                                }
+                                            }
+                                            continue;
+                                        }
+
                                         // Record the interaction for history and sync
                                         let _ = runtime
                                             .record_interaction(

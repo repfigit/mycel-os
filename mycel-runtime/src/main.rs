@@ -320,8 +320,8 @@ impl MycelRuntime {
         Ok(())
     }
 
-    /// Execute code after checking with policy (Legacy, needs update if used with streaming)
-    async fn execute_code_with_policy(
+    /// Execute code after checking with policy
+    pub(crate) async fn execute_code_with_policy(
         &self,
         code: &str,
         session_id: &str,

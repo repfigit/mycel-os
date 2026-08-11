@@ -175,11 +175,45 @@ impl AiRouter {
             warn!("⚠️  Local LLM not available! Running in degraded cloud-only mode. Start Ollama for full capability.");
         }
 
-        Ok(Self {
+        let router = Self {
             config: config.clone(),
             http_client,
             local_available,
-        })
+        };
+
+        // Preload the model in the background so the first user request
+        // doesn't pay the cold-start model-load cost (tens of seconds on CPU).
+        router.spawn_warmup();
+
+        Ok(router)
+    }
+
+    /// Spawn a background task that preloads the local model into memory and
+    /// pins it with keep_alive so subsequent requests are fast.
+    fn spawn_warmup(&self) {
+        if !self.local_available {
+            return;
+        }
+        let client = self.http_client.clone();
+        let url = format!("{}/api/generate", self.config.ollama_url);
+        let model = self.config.local_model.clone();
+        tokio::spawn(async move {
+            debug!("Warming up local model '{}'...", model);
+            let start = std::time::Instant::now();
+            let body = serde_json::json!({
+                "model": model,
+                "prompt": "hi",
+                "stream": false,
+                "think": false,
+                // Pin the model in memory for 30 minutes after load.
+                "keep_alive": "30m",
+                "options": {"num_predict": 1}
+            });
+            match client.post(&url).json(&body).send().await {
+                Ok(_) => info!("Local model '{}' warmed up in {:?}", model, start.elapsed()),
+                Err(e) => debug!("Model warmup failed (non-fatal): {}", e),
+            }
+        });
     }
 
     /// Create a cloud-only router
@@ -328,6 +362,18 @@ Reply (use <tool_call>{{...}}</tool_call> for tools):"#,
             return Ok(Box::pin(futures::stream::once(futures::future::ready(Ok(
                 cleaned,
             )))));
+        }
+
+        // Built-in shell execution: emit the #!exec marker as a single-chunk
+        // stream. The IPC layer detects the marker in the accumulated response
+        // and routes it through the policy-gated executor.
+        if let Some(call) = parsed.tool_calls.iter().find(|c| c.name == "shell_execute") {
+            if let Some(cmd) = call.arguments.get("command").and_then(|v| v.as_str()) {
+                let marker = format!("#!exec\n{}", cmd);
+                return Ok(Box::pin(futures::stream::once(futures::future::ready(Ok(
+                    marker,
+                )))));
+            }
         }
 
         // Process tool calls
