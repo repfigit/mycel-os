@@ -288,7 +288,9 @@ impl AiRouter {
                 .await;
         }
 
-        // Build the enhanced prompt with tools
+        // Build the enhanced prompt with tools, including recent history
+        let history = Self::format_history(context);
+
         let prompt = format!(
             r#"You are Mycel OS - an AI-native operating system assistant.
 
@@ -304,12 +306,13 @@ HOW TO RESPOND:
 - After tool results, summarize what you found
 - For simple questions, answer directly without tools
 
-cwd: {cwd}
+cwd: {cwd}{history}
 user: {input}
 
 Reply (use <tool_call>{{...}}</tool_call> for tools):"#,
             tools_prompt = tools_prompt,
             cwd = context.working_directory,
+            history = history,
             input = input
         );
 
@@ -368,6 +371,8 @@ Provide a helpful response based on these results. Include relevant details, com
             model: self.config.local_model.clone(),
             prompt: prompt.to_string(),
             stream: true,
+            think: false,
+            options: OllamaOptions { num_predict: 2048 },
         };
 
         let url = format!("{}/api/generate", self.config.ollama_url);
@@ -420,15 +425,34 @@ Provide a helpful response based on these results. Include relevant details, com
         Ok(futures::stream::once(futures::future::ready(Ok(response))))
     }
 
+    /// Render recent conversation history for injection into prompts.
+    /// Caps at the last 10 turns to bound prompt size on small local models.
+    fn format_history(context: &Context) -> String {
+        if context.conversation_history.is_empty() {
+            return String::new();
+        }
+        let turns: Vec<String> = context
+            .conversation_history
+            .iter()
+            .rev()
+            .take(10)
+            .rev()
+            .map(|t| format!("User: {}\nAssistant: {}", t.user, t.assistant))
+            .collect();
+        format!("\n\nConversation so far:\n{}", turns.join("\n"))
+    }
+
     pub fn build_basic_prompt(&self, input: &str, context: &Context) -> String {
+        let history = Self::format_history(context);
+
         format!(
             r#"You are Mycel OS, an AI assistant. Answer the user's question or help with their task.
 
-Current directory: {}
+Current directory: {}{}
 User: {}
 
 Respond directly and helpfully:"#,
-            context.working_directory, input
+            context.working_directory, history, input
         )
     }
 
@@ -488,7 +512,9 @@ Respond directly and helpfully:"#,
             return self.process(input, context).await;
         }
 
-        // Build the enhanced prompt with tools
+        // Build the enhanced prompt with tools, including recent history
+        let history = Self::format_history(context);
+
         let prompt = format!(
             r#"You are Mycel OS, an AI assistant with system access.
 
@@ -499,12 +525,13 @@ IMPORTANT:
 - Use tools only when the user asks for system info, file operations, or commands.
 - Be concise and helpful.
 
-Current directory: {cwd}
+Current directory: {cwd}{history}
 User: {input}
 
 Respond:"#,
             tools_prompt = tools_prompt,
             cwd = context.working_directory,
+            history = history,
             input = input
         );
 
@@ -517,6 +544,14 @@ Respond:"#,
         if !parsed.has_tool_calls() {
             // No tool calls - return the response directly
             return Ok(strip_markdown_formatting(&response));
+        }
+
+        // Built-in shell execution: route to the runtime's policy-gated
+        // executor via the #!exec marker instead of running ungated here.
+        if let Some(call) = parsed.tool_calls.iter().find(|c| c.name == "shell_execute") {
+            if let Some(cmd) = call.arguments.get("command").and_then(|v| v.as_str()) {
+                return Ok(format!("#!exec\n{}", cmd));
+            }
         }
 
         // Process tool calls
@@ -613,6 +648,14 @@ Reply:"#,
             if !parsed.has_tool_calls() {
                 // No more tool calls - we're done
                 return Ok(strip_markdown_formatting(&response));
+            }
+
+            // Built-in shell execution: route to the runtime's policy-gated
+            // executor via the #!exec marker instead of running ungated here.
+            if let Some(call) = parsed.tool_calls.iter().find(|c| c.name == "shell_execute") {
+                if let Some(cmd) = call.arguments.get("command").and_then(|v| v.as_str()) {
+                    return Ok(format!("#!exec\n{}", cmd));
+                }
             }
 
             debug!(
@@ -839,6 +882,8 @@ Reply (1-2 sentences max):"#,
             model: self.config.local_model.clone(),
             prompt: prompt.to_string(),
             stream: false,
+            think: false,
+            options: OllamaOptions { num_predict: 2048 },
         };
 
         let url = format!("{}/api/generate", self.config.ollama_url);
@@ -973,6 +1018,8 @@ Reply (1-2 sentences max):"#,
                 .await;
         }
 
+        let history = Self::format_history(context);
+
         let prompt = format!(
             r#"You are Mycel OS. You ARE the operating system.
 
@@ -984,12 +1031,13 @@ RULES:
 - For simple questions, just respond directly.
 - After getting tool results, provide a final response.
 
-cwd: {cwd}
+cwd: {cwd}{history}
 user: {input}
 
 Reply:"#,
             tools_prompt = tools_prompt,
             cwd = context.working_directory,
+            history = history,
             input = input
         );
 
@@ -998,6 +1046,14 @@ Reply:"#,
 
         if !parsed.has_tool_calls() {
             return Ok(strip_markdown_formatting(&response));
+        }
+
+        // Built-in shell execution: route to the runtime's policy-gated
+        // executor via the #!exec marker instead of running ungated here.
+        if let Some(call) = parsed.tool_calls.iter().find(|c| c.name == "shell_execute") {
+            if let Some(cmd) = call.arguments.get("command").and_then(|v| v.as_str()) {
+                return Ok(format!("#!exec\n{}", cmd));
+            }
         }
 
         // Process tool calls
@@ -1051,6 +1107,17 @@ struct OllamaRequest {
     model: String,
     prompt: String,
     stream: bool,
+    /// Disable qwen3-style "thinking" mode. Mycel is an OS assistant that
+    /// needs direct, responsive answers — thinking burns the entire token
+    /// budget on reasoning and can stall CPU inference for minutes.
+    think: bool,
+    options: OllamaOptions,
+}
+
+#[derive(Serialize)]
+struct OllamaOptions {
+    /// Cap generated tokens to prevent runaway responses on local models.
+    num_predict: u32,
 }
 
 #[derive(Deserialize)]
