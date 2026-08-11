@@ -366,13 +366,13 @@ git clone https://github.com/void-linux/void-mklive
 cd void-mklive
 
 # Customize for Mycel OS
-# - Add clay-runtime package
+# - Add mycel-runtime package
 # - Add ollama
 # - Add branding
 # - Configure default services
 
 # Build ISO
-./mklive.sh -a x86_64-musl -p "clay-runtime ollama ..." -o mycel-os.iso
+./mklive.sh -a x86_64-musl -p "mycel-runtime ollama ..." -o mycel-os.iso
 ```
 
 ---
@@ -393,7 +393,7 @@ cd void-mklive
 Instead of NixOS's Nix language, Clay uses:
 
 ```toml
-# /etc/clay/system.toml - AI-readable, AI-writable
+# /etc/mycel/system.toml - AI-readable, AI-writable
 
 [system]
 hostname = "clay-workstation"
@@ -404,7 +404,7 @@ installed = ["firefox", "git", "rust", "ollama"]
 auto_update = true
 
 [services]
-enabled = ["clay-runtime", "ollama", "sshd"]
+enabled = ["mycel-runtime", "ollama", "sshd"]
 
 [ai]
 local_model = "qwen3:8b"

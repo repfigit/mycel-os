@@ -1,108 +1,99 @@
 # Mycel OS Quick Reference
 
-## Development Environment Setup
-
-### Option 1: Docker (Recommended)
+## Boot Up (TL;DR)
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/mycel-os
-cd mycel-os
+# 1. Install Ollama + model
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &
+ollama pull qwen3:8b
 
-# Start CLI development environment
-./scripts/setup-dev.sh
+# 2. Set up MCP system tools (optional)
+./scripts/setup-mcp-servers.sh
 
-# OR start GUI environment with VNC
-./scripts/setup-dev.sh --gui
-
-# OR with GPU support
-./scripts/setup-dev.sh --gpu
+# 3. Build + run, drops into mycel> prompt
+./scripts/dev-run.sh
 ```
 
-### Option 2: VS Code Dev Container
+Daemon mode (for the CLI client / production-style):
+```bash
+./scripts/dev-run.sh --daemon          # note the IPC auth token in the log
+export MYCEL_AUTH_TOKEN="<token>"
+python3 tools/mycel-cli.py chat
+```
 
-1. Install "Dev Containers" extension
-2. Open mycel-os folder
-3. Click "Reopen in Container" when prompted
-
-### Option 3: Manual Setup
+## Manual Setup
 
 ```bash
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Install Ollama
+# Install Ollama + model
 curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &
 ollama pull qwen3:8b
 
-# Build Mycel OS
-cd mycel-os
+# Build + run
+cd mycel-runtime
 cargo build --release
+./target/release/mycel-runtime --dev --verbose   # interactive mycel>
 ```
 
----
+## Runtime Flags
+
+| Flag | Effect |
+|------|--------|
+| `--dev` | No root needed, local paths, socket at /tmp/mycel-dev.sock |
+| `--daemon` | Background mode, no interactive CLI |
+| `--verbose` | Debug logging |
+| `--no-local-llm` | Cloud-only (needs OPENROUTER_API_KEY) |
+| `--no-collective` | Skip collective network |
 
 ## Connection Reference
 
-| Service | Port | Credentials |
-|---------|------|-------------|
-| SSH (CLI) | 2222 | clay / clay |
-| SSH (GUI) | 2223 | clay / clay |
-| VNC | 5901 | clay |
-| noVNC Web | 6080 | clay |
-| Ollama API | 11434 | - |
-| Dev Server | 3000 | - |
+| Service | Location | Credentials |
+|---------|----------|-------------|
+| IPC socket (dev) | /tmp/mycel-dev.sock | token in daemon log |
+| IPC socket (prod) | /run/mycel/runtime.sock | /etc/mycel/token |
+| Ollama API | localhost:11434 | - |
 
 ---
 
 ## Common Commands
 
-### Building
+### Building (from mycel-runtime/)
 
 ```bash
-# Build in debug mode
-cargo build
-
-# Build in release mode
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run with logging
-RUST_LOG=debug cargo run -- --dev
+cargo build              # debug
+cargo build --release    # release
+cargo test               # 60 tests
+cargo clippy             # lint (should be 0 warnings)
+RUST_LOG=debug cargo run -- --dev   # run with logging
 ```
 
 ### Running
 
 ```bash
-# Development mode (CLI)
+# Interactive CLI (recommended entry point)
 ./scripts/dev-run.sh
 
-# Or directly
-./target/release/clay-runtime --dev --verbose
+# Daemon + socket
+./scripts/dev-run.sh --daemon
+
+# Or directly (from mycel-runtime/)
+./target/release/mycel-runtime --dev --verbose
+./target/release/mycel-runtime --dev --daemon
 
 # Cloud-only mode (no local LLM)
-./target/release/clay-runtime --no-local-llm
+OPENROUTER_API_KEY=sk-or-... ./target/release/mycel-runtime --dev --no-local-llm
 ```
 
-### Docker
+### CLI Client (daemon mode)
 
 ```bash
-# Start environment
-docker compose -f docker/docker-compose.yml up -d clay-dev
-
-# View logs
-docker logs -f clay-dev
-
-# Enter container
-docker exec -it clay-dev bash
-
-# Stop environment
-docker compose -f docker/docker-compose.yml down
-
-# Rebuild images
-docker compose -f docker/docker-compose.yml build --no-cache
+export MYCEL_AUTH_TOKEN="<token from daemon log>"
+python3 tools/mycel-cli.py chat      # interactive
+python3 tools/mycel-cli.py status    # one-shot status
 ```
 
 ### Ollama
@@ -145,7 +136,7 @@ winecfg
 
 ```
 mycel-os/
-├── clay-runtime/          # Core Rust daemon
+├── mycel-runtime/         # Core Rust daemon
 │   └── src/
 │       ├── main.rs        # Entry point
 │       ├── ai/            # LLM integration
@@ -181,8 +172,8 @@ export RUST_LOG="info"  # debug, info, warn, error
 ### Config File Locations
 
 - Development: `./config/config.toml`
-- Production: `/etc/clay/config.toml`
-- User overrides: `~/.config/clay/config.toml`
+- Production: `/etc/mycel/config.toml`
+- Data (dev): `./mycel-data/`; (prod): `/var/lib/mycel/`
 
 ---
 
@@ -198,7 +189,7 @@ near create-account yourname.testnet --useFaucet
 near state yourname.testnet
 
 # View patterns
-near view patterns.clay.testnet find_patterns '{"domain": "coding"}'
+near view patterns.mycel.testnet find_patterns '{"domain": "coding"}'
 ```
 
 ### Bittensor
@@ -220,43 +211,31 @@ btcli stake show
 
 ### Ollama won't start
 ```bash
-# Check if running
-pgrep ollama
-
-# View logs
-journalctl -u ollama -f
-
-# Restart
-sudo systemctl restart ollama
+pgrep ollama          # already running?
+ollama serve          # start manually, watch output
 ```
+
+### First request very slow (~30-60s)
+One-time model load. A background warmup hides this; slow-every-request
+means Ollama is unloading the model between calls.
+
+### void-tools MCP server failed
+```bash
+./scripts/setup-mcp-servers.sh   # create per-server Python venvs
+```
+Check the daemon log for the underlying stderr.
 
 ### Out of memory
 ```bash
-# Use smaller model
 ollama pull qwen3:4b
-
-# Update config
 sed -i 's/qwen3:8b/qwen3:4b/' config/config.toml
-```
-
-### VNC not connecting
-```bash
-# Check VNC is running
-docker exec clay-gui ps aux | grep vnc
-
-# Restart VNC
-docker exec clay-gui vncserver -kill :1
-docker exec clay-gui vncserver :1
 ```
 
 ### Build errors
 ```bash
-# Clean and rebuild
-cargo clean
-cargo build
-
-# Update dependencies
-cargo update
+cargo clean && cargo build   # clean rebuild
+cargo update                 # update deps
+# Note: rustls is used for TLS - no OpenSSL/pkg-config needed
 ```
 
 ---

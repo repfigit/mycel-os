@@ -23,32 +23,36 @@ Traditional operating systems are isolated machines. Mycel OS instances form a l
 - 8GB+ RAM
 - x86_64 processor
 
-### Development Environment
+### Run the Runtime (fastest way to try it)
 
 ```bash
 # Clone the repository
 git clone https://github.com/mycel-os/mycel
 cd mycel
 
-# Start the Void Linux development environment
-./scripts/setup-dev.sh
+# Install Ollama and pull the default model
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &
+ollama pull qwen3:8b
 
-# Connect
-ssh mycel@localhost -p 2222
-# Password: mycel
+# Set up MCP system tools (optional but recommended)
+./scripts/setup-mcp-servers.sh
+
+# Build and run - drops you into a mycel> prompt
+./scripts/dev-run.sh
 ```
 
-### Building Mycel OS
+See [Getting Started](docs/GETTING_STARTED.md) for daemon mode, CLI client,
+model selection, and troubleshooting.
+
+### Building a Bootable ISO
 
 ```bash
-# Inside the development container
-cd /workspace/mycel-os
-
 # Build the runtime
 cd mycel-runtime
 cargo build --release
 
-# Build a bootable ISO
+# Build a bootable ISO (Void Linux base)
 cd ..
 ./scripts/build-mycel-iso.sh
 ```
@@ -69,7 +73,7 @@ cd ..
           ┌──────────────────┼──────────────────┐
           ▼                  ▼                  ▼
 ┌──────────────────┐ ┌──────────────┐ ┌──────────────────┐
-│    Local LLM     │ │  Claude API  │ │    Collective    │
+│    Local LLM     │ │  OpenRouter  │ │    Collective    │
 │    (Ollama)      │ │   (Cloud)    │ │   (NEAR/BT)      │
 └──────────────────┘ └──────────────┘ └──────────────────┘
                              │
@@ -161,24 +165,26 @@ mycel-os/
 
 ## Status
 
-🚧 **Early Development**
+🚧 **Early Development** — core runtime working end-to-end
 
-### Completed
-- [x] Architecture design
-- [x] Collective intelligence design
-- [x] Device sync design
-- [x] Development environment
+### Working (verified)
+- [x] Mycel Runtime daemon (Rust, ~10,600 lines, 60 tests passing)
+- [x] Local LLM integration (Ollama, qwen3:8b default) with warmup
+- [x] Cloud routing via OpenRouter with provider selection
+- [x] IPC server (Unix socket, auth, rate limiting, streaming)
+- [x] Policy-gated code execution (dangerous commands need confirmation)
+- [x] Session memory (conversation history in prompts)
+- [x] MCP system tools (void-tools: 14 tools) + built-in shell_execute
+- [x] Device sync foundation (mDNS discovery, WireGuard keys, CRDT)
 
 ### In Progress
-- [ ] Bootable base image
-- [ ] Mycel Runtime daemon
-- [ ] Local LLM integration
+- [ ] Bootable base image (scripts exist, unverified end-to-end)
+- [ ] Device mesh sync (foundation laid)
 
 ### Planned
-- [ ] Device mesh sync
-- [ ] NEAR/Bittensor integration
-- [ ] Windows compatibility
-- [ ] Evolving GUI
+- [ ] NEAR/Bittensor collective (stubs only)
+- [ ] Windows compatibility (Wine)
+- [ ] Evolving GUI (Wayland/Smithay, not started)
 
 ## Philosophy
 
