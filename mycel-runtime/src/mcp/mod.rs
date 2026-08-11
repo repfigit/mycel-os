@@ -527,6 +527,24 @@ impl McpManager {
     pub async fn get_tools_prompt(&self) -> String {
         let mut tools = self.get_all_tools().await;
 
+        // Built-in shell execution tool, always available even with no MCP
+        // servers running. Routed to the internal policy-gated executor.
+        let builtin_tools = vec![McpTool {
+            name: "shell_execute".to_string(),
+            description: "Execute a shell command on the local system and return its output. \
+Use this for ANY system task: listing files, checking system info, installing packages, \
+reading command output, etc. You CAN and SHOULD run commands when the user asks. \
+Dangerous commands are automatically gated for user confirmation by the policy evaluator."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to execute"}
+                },
+                "required": ["command"]
+            }),
+        }];
+
         // Add meta-tools for evolution
         let meta_tools = vec![
             McpTool {
@@ -567,6 +585,7 @@ server.connect(transport);"
             },
         ];
 
+        tools.extend(builtin_tools);
         tools.extend(meta_tools);
         format_tools_for_prompt(&tools)
     }
