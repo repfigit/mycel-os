@@ -28,6 +28,20 @@ cloud_timeout_secs = 60
 prefer_local = true
 escalate_threshold = 0.7  # Confidence below this triggers cloud
 
+[router]
+# Auto-router: decides local vs cloud per query (decision list, not ML).
+# Order: privacy -> size -> budget -> task type -> default(local+escalate).
+#
+# Max estimated tokens to keep a prompt on the local model.
+# Local CPU context is ~4096; leave headroom for the response.
+local_ctx_safe_tokens = 3000
+# Daily cloud budget in USD. 0.0 = unlimited. Over budget => local only.
+cloud_budget_daily_usd = 0.0
+# true = favor fast local answers over cloud quality
+prefer_fast = false
+# Escalate to cloud when a local answer looks inadequate
+escalate_on_low_confidence = true
+
 [executor]
 # Sandboxed code execution
 enabled = true
