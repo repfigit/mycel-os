@@ -20,6 +20,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 mod ai;
 mod codegen;
 mod collective;
+mod commands;
 mod config;
 mod context;
 mod events;
@@ -144,6 +145,12 @@ async fn main() -> Result<()> {
     )
     .await;
 
+    // User-defined command registry (named sequences of shell/tool steps).
+    let command_registry = commands::CommandRegistry::load(
+        std::path::PathBuf::from(&config.context_path).join("commands.json"),
+    )
+    .await;
+
     // Create the main runtime
     let runtime = MycelRuntime {
         config,
@@ -155,6 +162,7 @@ async fn main() -> Result<()> {
         sync_service,
         mcp_manager,
         selfdev,
+        command_registry,
     };
 
     let ipc_server = ipc::IpcServer::new(&runtime).await?;
@@ -194,6 +202,7 @@ pub struct MycelRuntime {
     pub sync_service: sync::SyncService,
     pub mcp_manager: mcp::McpManager,
     pub selfdev: selfdev::SelfDevService,
+    pub command_registry: commands::CommandRegistry,
 }
 
 impl MycelRuntime {
@@ -204,18 +213,52 @@ impl MycelRuntime {
         // 1. Handle pending confirmations
         if let Some(pending_code) = &context.pending_command {
             let input_lower = input.to_lowercase();
-            if input_lower == "yes"
-                || input_lower == "y"
-                || input_lower == "confirm"
-                || input_lower == "ok"
-            {
+            let confirmed = matches!(input_lower.as_str(), "yes" | "y" | "confirm" | "ok");
+            let denied = matches!(input_lower.as_str(), "no" | "n" | "cancel");
+
+            // Pending command definition (save a new user command)?
+            if let Some(def_json) = pending_code.strip_prefix("#!defcmd\n") {
+                if confirmed {
+                    self.context_manager
+                        .clear_pending_command(session_id)
+                        .await?;
+                    let def: commands::PendingCommandDef = serde_json::from_str(def_json)?;
+                    match self
+                        .command_registry
+                        .define(&def.name, &def.description, def.steps)
+                        .await
+                    {
+                        Ok(_) => {
+                            return Ok(RuntimeResponse::Text(format!(
+                                "'{}' is ready. just say '{}' anytime.",
+                                def.name, def.name
+                            )));
+                        }
+                        Err(e) => {
+                            return Ok(RuntimeResponse::Text(format!("couldn't save: {}", e)));
+                        }
+                    }
+                } else if denied {
+                    self.context_manager
+                        .clear_pending_command(session_id)
+                        .await?;
+                    return Ok(RuntimeResponse::Text("command not saved.".to_string()));
+                } else {
+                    return Ok(RuntimeResponse::Text(
+                        "save this command? type 'yes' to save or 'no' to discard.".to_string(),
+                    ));
+                }
+            }
+
+            // Pending code execution?
+            if confirmed {
                 // User confirmed - clear and execute
                 self.context_manager
                     .clear_pending_command(session_id)
                     .await?;
                 let output = self.executor.run(pending_code).await?;
                 return Ok(RuntimeResponse::Text(output));
-            } else if input_lower == "no" || input_lower == "n" || input_lower == "cancel" {
+            } else if denied {
                 // User denied - clear and inform
                 self.context_manager
                     .clear_pending_command(session_id)
@@ -230,11 +273,19 @@ impl MycelRuntime {
             }
         }
 
-        // 2. Normal processing
+        // 2. Command management (conversational create/list/show/forget)
+        if let Some(response) = self.handle_command_management(input, session_id).await? {
+            return Ok(RuntimeResponse::Text(response));
+        }
+
+        // 3. User-defined command? Run its steps (each policy-gated).
         let input_trimmed = input.trim();
         let first_word = input_trimmed.split_whitespace().next().unwrap_or("");
+        if let Some(user_cmd) = self.command_registry.get(first_word).await {
+            return self.run_user_command(user_cmd, session_id).await;
+        }
 
-        // Check if it looks like a command (single word or starts with common command pattern)
+        // 4. Check if it looks like a command (single word or starts with common command pattern)
         if !first_word.is_empty()
             && !first_word.contains(' ')
             && first_word
@@ -433,6 +484,244 @@ impl MycelRuntime {
             first_package
         )))
     }
+
+    /// Handle conversational command management: make/list/show/forget.
+    /// Returns Some(response) if the input was a management request, else None.
+    async fn handle_command_management(
+        &self,
+        input: &str,
+        session_id: &str,
+    ) -> Result<Option<String>> {
+        let lower = input.trim().to_lowercase();
+
+        // List commands
+        if matches!(
+            lower.as_str(),
+            "what commands do i have" | "list commands" | "my commands" | "show commands"
+        ) {
+            let cmds = self.command_registry.list().await;
+            if cmds.is_empty() {
+                return Ok(Some(
+                    "no custom commands yet. create one with: make a command called <name> that <does things>".to_string(),
+                ));
+            }
+            let mut out = String::from("your commands:\n");
+            for c in cmds {
+                out.push_str(&format!(
+                    "  {} - {} ({} steps, used {}x)\n",
+                    c.name,
+                    c.description,
+                    c.steps.len(),
+                    c.use_count
+                ));
+            }
+            return Ok(Some(out));
+        }
+
+        // Forget/delete a command
+        for prefix in [
+            "forget the ",
+            "forget ",
+            "delete the command ",
+            "delete command ",
+            "remove command ",
+        ] {
+            if let Some(rest) = lower.strip_prefix(prefix) {
+                let name = rest.trim().trim_end_matches(" command").trim().to_string();
+                return if self.command_registry.remove(&name).await? {
+                    Ok(Some(format!("'{}' forgotten.", name)))
+                } else {
+                    Ok(Some(format!("no command called '{}'.", name)))
+                };
+            }
+        }
+
+        // Show a command's definition
+        for prefix in ["what does ", "show ", "describe "] {
+            if let Some(rest) = lower.strip_prefix(prefix) {
+                let name = rest
+                    .trim()
+                    .trim_end_matches(" do")
+                    .trim_end_matches(" command")
+                    .trim()
+                    .to_string();
+                if let Some(cmd) = self.command_registry.get(&name).await {
+                    let mut out = format!("'{}' - {}\n", cmd.name, cmd.description);
+                    for (i, step) in cmd.steps.iter().enumerate() {
+                        out.push_str(&format!("  {}. {}\n", i + 1, step.describe()));
+                    }
+                    return Ok(Some(out));
+                }
+                // Not a command — fall through to normal processing.
+                return Ok(None);
+            }
+        }
+
+        // Create a command: "make a command called X that ..."
+        if let Some(parsed) = self.parse_command_definition(input).await? {
+            let (name, description, steps) = parsed;
+            // Show the expanded form and ask for confirmation before saving.
+            let mut preview = format!("i'll create '{}':\n", name);
+            for (i, step) in steps.iter().enumerate() {
+                preview.push_str(&format!("  {}. {}\n", i + 1, step.describe()));
+            }
+            // Check for collision with a real binary.
+            if let Ok(which) = self
+                .executor
+                .run(&format!("which {} 2>/dev/null", name))
+                .await
+            {
+                let out = which.trim();
+                if !out.is_empty() && !out.starts_with("Command exited with code") {
+                    preview.push_str(&format!(
+                        "\nwarning: '{}' is also a real command at {}. your version takes precedence in chat.",
+                        name, out
+                    ));
+                }
+            }
+            preview.push_str("save this command? (yes/no)");
+
+            // Stash the pending definition in the session for confirmation.
+            let pending = serde_json::to_string(&commands::PendingCommandDef {
+                name: name.clone(),
+                description: description.clone(),
+                steps: steps.clone(),
+            })?;
+            self.context_manager
+                .set_pending_command(session_id, Some(format!("#!defcmd\n{}", pending)))
+                .await?;
+            return Ok(Some(preview));
+        }
+
+        Ok(None)
+    }
+
+    /// Parse "make a command called X that A, B, and C" into (name, desc, steps).
+    /// Uses the LLM to split the step list robustly, then builds Shell steps.
+    async fn parse_command_definition(
+        &self,
+        input: &str,
+    ) -> Result<Option<(String, String, Vec<commands::CommandStep>)>> {
+        let lower = input.to_lowercase();
+        // Match "make a command called X that ..." / "create a command X that ..."
+        let trigger = [
+            "make a command called",
+            "create a command called",
+            "make a command",
+            "create a command",
+        ];
+        let mut name: Option<String> = None;
+        let mut rest = "";
+        for t in trigger {
+            if let Some(idx) = lower.find(t) {
+                let after = &input[idx + t.len()..];
+                let after_lower = &lower[idx + t.len()..];
+                // Split on " that " to separate name from the step list.
+                if let Some(tidx) = after_lower.find(" that ") {
+                    name = Some(after[..tidx].trim().to_string());
+                    rest = &after[tidx + 6..];
+                } else {
+                    // No "that": first word is the name, rest is the body.
+                    let mut parts = after.trim().splitn(2, ' ');
+                    name = parts.next().map(|s| s.trim().to_string());
+                    rest = parts.next().unwrap_or("");
+                }
+                break;
+            }
+        }
+        let Some(name) = name.filter(|n| !n.is_empty()) else {
+            return Ok(None);
+        };
+        if rest.trim().is_empty() {
+            return Ok(None);
+        }
+
+        // Ask the LLM to break the body into discrete shell steps as JSON.
+        let split_prompt = format!(
+            "Break this user request into a short ordered list of shell commands.\n\
+Return ONLY a JSON array of strings, each a single shell command. No prose.\n\
+Request: \"{}\"\n\
+Example: [\"ls /etc\", \"wc -l /etc/passwd\"]",
+            rest.trim()
+        );
+        let llm_out = self
+            .ai_router
+            .generate_with_provider(&split_prompt, crate::ipc::LlmProvider::Auto)
+            .await?;
+
+        // Extract the JSON array from the response.
+        let steps = parse_step_list(&llm_out)
+            .into_iter()
+            .map(|s| commands::CommandStep::shell(&s))
+            .collect::<Vec<_>>();
+        if steps.is_empty() {
+            return Ok(None);
+        }
+
+        let description = rest.trim().chars().take(80).collect::<String>();
+        Ok(Some((name, description, steps)))
+    }
+
+    /// Execute a user-defined command's steps, each policy-gated.
+    async fn run_user_command(
+        &self,
+        cmd: commands::UserCommand,
+        session_id: &str,
+    ) -> Result<RuntimeResponse> {
+        self.command_registry.record_use(&cmd.name).await;
+
+        let mut outputs = Vec::new();
+        for (i, step) in cmd.steps.iter().enumerate() {
+            match step {
+                commands::CommandStep::Shell { command } => {
+                    // Policy-gate each step exactly like a direct command.
+                    use crate::policy::ActionPolicy;
+                    match self.policy_evaluator.evaluate_code(command) {
+                        ActionPolicy::Allow => {
+                            let out = self.executor.run(command).await?;
+                            outputs.push(format!("{}. {}\n{}", i + 1, command, out.trim()));
+                        }
+                        ActionPolicy::RequiresConfirmation { message, .. } => {
+                            // Pause the command and ask for confirmation of this step.
+                            self.context_manager
+                                .set_pending_command(session_id, Some(command.clone()))
+                                .await?;
+                            outputs.push(format!("{}. {} — paused: {}", i + 1, command, message));
+                            return Ok(RuntimeResponse::Text(outputs.join("\n\n")));
+                        }
+                        ActionPolicy::Deny { reason } => {
+                            outputs.push(format!("{}. {} — blocked: {}", i + 1, command, reason));
+                            return Ok(RuntimeResponse::Text(outputs.join("\n\n")));
+                        }
+                    }
+                }
+                commands::CommandStep::Prompt { message } => {
+                    outputs.push(format!("{}. {}", i + 1, message));
+                }
+            }
+        }
+
+        Ok(RuntimeResponse::Text(outputs.join("\n\n")))
+    }
+}
+
+/// Parse a JSON array of strings from an LLM response (tolerant of prose).
+fn parse_step_list(text: &str) -> Vec<String> {
+    // Find the first '[' ... last ']' and parse as JSON.
+    let start = text.find('[');
+    let end = text.rfind(']');
+    if let (Some(s), Some(e)) = (start, end) {
+        if e > s {
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&text[s..=e]) {
+                return arr
+                    .into_iter()
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Extract code from markdown code block
@@ -539,5 +828,42 @@ async fn run_dev_cli(runtime: MycelRuntime) {
             }
             Err(e) => eprintln!("error: {}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_step_list_clean_json() {
+        let out = parse_step_list(r#"["ls /etc", "wc -l /etc/passwd"]"#);
+        assert_eq!(out, vec!["ls /etc", "wc -l /etc/passwd"]);
+    }
+
+    #[test]
+    fn test_parse_step_list_with_prose() {
+        let out =
+            parse_step_list("Here are the steps:\n[\"echo hello\", \"date\"]\nThat should work!");
+        assert_eq!(out, vec!["echo hello", "date"]);
+    }
+
+    #[test]
+    fn test_parse_step_list_in_code_block() {
+        let out = parse_step_list("```json\n[\"pwd\", \"whoami\"]\n```");
+        assert_eq!(out, vec!["pwd", "whoami"]);
+    }
+
+    #[test]
+    fn test_parse_step_list_empty_and_invalid() {
+        assert!(parse_step_list("no json here").is_empty());
+        assert!(parse_step_list("[]").is_empty());
+        assert!(parse_step_list("[\"\"]").is_empty()); // empty strings filtered
+    }
+
+    #[test]
+    fn test_extract_code_block() {
+        assert_eq!(extract_code_block("```\nls -la\n```"), "ls -la");
+        assert_eq!(extract_code_block("```bash\necho hi\n```"), "echo hi");
     }
 }
