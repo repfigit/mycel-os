@@ -34,3 +34,4 @@ plans/
 .DS_Store
 .env
 **/.venv/
+.pi-subagents/
