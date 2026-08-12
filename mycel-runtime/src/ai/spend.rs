@@ -189,7 +189,9 @@ mod tests {
     #[tokio::test]
     async fn test_unknown_model_uses_fallback() {
         let t = SpendTracker::in_memory();
-        t.record("some/new-model", 1_000_000, 1_000_000).await.unwrap();
+        t.record("some/new-model", 1_000_000, 1_000_000)
+            .await
+            .unwrap();
         // fallback: $1 + $4 = $5
         let spent = t.spent_today_usd().await;
         assert!((spent - 5.0).abs() < 0.001, "spent was {}", spent);

@@ -29,6 +29,7 @@ mod ipc;
 mod mcp;
 mod models;
 mod policy;
+mod selfdev;
 mod sync;
 mod ui;
 
@@ -135,6 +136,14 @@ async fn main() -> Result<()> {
         sync::SyncService::new(&config, Some(mcp_manager.clone()), event_bus.clone()).await?;
     sync_service.start().await?;
 
+    // Self-development loop (auto-filing issues for limitations). State lives
+    // alongside other runtime data; disabled unless [selfdev] enabled = true.
+    let selfdev = selfdev::SelfDevService::new(
+        config.selfdev.clone(),
+        std::path::PathBuf::from(&config.context_path).join("selfdev_state.json"),
+    )
+    .await;
+
     // Create the main runtime
     let runtime = MycelRuntime {
         config,
@@ -145,6 +154,7 @@ async fn main() -> Result<()> {
         ui_factory,
         sync_service,
         mcp_manager,
+        selfdev,
     };
 
     let ipc_server = ipc::IpcServer::new(&runtime).await?;
@@ -183,6 +193,7 @@ pub struct MycelRuntime {
     pub ui_factory: ui::UiFactory,
     pub sync_service: sync::SyncService,
     pub mcp_manager: mcp::McpManager,
+    pub selfdev: selfdev::SelfDevService,
 }
 
 impl MycelRuntime {
@@ -236,7 +247,12 @@ impl MycelRuntime {
                 .run(&format!("which {} 2>/dev/null", first_word))
                 .await;
             if let Ok(result) = &check {
-                if result.trim().is_empty() {
+                let out = result.trim();
+                // `which` exits non-zero with no output when the command is
+                // missing; the executor surfaces that as an empty string OR a
+                // "Command exited with code" placeholder. Both mean "not found".
+                let not_found = out.is_empty() || out.starts_with("Command exited with code");
+                if not_found {
                     // Command not found - search for package
                     return self.handle_missing_command(first_word).await;
                 }
@@ -360,6 +376,23 @@ impl MycelRuntime {
 
     /// Handle missing command - search repos and offer to install
     async fn handle_missing_command(&self, cmd: &str) -> Result<RuntimeResponse> {
+        // Report the gap to the self-development loop (deduped, opt-in).
+        let _ = self
+            .selfdev
+            .report(selfdev::Limitation {
+                kind: selfdev::LimitationKind::MissingCommand,
+                summary: format!("user needs the '{}' command", cmd),
+                detail: format!(
+                    "'{}' was requested but is not installed and no package was found.",
+                    cmd
+                ),
+                suggestion: Some(format!(
+                    "Add an MCP tool or package-install fallback for '{}'.",
+                    cmd
+                )),
+            })
+            .await;
+
         // Search for package (works on Debian/Ubuntu - devcontainer)
         let search_result = self.executor.run(&format!(
             "apt-cache search '^{}$' 2>/dev/null | head -5 || apt-cache search '{}' 2>/dev/null | head -5",

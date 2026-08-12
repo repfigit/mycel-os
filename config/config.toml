@@ -42,6 +42,21 @@ prefer_fast = false
 # Escalate to cloud when a local answer looks inadequate
 escalate_on_low_confidence = true
 
+[selfdev]
+# Self-development loop: the OS files GitHub issues about its own
+# limitations (missing tools/commands, repeated low-confidence answers).
+# OPT-IN - off by default. Issues are deduped, rate-capped, PII-sanitized,
+# and filed via the `gh` CLI (uses your existing gh auth, no token stored).
+enabled = false
+# Target repo (owner/name)
+repo = "repfigit/mycel-os"
+# Max issues filed per rolling 7-day window
+max_issues_per_week = 5
+# Don't re-file the same limitation within this many days
+dedup_window_days = 7
+# Actually file to GitHub (vs. log locally). Requires `gh` authenticated.
+file_to_github = false
+
 [executor]
 # Sandboxed code execution
 enabled = true

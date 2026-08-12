@@ -67,6 +67,10 @@ pub struct MycelConfig {
     #[serde(default)]
     pub router: crate::ai::router::RouterConfig,
 
+    /// Self-development loop (auto-filing GitHub issues for limitations)
+    #[serde(default)]
+    pub selfdev: crate::selfdev::SelfDevConfig,
+
     /// MCP (Model Context Protocol) configuration
     #[serde(default)]
     pub mcp: McpConfig,
@@ -184,6 +188,7 @@ impl Default for MycelConfig {
             blockchain_sync: false,
             near_account: None,
             router: crate::ai::router::RouterConfig::default(),
+            selfdev: crate::selfdev::SelfDevConfig::default(),
             mcp: McpConfig::default(),
         }
     }
