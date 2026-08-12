@@ -423,11 +423,13 @@ async fn process_request(
         },
         IpcRequest::Status => {
             let session_count = runtime.context_manager.session_count().await;
+            let cloud_spend = runtime.ai_router.cloud_spend_today().await;
             IpcResponse::Status {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 uptime: 0, // TODO: Track uptime
                 sessions: session_count,
                 llm_model: runtime.config.local_model.clone(),
+                cloud_spend_usd: cloud_spend,
             }
         }
         IpcRequest::ExecuteCode { code } => {
@@ -534,6 +536,8 @@ pub enum IpcResponse {
         uptime: u64,
         sessions: usize,
         llm_model: String,
+        #[serde(default)]
+        cloud_spend_usd: f64,
     },
     /// Generic OK response
     Ok { message: String },

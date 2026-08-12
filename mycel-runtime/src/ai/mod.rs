@@ -16,9 +16,11 @@ use crate::config::MycelConfig;
 use crate::context::Context;
 
 pub mod router;
+pub mod spend;
 use crate::intent::{ActionType, Intent};
 use crate::mcp::{self, McpManager};
 use router::{looks_inadequate, AutoRouter, Route};
+use spend::SpendTracker;
 
 /// Strip markdown code blocks and extract JSON from a string
 /// Handles cases like: ```json\n{...}\n``` or just ```\n{...}\n```
@@ -141,6 +143,7 @@ pub struct AiRouter {
     config: MycelConfig,
     http_client: Client,
     local_available: bool,
+    spend_tracker: SpendTracker,
 }
 
 use std::pin::Pin;
@@ -178,10 +181,13 @@ impl AiRouter {
             warn!("⚠️  Local LLM not available! Running in degraded cloud-only mode. Start Ollama for full capability.");
         }
 
+        let spend_tracker = SpendTracker::load(Self::spend_path(config)).await;
+
         let router = Self {
             config: config.clone(),
             http_client,
             local_available,
+            spend_tracker,
         };
 
         // Preload the model in the background so the first user request
@@ -189,6 +195,11 @@ impl AiRouter {
         router.spawn_warmup();
 
         Ok(router)
+    }
+
+    /// Path to the persistent spend record, alongside other runtime state.
+    fn spend_path(config: &MycelConfig) -> std::path::PathBuf {
+        std::path::PathBuf::from(&config.context_path).join("cloud_spend.json")
     }
 
     /// Spawn a background task that preloads the local model into memory and
@@ -230,6 +241,7 @@ impl AiRouter {
             config: config.clone(),
             http_client,
             local_available: false,
+            spend_tracker: SpendTracker::load(Self::spend_path(config)).await,
         })
     }
 
@@ -939,10 +951,13 @@ Reply (1-2 sentences max):"#,
             self.local_available,
             self.has_cloud_api(),
         );
-        // TODO: track real per-day cloud spend; 0.0 = no budget enforcement yet.
-        let route = router.route(query, context_text, 0.0);
+        let spent_today = self.spend_tracker.spent_today_usd().await;
+        let route = router.route(query, context_text, spent_today);
 
-        info!("Auto-router decision: {:?}", route);
+        info!(
+            "Auto-router decision: {:?} (cloud spend today: ${:.4})",
+            route, spent_today
+        );
 
         let result = match route {
             Route::Cloud => self.cloud_generate(prompt).await,
@@ -1064,11 +1079,36 @@ Reply (1-2 sentences max):"#,
 
         let response: OpenRouterResponse = response.json().await?;
 
+        // Record token usage for budget enforcement (best-effort).
+        if let Some(usage) = response.usage {
+            if let Err(e) = self
+                .spend_tracker
+                .record(
+                    &self.config.cloud_model,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                )
+                .await
+            {
+                debug!("Failed to record cloud spend: {}", e);
+            }
+        }
+
         response
             .choices
             .first()
             .and_then(|c| c.message.content.clone())
             .ok_or_else(|| anyhow!("Empty response from OpenRouter"))
+    }
+
+    /// Current cloud spend today (USD), for status reporting.
+    pub async fn cloud_spend_today(&self) -> f64 {
+        self.spend_tracker.spent_today_usd().await
+    }
+
+    /// Human-readable cloud spend summary for today.
+    pub async fn cloud_spend_summary(&self) -> String {
+        self.spend_tracker.today_summary().await
     }
 
     /// Generate with a specific provider (for IPC provider selection)
@@ -1256,6 +1296,17 @@ struct OpenRouterMessage {
 #[derive(Deserialize)]
 struct OpenRouterResponse {
     choices: Vec<OpenRouterChoice>,
+    /// Token usage, present on non-streaming responses.
+    #[serde(default)]
+    usage: Option<OpenRouterUsage>,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy)]
+struct OpenRouterUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 
 #[derive(Deserialize)]
