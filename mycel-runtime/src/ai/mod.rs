@@ -14,8 +14,11 @@ use tracing::{debug, info, warn};
 
 use crate::config::MycelConfig;
 use crate::context::Context;
+
+pub mod router;
 use crate::intent::{ActionType, Intent};
 use crate::mcp::{self, McpManager};
+use router::{looks_inadequate, AutoRouter, Route};
 
 /// Strip markdown code blocks and extract JSON from a string
 /// Handles cases like: ```json\n{...}\n``` or just ```\n{...}\n```
@@ -581,8 +584,8 @@ Respond:"#,
             input = input
         );
 
-        // Get initial response from LLM
-        let response = self.smart_generate(&prompt, false).await?;
+        // Get initial response from LLM via the auto-router (local vs cloud)
+        let response = self.smart_generate_routed(&prompt, input, &history).await?;
 
         // Parse for tool calls
         let parsed = mcp::parse_tool_calls(&response);
@@ -920,6 +923,64 @@ Reply (1-2 sentences max):"#,
         result
     }
 
+    /// Routed generation: decide local-vs-cloud up front with the decision
+    /// list, then escalate on low-confidence local answers. `query` is the
+    /// user's raw input, `context_text` the assembled prompt context (history,
+    /// tools, cwd). `prompt` is the full text actually sent to the model.
+    async fn smart_generate_routed(
+        &self,
+        prompt: &str,
+        query: &str,
+        context_text: &str,
+    ) -> Result<String> {
+        let start = std::time::Instant::now();
+        let router = AutoRouter::new(
+            self.config.router.clone(),
+            self.local_available,
+            self.has_cloud_api(),
+        );
+        // TODO: track real per-day cloud spend; 0.0 = no budget enforcement yet.
+        let route = router.route(query, context_text, 0.0);
+
+        info!("Auto-router decision: {:?}", route);
+
+        let result = match route {
+            Route::Cloud => self.cloud_generate(prompt).await,
+            Route::LocalOnly => self.local_generate(prompt).await,
+            Route::LocalWithEscalation => match self.local_generate(prompt).await {
+                Ok(answer) => {
+                    if looks_inadequate(&answer) && self.has_cloud_api() {
+                        info!("Local answer inadequate, escalating to cloud");
+                        match self.cloud_generate(prompt).await {
+                            Ok(cloud_answer) => Ok(cloud_answer),
+                            Err(e) => {
+                                warn!("Cloud escalation failed, using local answer: {}", e);
+                                Ok(answer)
+                            }
+                        }
+                    } else {
+                        Ok(answer)
+                    }
+                }
+                Err(e) => {
+                    if self.has_cloud_api() {
+                        warn!("Local LLM failed, escalating to cloud: {}", e);
+                        self.cloud_generate(prompt).await
+                    } else {
+                        Err(e)
+                    }
+                }
+            },
+        };
+
+        info!(
+            "AI response time: {:?} (route: {:?})",
+            start.elapsed(),
+            route
+        );
+        result
+    }
+
     /// Generate using local Ollama - the primary brain of Mycel OS    /// Generate using local Ollama - the primary brain of Mycel OS
     async fn local_generate(&self, prompt: &str) -> Result<String> {
         debug!("🧠 Generating with local LLM (kernel brain)");
@@ -1020,7 +1081,10 @@ Reply (1-2 sentences max):"#,
         let start = std::time::Instant::now();
 
         let result = match provider {
-            LlmProvider::Auto => self.smart_generate(prompt, false).await,
+            // Auto: use the decision-list router. The full prompt serves as
+            // both query and context for sensitivity/size checks (more
+            // conservative for privacy, which is the safe direction).
+            LlmProvider::Auto => self.smart_generate_routed(prompt, prompt, "").await,
             LlmProvider::Local => {
                 if !self.local_available {
                     return Err(anyhow!("Local LLM (Ollama) is not available"));

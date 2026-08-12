@@ -63,6 +63,10 @@ pub struct MycelConfig {
     #[serde(default)]
     pub near_account: Option<String>,
 
+    /// Auto-router configuration (local-vs-cloud decision list)
+    #[serde(default)]
+    pub router: crate::ai::router::RouterConfig,
+
     /// MCP (Model Context Protocol) configuration
     #[serde(default)]
     pub mcp: McpConfig,
@@ -179,6 +183,7 @@ impl Default for MycelConfig {
             execution_memory_mb: default_execution_memory(),
             blockchain_sync: false,
             near_account: None,
+            router: crate::ai::router::RouterConfig::default(),
             mcp: McpConfig::default(),
         }
     }
