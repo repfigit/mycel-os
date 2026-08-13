@@ -50,6 +50,13 @@ pub struct UserCommand {
     pub name: String,
     pub description: String,
     pub steps: Vec<CommandStep>,
+    /// Named parameters for templates (Tier 2). Steps reference them as {param}.
+    #[serde(default)]
+    pub params: Vec<String>,
+    /// Raw bash body for logic commands (Tier 3). When set, takes precedence
+    /// over steps and is run as a single script through the policy-gated executor.
+    #[serde(default)]
+    pub script: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub use_count: u64,
 }
@@ -60,10 +67,39 @@ impl UserCommand {
             name: name.to_string(),
             description: description.to_string(),
             steps,
+            params: Vec::new(),
+            script: None,
             created_at: chrono::Utc::now(),
             use_count: 0,
         }
     }
+
+    /// Whether this is a raw-script (Tier 3) command.
+    pub fn is_script(&self) -> bool {
+        self.script.is_some()
+    }
+
+    /// Substitute {param} placeholders in a string with provided arg values.
+    /// Args are positionally bound to self.params. Values are shell-escaped
+    /// (single-quoted) so they are treated as data, not code.
+    pub fn substitute(&self, text: &str, args: &[String]) -> String {
+        let mut out = text.to_string();
+        for (i, param) in self.params.iter().enumerate() {
+            let placeholder = format!("{{{}}}", param);
+            let value = args.get(i).map(|s| s.as_str()).unwrap_or("");
+            // Single-quote and escape embedded single quotes: safe shell data.
+            let escaped = shell_escape(value);
+            out = out.replace(&placeholder, &escaped);
+        }
+        out
+    }
+}
+
+/// Escape a value for safe embedding in a shell command as a single-quoted
+/// string. Prevents parameter injection: the value can never break out into
+/// new commands. 'foo' -> 'foo'; o'brien -> 'o'\''brien'
+pub fn shell_escape(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// A command definition awaiting user confirmation before being saved.
@@ -72,6 +108,10 @@ pub struct PendingCommandDef {
     pub name: String,
     pub description: String,
     pub steps: Vec<CommandStep>,
+    #[serde(default)]
+    pub params: Vec<String>,
+    #[serde(default)]
+    pub script: Option<String>,
 }
 
 /// Persistent registry of user commands.
@@ -126,9 +166,25 @@ impl CommandRegistry {
         description: &str,
         steps: Vec<CommandStep>,
     ) -> Result<UserCommand> {
+        self.define_full(name, description, steps, Vec::new(), None)
+            .await
+    }
+
+    /// Define a command with parameters and/or a raw script body.
+    pub async fn define_full(
+        &self,
+        name: &str,
+        description: &str,
+        steps: Vec<CommandStep>,
+        params: Vec<String>,
+        script: Option<String>,
+    ) -> Result<UserCommand> {
         validate_name(name)?;
-        if steps.is_empty() {
+        if script.is_none() && steps.is_empty() {
             return Err(anyhow!("a command needs at least one step"));
+        }
+        for p in &params {
+            validate_param(p)?;
         }
         let mut commands = self.commands.write().await;
         if commands.contains_key(name) {
@@ -138,7 +194,9 @@ impl CommandRegistry {
                 name
             ));
         }
-        let cmd = UserCommand::new(name, description, steps);
+        let mut cmd = UserCommand::new(name, description, steps);
+        cmd.params = params;
+        cmd.script = script;
         commands.insert(name.to_string(), cmd.clone());
         drop(commands);
         self.persist().await?;
@@ -187,6 +245,17 @@ impl CommandRegistry {
         tokio::fs::rename(&tmp, path).await?;
         Ok(())
     }
+}
+
+/// Parameter names must be simple identifiers (used as {name} placeholders).
+fn validate_param(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(anyhow!("parameter name cannot be empty"));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(anyhow!("parameter names must be letters, digits, or '_'"));
+    }
+    Ok(())
 }
 
 /// Command names must be simple lowercase identifiers.
@@ -278,5 +347,88 @@ mod tests {
     async fn test_empty_steps_rejected() {
         let reg = CommandRegistry::in_memory();
         assert!(reg.define("noop", "a", vec![]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_define_full_with_params() {
+        let reg = CommandRegistry::in_memory();
+        let cmd = reg
+            .define_full(
+                "backup",
+                "tar a folder",
+                vec![CommandStep::shell("tar czf {folder}.tgz {folder}")],
+                vec!["folder".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cmd.params, vec!["folder"]);
+        assert!(!cmd.is_script());
+    }
+
+    #[tokio::test]
+    async fn test_define_script() {
+        let reg = CommandRegistry::in_memory();
+        let cmd = reg
+            .define_full(
+                "cleanup",
+                "remove old files",
+                vec![],
+                vec![],
+                Some("for f in *; do rm -i \"$f\"; done".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(cmd.is_script());
+    }
+
+    #[tokio::test]
+    async fn test_script_allows_empty_steps() {
+        let reg = CommandRegistry::in_memory();
+        // A script command with no steps is valid (script takes precedence).
+        assert!(reg
+            .define_full("s", "d", vec![], vec![], Some("echo hi".to_string()))
+            .await
+            .is_ok());
+        // But no steps AND no script is invalid.
+        assert!(reg
+            .define_full("s2", "d", vec![], vec![], None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_param_rejected() {
+        let reg = CommandRegistry::in_memory();
+        assert!(reg
+            .define_full("bad", "d", steps(), vec!["bad param!".to_string()], None)
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn test_substitute() {
+        let mut cmd = UserCommand::new("backup", "d", vec![]);
+        cmd.params = vec!["folder".to_string()];
+        let out = cmd.substitute("tar czf {folder}.tgz {folder}", &["docs".to_string()]);
+        assert_eq!(out, "tar czf 'docs'.tgz 'docs'");
+    }
+
+    #[test]
+    fn test_substitute_missing_arg_becomes_empty() {
+        let mut cmd = UserCommand::new("backup", "d", vec![]);
+        cmd.params = vec!["folder".to_string()];
+        let out = cmd.substitute("echo {folder}", &[]);
+        assert_eq!(out, "echo ''");
+    }
+
+    #[test]
+    fn test_shell_escape_prevents_injection() {
+        // A malicious value must not break out into a new command.
+        let evil = "$(rm -rf /)";
+        let escaped = shell_escape(evil);
+        assert_eq!(escaped, "'$(rm -rf /)'"); // inert single-quoted string
+                                              // Single quotes are escaped.
+        assert_eq!(shell_escape("o'brien"), "'o'\\''brien'");
     }
 }

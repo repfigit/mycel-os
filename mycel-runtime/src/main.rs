@@ -151,6 +151,12 @@ async fn main() -> Result<()> {
     )
     .await;
 
+    // Let the sync service apply DefineCommand events from the mesh into the
+    // registry, so commands follow the user across their devices.
+    sync_service
+        .set_command_registry(command_registry.clone())
+        .await;
+
     // Create the main runtime
     let runtime = MycelRuntime {
         config,
@@ -223,12 +229,32 @@ impl MycelRuntime {
                         .clear_pending_command(session_id)
                         .await?;
                     let def: commands::PendingCommandDef = serde_json::from_str(def_json)?;
+                    let params = def.params.clone();
+                    let script = def.script.clone();
+                    let steps_json = serde_json::to_string(&def.steps)?;
                     match self
                         .command_registry
-                        .define(&def.name, &def.description, def.steps)
+                        .define_full(
+                            &def.name,
+                            &def.description,
+                            def.steps,
+                            def.params,
+                            def.script,
+                        )
                         .await
                     {
                         Ok(_) => {
+                            // Propagate the new command across the personal mesh.
+                            let _ = self
+                                .sync_service
+                                .create_event(crate::sync::SyncOperation::DefineCommand {
+                                    name: def.name.clone(),
+                                    description: def.description.clone(),
+                                    steps_json,
+                                    params,
+                                    script,
+                                })
+                                .await;
                             return Ok(RuntimeResponse::Text(format!(
                                 "'{}' is ready. just say '{}' anytime.",
                                 def.name, def.name
@@ -280,9 +306,12 @@ impl MycelRuntime {
 
         // 3. User-defined command? Run its steps (each policy-gated).
         let input_trimmed = input.trim();
-        let first_word = input_trimmed.split_whitespace().next().unwrap_or("");
+        let mut words = input_trimmed.split_whitespace();
+        let first_word = words.next().unwrap_or("");
         if let Some(user_cmd) = self.command_registry.get(first_word).await {
-            return self.run_user_command(user_cmd, session_id).await;
+            // Remaining words are arguments for parameterized commands.
+            let args: Vec<String> = words.map(|s| s.to_string()).collect();
+            return self.run_user_command(user_cmd, &args, session_id).await;
         }
 
         // 4. Check if it looks like a command (single word or starts with common command pattern)
@@ -558,35 +587,40 @@ impl MycelRuntime {
         }
 
         // Create a command: "make a command called X that ..."
-        if let Some(parsed) = self.parse_command_definition(input).await? {
-            let (name, description, steps) = parsed;
+        if let Some(def) = self.parse_command_definition(input).await? {
             // Show the expanded form and ask for confirmation before saving.
-            let mut preview = format!("i'll create '{}':\n", name);
-            for (i, step) in steps.iter().enumerate() {
-                preview.push_str(&format!("  {}. {}\n", i + 1, step.describe()));
+            let mut preview = format!("i'll create '{}':\n", def.name);
+            if !def.params.is_empty() {
+                preview.push_str(&format!("  parameters: {}\n", def.params.join(", ")));
+            }
+            if let Some(script) = &def.script {
+                preview.push_str("  script:\n");
+                for line in script.lines().take(12) {
+                    preview.push_str(&format!("    {}\n", line));
+                }
+            } else {
+                for (i, step) in def.steps.iter().enumerate() {
+                    preview.push_str(&format!("  {}. {}\n", i + 1, step.describe()));
+                }
             }
             // Check for collision with a real binary.
             if let Ok(which) = self
                 .executor
-                .run(&format!("which {} 2>/dev/null", name))
+                .run(&format!("which {} 2>/dev/null", def.name))
                 .await
             {
                 let out = which.trim();
                 if !out.is_empty() && !out.starts_with("Command exited with code") {
                     preview.push_str(&format!(
                         "\nwarning: '{}' is also a real command at {}. your version takes precedence in chat.",
-                        name, out
+                        def.name, out
                     ));
                 }
             }
             preview.push_str("save this command? (yes/no)");
 
             // Stash the pending definition in the session for confirmation.
-            let pending = serde_json::to_string(&commands::PendingCommandDef {
-                name: name.clone(),
-                description: description.clone(),
-                steps: steps.clone(),
-            })?;
+            let pending = serde_json::to_string(&def)?;
             self.context_manager
                 .set_pending_command(session_id, Some(format!("#!defcmd\n{}", pending)))
                 .await?;
@@ -601,7 +635,7 @@ impl MycelRuntime {
     async fn parse_command_definition(
         &self,
         input: &str,
-    ) -> Result<Option<(String, String, Vec<commands::CommandStep>)>> {
+    ) -> Result<Option<commands::PendingCommandDef>> {
         let lower = input.to_lowercase();
         // Match "make a command called X that ..." / "create a command X that ..."
         let trigger = [
@@ -635,62 +669,136 @@ impl MycelRuntime {
         if rest.trim().is_empty() {
             return Ok(None);
         }
+        let body = rest.trim();
 
-        // Ask the LLM to break the body into discrete shell steps as JSON.
-        let split_prompt = format!(
-            "Break this user request into a short ordered list of shell commands.\n\
-Return ONLY a JSON array of strings, each a single shell command. No prose.\n\
+        // Tier 3: raw script. Detected by explicit "script" phrasing or bash
+        // control-flow keywords in the body.
+        let is_script = lower.contains(" script")
+            || lower.contains("bash script")
+            || body.contains("\n")
+            || ["for ", "while ", "if ", "until "]
+                .iter()
+                .any(|k| lower.contains(k));
+
+        // Ask the LLM to produce a structured definition as JSON.
+        let def_prompt = format!(
+            "Turn this user request into a reusable OS command definition.\n\
+Return ONLY a JSON object, no prose, with these fields:\n\
+  \"params\": array of parameter names the command takes (empty if none),\n\
+  \"steps\": array of shell command strings (use {{param}} for parameters),\n\
+  \"script\": optional single bash script string for logic (loops/ifs), or null.\n\
+Rules:\n\
+- If the request takes an input (a folder, file, name), make it a param and use {{param}} in steps.\n\
+- Use \"script\" only when the logic needs loops or conditionals; otherwise use \"steps\".\n\
+- Keep it minimal and safe.\n\
 Request: \"{}\"\n\
-Example: [\"ls /etc\", \"wc -l /etc/passwd\"]",
-            rest.trim()
+Example for 'backup a folder': {{\"params\":[\"folder\"],\"steps\":[\"tar czf ~/backups/{{folder}}-$(date +%F).tar.gz {{folder}}\"],\"script\":null}}",
+            body
         );
         let llm_out = self
             .ai_router
-            .generate_with_provider(&split_prompt, crate::ipc::LlmProvider::Auto)
+            .generate_with_provider(&def_prompt, crate::ipc::LlmProvider::Auto)
             .await?;
 
-        // Extract the JSON array from the response.
-        let steps = parse_step_list(&llm_out)
-            .into_iter()
-            .map(|s| commands::CommandStep::shell(&s))
-            .collect::<Vec<_>>();
-        if steps.is_empty() {
+        let (params, steps, script) = parse_command_def_json(&llm_out);
+
+        // Force script form if Tier 3 was detected but the LLM used steps.
+        let script = if is_script && script.is_none() && !steps.is_empty() {
+            Some(steps.join("\n"))
+        } else {
+            script
+        };
+        let steps = if script.is_some() { Vec::new() } else { steps };
+
+        if script.is_none() && steps.is_empty() {
             return Ok(None);
         }
 
-        let description = rest.trim().chars().take(80).collect::<String>();
-        Ok(Some((name, description, steps)))
+        let description = body.chars().take(80).collect::<String>();
+        Ok(Some(commands::PendingCommandDef {
+            name,
+            description,
+            steps: steps
+                .into_iter()
+                .map(|s| commands::CommandStep::shell(&s))
+                .collect(),
+            params,
+            script,
+        }))
     }
 
-    /// Execute a user-defined command's steps, each policy-gated.
+    /// Execute a user-defined command. `args` are positional parameter values.
+    /// Scripts (Tier 3) run as one body; step commands run each step. All shell
+    /// execution is policy-gated; parameter values are shell-escaped as data.
     async fn run_user_command(
         &self,
         cmd: commands::UserCommand,
+        args: &[String],
         session_id: &str,
     ) -> Result<RuntimeResponse> {
+        // Parameter count check.
+        if args.len() < cmd.params.len() {
+            return Ok(RuntimeResponse::Text(format!(
+                "'{}' needs {} parameter(s): {}\nusage: {} {}",
+                cmd.name,
+                cmd.params.len(),
+                cmd.params.join(", "),
+                cmd.name,
+                cmd.params
+                    .iter()
+                    .map(|p| format!("<{}>", p))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )));
+        }
+
         self.command_registry.record_use(&cmd.name).await;
 
+        // Tier 3: raw script — substitute params, policy-gate the whole body.
+        if let Some(script) = &cmd.script {
+            let expanded = cmd.substitute(script, args);
+            use crate::policy::ActionPolicy;
+            return match self.policy_evaluator.evaluate_code(&expanded) {
+                ActionPolicy::Allow => {
+                    let out = self.executor.run(&expanded).await?;
+                    Ok(RuntimeResponse::Text(out))
+                }
+                ActionPolicy::RequiresConfirmation { message, .. } => {
+                    self.context_manager
+                        .set_pending_command(session_id, Some(expanded.clone()))
+                        .await?;
+                    Ok(RuntimeResponse::Text(format!(
+                        "{}\ncode: {}",
+                        message, expanded
+                    )))
+                }
+                ActionPolicy::Deny { reason } => {
+                    Ok(RuntimeResponse::Text(format!("blocked: {}", reason)))
+                }
+            };
+        }
+
+        // Tier 1/2: run steps in order, substituting params, each policy-gated.
         let mut outputs = Vec::new();
         for (i, step) in cmd.steps.iter().enumerate() {
             match step {
                 commands::CommandStep::Shell { command } => {
-                    // Policy-gate each step exactly like a direct command.
+                    let expanded = cmd.substitute(command, args);
                     use crate::policy::ActionPolicy;
-                    match self.policy_evaluator.evaluate_code(command) {
+                    match self.policy_evaluator.evaluate_code(&expanded) {
                         ActionPolicy::Allow => {
-                            let out = self.executor.run(command).await?;
-                            outputs.push(format!("{}. {}\n{}", i + 1, command, out.trim()));
+                            let out = self.executor.run(&expanded).await?;
+                            outputs.push(format!("{}. {}\n{}", i + 1, expanded, out.trim()));
                         }
                         ActionPolicy::RequiresConfirmation { message, .. } => {
-                            // Pause the command and ask for confirmation of this step.
                             self.context_manager
-                                .set_pending_command(session_id, Some(command.clone()))
+                                .set_pending_command(session_id, Some(expanded.clone()))
                                 .await?;
-                            outputs.push(format!("{}. {} — paused: {}", i + 1, command, message));
+                            outputs.push(format!("{}. {} — paused: {}", i + 1, expanded, message));
                             return Ok(RuntimeResponse::Text(outputs.join("\n\n")));
                         }
                         ActionPolicy::Deny { reason } => {
-                            outputs.push(format!("{}. {} — blocked: {}", i + 1, command, reason));
+                            outputs.push(format!("{}. {} — blocked: {}", i + 1, expanded, reason));
                             return Ok(RuntimeResponse::Text(outputs.join("\n\n")));
                         }
                     }
@@ -705,23 +813,44 @@ Example: [\"ls /etc\", \"wc -l /etc/passwd\"]",
     }
 }
 
-/// Parse a JSON array of strings from an LLM response (tolerant of prose).
-fn parse_step_list(text: &str) -> Vec<String> {
-    // Find the first '[' ... last ']' and parse as JSON.
-    let start = text.find('[');
-    let end = text.rfind(']');
+/// Parse a structured command-definition JSON object from an LLM response.
+/// Returns (params, steps, script). Tolerant of surrounding prose.
+fn parse_command_def_json(text: &str) -> (Vec<String>, Vec<String>, Option<String>) {
+    let start = text.find('{');
+    let end = text.rfind('}');
     if let (Some(s), Some(e)) = (start, end) {
         if e > s {
-            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&text[s..=e]) {
-                return arr
-                    .into_iter()
-                    .map(|x| x.trim().to_string())
-                    .filter(|x| !x.is_empty())
-                    .collect();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text[s..=e]) {
+                let params = v
+                    .get("params")
+                    .and_then(|p| p.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let steps = v
+                    .get("steps")
+                    .and_then(|p| p.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let script = v
+                    .get("script")
+                    .and_then(|p| p.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                return (params, steps, script);
             }
         }
     }
-    Vec::new()
+    (Vec::new(), Vec::new(), None)
 }
 
 /// Extract code from markdown code block
@@ -836,29 +965,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_step_list_clean_json() {
-        let out = parse_step_list(r#"["ls /etc", "wc -l /etc/passwd"]"#);
-        assert_eq!(out, vec!["ls /etc", "wc -l /etc/passwd"]);
+    fn test_parse_command_def_json_full() {
+        let (params, steps, script) = parse_command_def_json(
+            r#"{"params":["folder"],"steps":["tar czf {folder}.tgz {folder}"],"script":null}"#,
+        );
+        assert_eq!(params, vec!["folder"]);
+        assert_eq!(steps, vec!["tar czf {folder}.tgz {folder}"]);
+        assert!(script.is_none());
     }
 
     #[test]
-    fn test_parse_step_list_with_prose() {
-        let out =
-            parse_step_list("Here are the steps:\n[\"echo hello\", \"date\"]\nThat should work!");
-        assert_eq!(out, vec!["echo hello", "date"]);
+    fn test_parse_command_def_json_with_script() {
+        let (params, steps, script) = parse_command_def_json(
+            "Here you go:\n{\"params\":[],\"steps\":[],\"script\":\"for f in *; do echo $f; done\"}\nDone.",
+        );
+        assert!(params.is_empty());
+        assert!(steps.is_empty());
+        assert_eq!(script.unwrap(), "for f in *; do echo $f; done");
     }
 
     #[test]
-    fn test_parse_step_list_in_code_block() {
-        let out = parse_step_list("```json\n[\"pwd\", \"whoami\"]\n```");
-        assert_eq!(out, vec!["pwd", "whoami"]);
-    }
-
-    #[test]
-    fn test_parse_step_list_empty_and_invalid() {
-        assert!(parse_step_list("no json here").is_empty());
-        assert!(parse_step_list("[]").is_empty());
-        assert!(parse_step_list("[\"\"]").is_empty()); // empty strings filtered
+    fn test_parse_command_def_json_invalid() {
+        let (params, steps, script) = parse_command_def_json("no json");
+        assert!(params.is_empty() && steps.is_empty() && script.is_none());
     }
 
     #[test]

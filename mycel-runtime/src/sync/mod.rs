@@ -99,6 +99,15 @@ pub enum SyncOperation {
         language: String,
         code: String,
     },
+    /// A user-defined command to replicate across the personal mesh.
+    DefineCommand {
+        name: String,
+        description: String,
+        /// JSON-serialized Vec<CommandStep> (kept opaque to avoid a sync->commands dep).
+        steps_json: String,
+        params: Vec<String>,
+        script: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +188,8 @@ pub struct SyncService {
     socket: Arc<UdpSocket>,
     event_bus: broadcast::Sender<SystemEvent>,
     runtime_path: String,
+    /// Optional command registry for replicating user-defined commands.
+    command_registry: Arc<RwLock<Option<crate::commands::CommandRegistry>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -233,7 +244,13 @@ impl SyncService {
             socket: Arc::new(socket),
             event_bus,
             runtime_path,
+            command_registry: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Attach the command registry so DefineCommand events can be applied.
+    pub async fn set_command_registry(&self, registry: crate::commands::CommandRegistry) {
+        *self.command_registry.write().await = Some(registry);
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -603,17 +620,44 @@ impl SyncService {
         info!(event_id = %event.id, "Event integrated into local mesh log");
 
         // 5. React to the event
-        if let SyncOperation::AddCapability {
-            name,
-            language,
-            code,
-        } = event.operation
-        {
-            if let Some(mcp) = &*self.mcp_manager {
-                info!("Installing shared capability from mesh: {}", name);
-                let evolver = McpEvolver::new(mcp.clone(), &self.runtime_path);
-                let _ = evolver.create_server(&name, &language, &code, false).await;
+        match event.operation {
+            SyncOperation::AddCapability {
+                name,
+                language,
+                code,
+            } => {
+                if let Some(mcp) = &*self.mcp_manager {
+                    info!("Installing shared capability from mesh: {}", name);
+                    let evolver = McpEvolver::new(mcp.clone(), &self.runtime_path);
+                    let _ = evolver.create_server(&name, &language, &code, false).await;
+                }
             }
+            SyncOperation::DefineCommand {
+                name,
+                description,
+                steps_json,
+                params,
+                script,
+            } => {
+                let registry = self.command_registry.read().await.clone();
+                if let Some(registry) = registry {
+                    // Don't overwrite a locally-defined command of the same name.
+                    if registry.contains(&name).await {
+                        debug!(
+                            "DefineCommand from mesh: '{}' already exists locally, skipping",
+                            name
+                        );
+                    } else if let Ok(steps) =
+                        serde_json::from_str::<Vec<crate::commands::CommandStep>>(&steps_json)
+                    {
+                        info!("Installing shared command from mesh: {}", name);
+                        let _ = registry
+                            .define_full(&name, &description, steps, params, script)
+                            .await;
+                    }
+                }
+            }
+            _ => {}
         }
 
         Ok(())
@@ -678,5 +722,32 @@ mod tests {
         v1.increment("deviceB");
         assert!(!v1.is_ahead_of(&v2));
         assert!(!v2.is_ahead_of(&v1));
+    }
+
+    #[test]
+    fn test_define_command_operation_roundtrip() {
+        let op = SyncOperation::DefineCommand {
+            name: "backup".to_string(),
+            description: "tar a folder".to_string(),
+            steps_json: r#"[{"type":"shell","command":"tar czf {folder}.tgz {folder}"}]"#
+                .to_string(),
+            params: vec!["folder".to_string()],
+            script: None,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: SyncOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            SyncOperation::DefineCommand {
+                name,
+                params,
+                script,
+                ..
+            } => {
+                assert_eq!(name, "backup");
+                assert_eq!(params, vec!["folder"]);
+                assert!(script.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }
