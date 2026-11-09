@@ -89,22 +89,28 @@ share_patterns = false  # Opt-in to share learned patterns
 differential_privacy_epsilon = 1.0
 
 [mesh]
-# Personal device mesh (sync between your devices)
+# Personal device mesh (sync between your devices). Off by default: no UDP
+# port is opened and nothing is advertised or synced while disabled.
 enabled = false
-
-# WireGuard mesh network
-interface = "mycel0"
 listen_port = 51820
 
-# Sync settings
-sync_config = true
-sync_patterns = true
-sync_documents = false  # Opt-in
-sync_ai_context = true
+# Mycel IDs of your OWN devices. Each device logs its ID at startup
+# ("Mycel ID: ..."). Only listed devices can exchange events with this one;
+# every other handshake, mDNS record, or packet is ignored.
+trusted_peers = []
 
-# Discovery
-mdns_enabled = true  # Local network discovery
-relay_enabled = true  # For NAT traversal
+# Replicate conversation history to trusted devices (off by default)
+sync_ai_context = false
+
+# Discovery (only advertises/accepts devices listed in trusted_peers)
+mdns_enabled = true
+
+# --- Planned, not yet implemented by the runtime ---
+# interface = "mycel0"
+# sync_config = true
+# sync_patterns = true
+# sync_documents = false
+# relay_enabled = true
 
 [ui]
 # Interface settings

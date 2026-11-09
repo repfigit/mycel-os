@@ -74,6 +74,54 @@ pub struct MycelConfig {
     /// MCP (Model Context Protocol) configuration
     #[serde(default)]
     pub mcp: McpConfig,
+
+    /// Personal device mesh (sync between the user's own devices)
+    #[serde(default)]
+    pub mesh: MeshConfig,
+}
+
+/// Personal device mesh configuration.
+///
+/// Secure by default: the mesh is off, and when on, only explicitly trusted
+/// device keys can exchange events with this node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshConfig {
+    /// Enable the mesh (UDP listener, discovery, event exchange)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// UDP port for mesh traffic (0 = OS-assigned)
+    #[serde(default = "default_mesh_port")]
+    pub listen_port: u16,
+
+    /// Advertise and discover devices via mDNS on the local network
+    #[serde(default = "default_true")]
+    pub mdns_enabled: bool,
+
+    /// Mycel IDs (base64 x25519 public keys) of the user's own devices.
+    /// Only these peers can send or receive mesh events.
+    #[serde(default)]
+    pub trusted_peers: Vec<String>,
+
+    /// Replicate conversation history to trusted peers (opt-in)
+    #[serde(default)]
+    pub sync_ai_context: bool,
+}
+
+impl Default for MeshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_port: default_mesh_port(),
+            mdns_enabled: true,
+            trusted_peers: Vec::new(),
+            sync_ai_context: false,
+        }
+    }
+}
+
+fn default_mesh_port() -> u16 {
+    51820
 }
 
 /// MCP (Model Context Protocol) configuration
@@ -190,6 +238,7 @@ impl Default for MycelConfig {
             router: crate::ai::router::RouterConfig::default(),
             selfdev: crate::selfdev::SelfDevConfig::default(),
             mcp: McpConfig::default(),
+            mesh: MeshConfig::default(),
         }
     }
 }
