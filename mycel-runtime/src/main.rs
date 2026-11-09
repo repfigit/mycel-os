@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
 
     if args.dev {
         // Only spawn interactive CLI if running with a tty and not in daemon mode
-        let run_cli = !args.daemon && atty::is(atty::Stream::Stdin);
+        let run_cli = !args.daemon && std::io::IsTerminal::is_terminal(&std::io::stdin());
         if run_cli {
             tokio::spawn(run_dev_cli(runtime.clone()));
         }
