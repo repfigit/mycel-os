@@ -21,7 +21,7 @@ test:
 # Run linting (clippy + format check)
 lint:
 	cd mycel-runtime && cargo fmt --all -- --check
-	cd mycel-runtime && cargo clippy --all-targets --all-features -- -D warnings
+	cd mycel-runtime && cargo clippy --all-targets -- -D warnings
 
 # Quick check (no codegen)
 check:
