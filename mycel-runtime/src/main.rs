@@ -345,16 +345,22 @@ impl MycelRuntime {
             .process_with_tools(input, &context, &self.mcp_manager)
             .await?;
 
-        // Check if LLM wants to execute code
-        if response.starts_with("#!exec\n") || response.starts_with("#!exec ") {
-            let code = response.trim_start_matches("#!exec").trim();
-            self.execute_code_with_policy(code, session_id).await
-        } else if response.starts_with("```") {
-            let code = extract_code_block(&response);
-            self.execute_code_with_policy(&code, session_id).await
-        } else {
-            // Return the response from process_with_tools directly
-            Ok(RuntimeResponse::Text(response))
+        self.dispatch_llm_response(response, session_id).await
+    }
+
+    /// Route an LLM reply. Only the explicit `#!exec` marker (emitted by the
+    /// router for a `shell_execute` tool call or an intent-driven code
+    /// generation) reaches the executor, and it is policy-gated there. Any
+    /// other reply, including one that happens to start with a fenced code
+    /// block, is returned to the user as text and never executed.
+    async fn dispatch_llm_response(
+        &self,
+        response: String,
+        session_id: &str,
+    ) -> Result<RuntimeResponse> {
+        match exec_payload(&response) {
+            Some(code) => self.execute_code_with_policy(code, session_id).await,
+            None => Ok(RuntimeResponse::Text(response)),
         }
     }
 
@@ -380,16 +386,7 @@ impl MycelRuntime {
             .process_with_tools_provider(input, &context, &self.mcp_manager, provider)
             .await?;
 
-        // Check if LLM wants to execute code
-        if response.starts_with("#!exec\n") || response.starts_with("#!exec ") {
-            let code = response.trim_start_matches("#!exec").trim();
-            self.execute_code_with_policy(code, session_id).await
-        } else if response.starts_with("```") {
-            let code = extract_code_block(&response);
-            self.execute_code_with_policy(&code, session_id).await
-        } else {
-            Ok(RuntimeResponse::Text(response))
-        }
+        self.dispatch_llm_response(response, session_id).await
     }
 
     /// Update history and sync with mesh
@@ -853,21 +850,13 @@ fn parse_command_def_json(text: &str) -> (Vec<String>, Vec<String>, Option<Strin
     (Vec::new(), Vec::new(), None)
 }
 
-/// Extract code from markdown code block
-fn extract_code_block(text: &str) -> String {
-    let mut lines: Vec<&str> = text.lines().collect();
-
-    // Remove opening ``` line
-    if !lines.is_empty() && lines[0].starts_with("```") {
-        lines.remove(0);
+/// The code carried by an explicit `#!exec` marker, if the reply is one.
+fn exec_payload(response: &str) -> Option<&str> {
+    if response.starts_with("#!exec\n") || response.starts_with("#!exec ") {
+        Some(response.trim_start_matches("#!exec").trim())
+    } else {
+        None
     }
-
-    // Remove closing ``` line
-    if !lines.is_empty() && lines.last().map(|l| l.trim()) == Some("```") {
-        lines.pop();
-    }
-
-    lines.join("\n")
 }
 
 use std::pin::Pin;
@@ -991,8 +980,13 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_code_block() {
-        assert_eq!(extract_code_block("```\nls -la\n```"), "ls -la");
-        assert_eq!(extract_code_block("```bash\necho hi\n```"), "echo hi");
+    fn test_exec_payload_requires_explicit_marker() {
+        assert_eq!(exec_payload("#!exec\nls -la"), Some("ls -la"));
+        assert_eq!(exec_payload("#!exec uname -a"), Some("uname -a"));
+        // A fenced code block in a normal reply is text, never a command.
+        assert_eq!(exec_payload("```bash\nrm -rf ~/old\n```"), None);
+        assert_eq!(exec_payload("```\nls\n```"), None);
+        assert_eq!(exec_payload("here is #!exec\nls"), None);
+        assert_eq!(exec_payload("#!execute me"), None);
     }
 }
