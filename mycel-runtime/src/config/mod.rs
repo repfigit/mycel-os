@@ -78,6 +78,73 @@ pub struct MycelConfig {
     /// Personal device mesh (sync between the user's own devices)
     #[serde(default)]
     pub mesh: MeshConfig,
+
+    /// Isolation for AI-generated code execution
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+}
+
+/// How AI-generated code is isolated from the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxMode {
+    /// Run under bubblewrap: no network, read-only filesystem, secrets
+    /// masked, empty environment. Refuse to run if bwrap is unavailable.
+    #[default]
+    Bwrap,
+    /// Run directly on the host with the daemon's privileges. Resource
+    /// limits still apply. Opt-in only.
+    Host,
+}
+
+/// Sandbox configuration for the code executor. Secure by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    #[serde(default)]
+    pub mode: SandboxMode,
+
+    /// Path to the bubblewrap binary
+    #[serde(default = "default_bwrap_path")]
+    pub bwrap_path: String,
+
+    /// Allow network access from sandboxed code (default: no network)
+    #[serde(default)]
+    pub allow_network: bool,
+
+    /// Directories the sandboxed code may write to (bind-mounted read-write).
+    /// Everything else is read-only.
+    #[serde(default)]
+    pub writable_paths: Vec<String>,
+
+    /// Extra paths hidden from sandboxed code (in addition to the built-in
+    /// list of credential locations). `~` expands to the user's home.
+    #[serde(default)]
+    pub hidden_paths: Vec<String>,
+
+    /// Size of the private /tmp inside the sandbox, in MB
+    #[serde(default = "default_sandbox_tmp_mb")]
+    pub tmp_size_mb: u32,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            mode: SandboxMode::Bwrap,
+            bwrap_path: default_bwrap_path(),
+            allow_network: false,
+            writable_paths: Vec::new(),
+            hidden_paths: Vec::new(),
+            tmp_size_mb: default_sandbox_tmp_mb(),
+        }
+    }
+}
+
+fn default_bwrap_path() -> String {
+    "bwrap".to_string()
+}
+
+fn default_sandbox_tmp_mb() -> u32 {
+    64
 }
 
 /// Personal device mesh configuration.
@@ -239,6 +306,7 @@ impl Default for MycelConfig {
             selfdev: crate::selfdev::SelfDevConfig::default(),
             mcp: McpConfig::default(),
             mesh: MeshConfig::default(),
+            sandbox: SandboxConfig::default(),
         }
     }
 }
