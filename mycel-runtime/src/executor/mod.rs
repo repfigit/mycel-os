@@ -849,7 +849,7 @@ mod tests {
             &["/bin/sh".to_string()],
             &tmp.join("script.sh"),
             &Some(fake_home.clone()),
-            &[fake_ctx.clone()],
+            std::slice::from_ref(&fake_ctx),
         );
 
         let home_real = std::fs::canonicalize(&fake_home)
