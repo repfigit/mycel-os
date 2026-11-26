@@ -50,7 +50,7 @@ All main gates plus:
 - [ ] All AI-generated code runs in sandbox
 - [ ] Pattern validation blocks known dangerous patterns
 - [ ] Bypass attempts detected and blocked
-- [ ] Timeout and memory limits enforced
+- [ ] Timeout, memory and task-count limits enforced
 - [ ] Shell execution always requires sandbox
 
 ### IPC Security

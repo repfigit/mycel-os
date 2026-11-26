@@ -124,6 +124,13 @@ pub struct SandboxConfig {
     /// Size of the private /tmp inside the sandbox, in MB
     #[serde(default = "default_sandbox_tmp_mb")]
     pub tmp_size_mb: u32,
+
+    /// Maximum number of tasks the sandboxed code may have running
+    /// (`RLIMIT_NPROC`), which stops fork bombs. The limit counts every task
+    /// (thread) of the sandbox's real user across the host, so it must sit
+    /// above the usual desktop task count; root bypasses it entirely.
+    #[serde(default = "default_max_processes")]
+    pub max_processes: u32,
 }
 
 impl Default for SandboxConfig {
@@ -135,6 +142,7 @@ impl Default for SandboxConfig {
             writable_paths: Vec::new(),
             hidden_paths: Vec::new(),
             tmp_size_mb: default_sandbox_tmp_mb(),
+            max_processes: default_max_processes(),
         }
     }
 }
@@ -145,6 +153,10 @@ fn default_bwrap_path() -> String {
 
 fn default_sandbox_tmp_mb() -> u32 {
     64
+}
+
+fn default_max_processes() -> u32 {
+    4096
 }
 
 /// Personal device mesh configuration.

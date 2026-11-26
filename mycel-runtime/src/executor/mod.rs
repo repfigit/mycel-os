@@ -13,11 +13,16 @@
 //! - `SandboxMode::Host`: explicit opt-in to run with the daemon's privileges.
 //!
 //! In both modes: wall-clock timeout that kills the whole process tree, CPU
-//! time limit, no core dumps, output capped at 1 MiB per stream. Python gets
-//! an address-space limit of `execution_memory_mb`; JavaScript gets a V8 heap
-//! cap (RLIMIT_AS breaks node at startup). Shell is not memory-limited here:
-//! it may legitimately launch node. Process-count limits need cgroups and are
-//! not enforced yet.
+//! time limit, no core dumps, output capped at 1 MiB per stream, and a
+//! task-count limit (`RLIMIT_NPROC`) so a fork bomb cannot exhaust the host.
+//! Python gets an address-space limit of `execution_memory_mb`; JavaScript
+//! gets a V8 heap cap (RLIMIT_AS breaks node at startup). Shell is not
+//! memory-limited here: it may legitimately launch node.
+//!
+//! `RLIMIT_NPROC` counts every task (thread) of the sandbox's real user across
+//! the whole host (it is not namespaced) and root bypasses it, so the cap is a
+//! resilience measure, not a hard per-sandbox quota. It must sit above the
+//! machine's normal task count, hence the large default.
 
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
@@ -173,10 +178,12 @@ impl CodeExecutor {
 
     /// The command line run inside the sandbox (or on the host), minus the
     /// script path which is appended last. Resource limits are applied by a
-    /// `/bin/sh` prelude so no `unsafe` pre-exec hook is needed.
+    /// `/bin/bash` prelude so no `unsafe` pre-exec hook is needed. bash (not
+    /// POSIX sh) is required for `ulimit -u`; dash's `ulimit` lacks it.
     fn inner_argv(&self, language: Language) -> Vec<String> {
         let cpu = self.config.execution_timeout_secs.max(1);
-        let mut prelude = format!("ulimit -c 0 && ulimit -t {}", cpu);
+        let procs = self.config.sandbox.max_processes.max(1);
+        let mut prelude = format!("ulimit -c 0 && ulimit -t {} && ulimit -u {}", cpu, procs);
         let interpreter: &[&str] = match language {
             Language::Python => {
                 let kb = u64::from(self.config.execution_memory_mb) * 1024;
@@ -188,7 +195,7 @@ impl CodeExecutor {
         };
         prelude.push_str(" && exec \"$@\"");
         let mut argv = vec![
-            "/bin/sh".to_string(),
+            "/bin/bash".to_string(),
             "-c".to_string(),
             prelude,
             "mycel-exec".to_string(),
@@ -646,10 +653,31 @@ mod tests {
         let py = exec.inner_argv(Language::Python).join(" ");
         assert!(py.contains("ulimit -c 0"));
         assert!(py.contains("ulimit -v 524288"), "{py}");
+        assert!(py.contains("ulimit -u 4096"), "{py}");
         assert!(py.ends_with("exec \"$@\" mycel-exec python3"));
         let js = exec.inner_argv(Language::JavaScript).join(" ");
         assert!(js.contains("--max-old-space-size=256"));
         assert!(!js.contains("ulimit -v"), "RLIMIT_AS breaks node: {js}");
+    }
+
+    /// True when the test runs as root, where RLIMIT_NPROC is not enforced.
+    fn running_as_root() -> bool {
+        effective_uid() == Some(0)
+    }
+
+    /// Real user id of this test process (field 2 of `Uid:`), if available.
+    fn effective_uid() -> Option<u32> {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("Uid:").map(|v| v.trim().to_string()))
+            })
+            .and_then(|uids| {
+                uids.split_whitespace()
+                    .nth(1)
+                    .and_then(|uid| uid.parse().ok())
+            })
     }
 
     #[tokio::test]
@@ -779,6 +807,32 @@ mod tests {
             out.contains("MemoryError"),
             "1 GiB allocation allowed: {out}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_process_limit_rejects_forks() {
+        if effective_uid().is_none() {
+            return;
+        }
+        if running_as_root() {
+            eprintln!("root bypasses RLIMIT_NPROC; skipping process-limit test");
+            return;
+        }
+        let Some(_probe) = sandboxed(10) else { return };
+
+        // A limit of one task: the shell itself fits (exec does not fork), but
+        // the first fork must be rejected. `/bin/true` is not a bash builtin,
+        // so bash has to fork; it retries for several seconds before
+        // reporting, hence the generous timeout.
+        let exec = executor_with(
+            SandboxConfig {
+                max_processes: 1,
+                ..Default::default()
+            },
+            45,
+        );
+        let out = exec.run("/bin/true; echo done").await.unwrap();
+        assert!(out.contains("fork"), "fork allowed above limit: {out}");
     }
 
     #[tokio::test]
