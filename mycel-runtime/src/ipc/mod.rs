@@ -15,7 +15,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -87,10 +87,9 @@ impl IpcServer {
             info!("IPC socket permissions set to 0600");
         }
 
-        // Generate authentication token
+        // Generate authentication token (never log the secret token)
         let auth_token = uuid::Uuid::new_v4().to_string();
         info!("IPC server listening on {}", socket_path);
-        info!("IPC auth token: {}", auth_token);
 
         Ok(Self {
             listener,
@@ -124,6 +123,30 @@ impl IpcServer {
     }
 }
 
+enum BoundedRead {
+    Eof,
+    Line(String),
+    TooLarge(usize),
+}
+
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_size: usize,
+) -> std::io::Result<BoundedRead> {
+    let mut line = String::new();
+    let n = reader
+        .take((max_size + 1) as u64)
+        .read_line(&mut line)
+        .await?;
+    if n == 0 {
+        return Ok(BoundedRead::Eof);
+    }
+    if n > max_size {
+        return Ok(BoundedRead::TooLarge(n));
+    }
+    Ok(BoundedRead::Line(line))
+}
+
 async fn handle_connection(
     stream: UnixStream,
     runtime: Arc<MycelRuntime>,
@@ -139,30 +162,22 @@ async fn handle_connection(
 
     debug!("New IPC connection, session: {}", session_id);
 
-    let mut line = String::new();
     loop {
-        line.clear();
-
-        // Read with size limit check
-        match reader.read_line(&mut line).await {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                // Check message size limit
-                if n > MAX_MESSAGE_SIZE {
-                    warn!("Message exceeds size limit ({} bytes)", n);
-                    let error_response = IpcResponse::Error {
-                        message: format!(
-                            "Message too large: {} bytes (max: {} bytes)",
-                            n, MAX_MESSAGE_SIZE
-                        ),
-                    };
-                    let response_json = serde_json::to_string(&error_response)? + "\n";
-                    let mut w = writer.lock().await;
-                    w.write_all(response_json.as_bytes()).await?;
-                    w.flush().await?;
-                    continue;
-                }
-
+        // Read with size limit enforced before allocation
+        match read_bounded_line(&mut reader, MAX_MESSAGE_SIZE).await {
+            Ok(BoundedRead::Eof) => break,
+            Ok(BoundedRead::TooLarge(n)) => {
+                warn!("Message exceeds size limit ({} bytes)", n);
+                let error_response = IpcResponse::Error {
+                    message: format!("Message too large: exceeds max {} bytes", MAX_MESSAGE_SIZE),
+                };
+                let response_json = serde_json::to_string(&error_response)? + "\n";
+                let mut w = writer.lock().await;
+                w.write_all(response_json.as_bytes()).await?;
+                w.flush().await?;
+                break;
+            }
+            Ok(BoundedRead::Line(line)) => {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -761,5 +776,51 @@ mod tests {
         let invalid_json = r#"{"type":"InvalidType"}"#;
         let result: Result<IpcRequest, _> = serde_json::from_str(invalid_json);
         assert!(result.is_err(), "Should fail on invalid request type");
+    }
+
+    #[tokio::test]
+    async fn test_read_bounded_line_rejects_oversized_without_newline() {
+        // Infinite stream of 'a' with no newline: must stop at MAX_MESSAGE_SIZE + 1 without OOM.
+        let mut reader = BufReader::new(tokio::io::repeat(b'a'));
+        match read_bounded_line(&mut reader, MAX_MESSAGE_SIZE)
+            .await
+            .unwrap()
+        {
+            BoundedRead::TooLarge(n) => assert_eq!(n, MAX_MESSAGE_SIZE + 1),
+            other => panic!(
+                "expected TooLarge, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_bounded_line_accepts_valid_and_rejects_oversized_with_newline() {
+        let valid = b"{\"type\":\"Ping\"}\n";
+        let mut reader = BufReader::new(&valid[..]);
+        match read_bounded_line(&mut reader, MAX_MESSAGE_SIZE)
+            .await
+            .unwrap()
+        {
+            BoundedRead::Line(line) => assert_eq!(line, "{\"type\":\"Ping\"}\n"),
+            _ => panic!("expected Line"),
+        }
+        assert!(matches!(
+            read_bounded_line(&mut reader, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap(),
+            BoundedRead::Eof
+        ));
+
+        let mut oversized = vec![b'x'; MAX_MESSAGE_SIZE + 100];
+        oversized.push(b'\n');
+        let mut reader = BufReader::new(&oversized[..]);
+        match read_bounded_line(&mut reader, MAX_MESSAGE_SIZE)
+            .await
+            .unwrap()
+        {
+            BoundedRead::TooLarge(n) => assert_eq!(n, MAX_MESSAGE_SIZE + 1),
+            _ => panic!("expected TooLarge"),
+        }
     }
 }

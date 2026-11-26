@@ -386,6 +386,21 @@ fn bwrap_args(
         "/tmp".to_string(),
     ]);
 
+    // Explicitly writable directories (applied before hidden-path masks so
+    // masks like ~/.ssh and runtime state always win even if ~ is writable).
+    for w in cfg
+        .writable_paths
+        .iter()
+        .filter_map(|p| expand_home(p, home))
+    {
+        if let Ok(real) = std::fs::canonicalize(&w) {
+            if real.is_dir() {
+                let s = real.to_string_lossy().to_string();
+                a.extend(["--bind".to_string(), s.clone(), s]);
+            }
+        }
+    }
+
     // Hide credential and runtime-state locations.
     let mut hidden: Vec<PathBuf> = HIDDEN_SYSTEM_PATHS.iter().map(PathBuf::from).collect();
     if let Some(h) = home {
@@ -407,20 +422,6 @@ fn bwrap_args(
             a.extend(["--tmpfs".to_string(), s]);
         } else {
             a.extend(["--ro-bind".to_string(), "/dev/null".to_string(), s]);
-        }
-    }
-
-    // Explicitly writable directories.
-    for w in cfg
-        .writable_paths
-        .iter()
-        .filter_map(|p| expand_home(p, home))
-    {
-        if let Ok(real) = std::fs::canonicalize(&w) {
-            if real.is_dir() {
-                let s = real.to_string_lossy().to_string();
-                a.extend(["--bind".to_string(), s.clone(), s]);
-            }
         }
     }
 
@@ -827,5 +828,109 @@ mod tests {
             5,
         );
         assert_eq!(exec.run("echo host").await.unwrap().trim(), "host");
+    }
+
+    #[test]
+    fn test_bwrap_args_masks_win_over_writable_home() {
+        let tmp = std::env::temp_dir().join(format!("mycel-bwrap-test-{}", uuid::Uuid::new_v4()));
+        let fake_home = tmp.join("home");
+        let fake_ssh = fake_home.join(".ssh");
+        let fake_ctx = fake_home.join(".local/share/mycel");
+        std::fs::create_dir_all(&fake_ssh).unwrap();
+        std::fs::create_dir_all(&fake_ctx).unwrap();
+
+        let cfg = SandboxConfig {
+            mode: SandboxMode::Bwrap,
+            writable_paths: vec!["~".to_string()],
+            ..Default::default()
+        };
+        let args = bwrap_args(
+            &cfg,
+            &["/bin/sh".to_string()],
+            &tmp.join("script.sh"),
+            &Some(fake_home.clone()),
+            &[fake_ctx.clone()],
+        );
+
+        let home_real = std::fs::canonicalize(&fake_home)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let ssh_real = std::fs::canonicalize(&fake_ssh)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let ctx_real = std::fs::canonicalize(&fake_ctx)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let bind_idx = args
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == home_real && w[2] == home_real)
+            .expect("writable home --bind should be present");
+        let ssh_mask_idx = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == ssh_real)
+            .expect("~/.ssh --tmpfs mask should be present");
+        let ctx_mask_idx = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == ctx_real)
+            .expect("context_path --tmpfs mask should be present");
+
+        assert!(
+            bind_idx < ssh_mask_idx,
+            "writable home --bind ({bind_idx}) must precede ~/.ssh mask ({ssh_mask_idx})"
+        );
+        assert!(
+            bind_idx < ctx_mask_idx,
+            "writable home --bind ({bind_idx}) must precede context_path mask ({ctx_mask_idx})"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_home_writable_sandbox_still_hides_ssh_and_context_path() {
+        let Some(probe) = sandboxed(10) else { return };
+        drop(probe);
+
+        let exec = executor_with(
+            SandboxConfig {
+                mode: SandboxMode::Bwrap,
+                writable_paths: vec!["~".to_string()],
+                ..Default::default()
+            },
+            10,
+        );
+
+        // Runtime state (context_path) must remain hidden even with writable home.
+        let data = PathBuf::from(&exec.config.context_path);
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("device_key"), [9u8; 32]).unwrap();
+        let out = exec
+            .run(&format!("ls -A {} | wc -l", data.display()))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.trim(),
+            "0",
+            "context_path visible in home-writable sandbox: {out}"
+        );
+
+        // ~/.ssh must remain hidden if it exists on the host.
+        if let Some(home) = dirs::home_dir() {
+            let ssh = home.join(".ssh");
+            if ssh.is_dir() {
+                let out = exec
+                    .run(&format!("ls -A {} | wc -l", ssh.display()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    out.trim(),
+                    "0",
+                    "~/.ssh visible in home-writable sandbox: {out}"
+                );
+            }
+        }
     }
 }
