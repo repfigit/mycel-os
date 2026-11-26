@@ -212,7 +212,10 @@ pub struct MycelRuntime {
 }
 
 impl MycelRuntime {
-    /// Process user input - the LLM is the interface between user and OS
+    /// Process user input with the default provider. Thin alias over
+    /// [`Self::process_input_with_provider`] so every entry point (dev CLI, IPC)
+    /// runs the same routing core: pending confirmations, command management,
+    /// user commands, the missing-command probe, then the LLM.
     pub async fn process_input(&self, input: &str, session_id: &str) -> Result<RuntimeResponse> {
         self.process_input_with_provider(input, session_id, ipc::LlmProvider::Auto)
             .await
@@ -987,8 +990,16 @@ fn build_which_command(cmd: &str) -> String {
 /// Detect whether shell execution output is a genuine "command not found"
 /// diagnostic for the command invoked by `code`, rather than ordinary command
 /// output that happens to contain the words "not found".
+///
+/// Recognized prefixes are the shells themselves (`sh`, `bash`, `dash`, `zsh`,
+/// with or without a path) and the executor's generated script path (`*.sh`),
+/// which is exactly how bash reports a missing command inside a script file.
 fn detect_missing_command_in_output(code: &str, output: &str) -> Option<String> {
     let invoked = code.split_whitespace().next()?;
+    // A path-qualified invocation is reported by name, and a trailing shell
+    // operator is not part of the name.
+    let invoked = invoked.trim_end_matches(&[';', '|', '&'][..]);
+    let invoked = invoked.rsplit('/').next().unwrap_or(invoked);
     let invoked = sanitize_missing_command_name(invoked)?;
 
     for raw_line in output.lines() {
@@ -997,7 +1008,7 @@ fn detect_missing_command_in_output(code: &str, output: &str) -> Option<String> 
             continue;
         };
         let shell_name = prefix.rsplit('/').next().unwrap_or(prefix).trim();
-        if !matches!(shell_name, "sh" | "bash" | "dash" | "zsh") {
+        if !matches!(shell_name, "sh" | "bash" | "dash" | "zsh") && !shell_name.ends_with(".sh") {
             continue;
         }
 
@@ -1013,6 +1024,7 @@ fn detect_missing_command_in_output(code: &str, output: &str) -> Option<String> 
         };
 
         if let Some(cmd) = reported {
+            let cmd = cmd.rsplit('/').next().unwrap_or(cmd);
             if cmd == invoked {
                 return Some(invoked.to_string());
             }
@@ -1268,6 +1280,30 @@ mod tests {
             detect_missing_command_in_output("rg foo", "zsh:1: command not found: rg\n"),
             Some("rg".to_string())
         );
+        // The executor runs generated script files, so bash prefixes the
+        // diagnostic with the script path rather than "bash".
+        assert_eq!(
+            detect_missing_command_in_output(
+                "mycel-tool --version",
+                "/home/u/.cache/mycel/code/e753.sh: line 1: mycel-tool: command not found\n"
+            ),
+            Some("mycel-tool".to_string())
+        );
+        // Path-qualified invocations and trailing operators are normalized.
+        assert_eq!(
+            detect_missing_command_in_output(
+                "./mycel-tool --version",
+                "sh: 1: ./mycel-tool: not found\n"
+            ),
+            Some("mycel-tool".to_string())
+        );
+        assert_eq!(
+            detect_missing_command_in_output(
+                "mycel-tool; echo done",
+                "sh: 1: mycel-tool: not found\n"
+            ),
+            Some("mycel-tool".to_string())
+        );
 
         // Ordinary command output containing "not found" or fake shell lines must not trigger.
         assert_eq!(
@@ -1292,6 +1328,14 @@ mod tests {
             detect_missing_command_in_output(
                 "curl -s https://example.com/missing",
                 "404 Not Found\nresource not found\n"
+            ),
+            None
+        );
+        // A script-path prefix is only accepted for *.sh files.
+        assert_eq!(
+            detect_missing_command_in_output(
+                "cat notes.txt",
+                "notes.txt: line 1: xyz: command not found\n"
             ),
             None
         );
@@ -1443,6 +1487,56 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(out2.trim(), "bash: line 1: foo: command not found");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end: a genuine shell "command not found" diagnostic still reaches
+    /// the package-install offer through the real executor.
+    #[tokio::test]
+    async fn test_real_missing_command_reaches_package_offer() {
+        let dir = temp_test_dir("real-missing");
+        let runtime = build_test_runtime(&dir).await;
+
+        let out = unwrap_text(
+            runtime
+                .execute_code_with_policy("mycel-nonexistent-tool", "sess-missing")
+                .await
+                .unwrap(),
+        );
+        assert!(
+            out.contains("mycel-nonexistent-tool")
+                && (out.contains("not installed")
+                    || out.contains("no package available")
+                    || out.contains("install with")),
+            "missing command did not reach handle_missing_command: {out}"
+        );
+        assert!(
+            !out.starts_with("bash: line"),
+            "raw shell error leaked: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end: a CLI-shaped probe on the input path is still detected as a
+    /// missing command, while single-word chat stays on the LLM path.
+    #[tokio::test]
+    async fn test_cli_shaped_probe_routes_to_missing_command_handler() {
+        let dir = temp_test_dir("probe-missing");
+        let runtime = build_test_runtime(&dir).await;
+
+        let out = unwrap_text(
+            runtime
+                .process_input("mycel-nonexistent-tool --version", "sess-probe")
+                .await
+                .unwrap(),
+        );
+        assert!(
+            out.contains("mycel-nonexistent-tool")
+                && (out.contains("not installed")
+                    || out.contains("no package available")
+                    || out.contains("install with")),
+            "CLI-shaped probe did not reach handle_missing_command: {out}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
