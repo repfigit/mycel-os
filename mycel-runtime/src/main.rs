@@ -212,13 +212,27 @@ pub struct MycelRuntime {
 }
 
 impl MycelRuntime {
-    /// Process user input - the LLM is the interface between user and OS
+    /// Process user input with the default provider. Thin alias over
+    /// [`Self::process_input_with_provider`] so every entry point (dev CLI, IPC)
+    /// runs the same routing core: pending confirmations, command management,
+    /// user commands, the missing-command probe, then the LLM.
     pub async fn process_input(&self, input: &str, session_id: &str) -> Result<RuntimeResponse> {
+        self.process_input_with_provider(input, session_id, ipc::LlmProvider::Auto)
+            .await
+    }
+
+    /// Process user input with a specific LLM provider through the unified routing core.
+    pub async fn process_input_with_provider(
+        &self,
+        input: &str,
+        session_id: &str,
+        provider: ipc::LlmProvider,
+    ) -> Result<RuntimeResponse> {
         let context = self.context_manager.get_context(session_id).await?;
 
         // 1. Handle pending confirmations
         if let Some(pending_code) = &context.pending_command {
-            let input_lower = input.to_lowercase();
+            let input_lower = input.trim().to_lowercase();
             let confirmed = matches!(input_lower.as_str(), "yes" | "y" | "confirm" | "ok");
             let denied = matches!(input_lower.as_str(), "no" | "n" | "cancel");
 
@@ -300,7 +314,10 @@ impl MycelRuntime {
         }
 
         // 2. Command management (conversational create/list/show/forget)
-        if let Some(response) = self.handle_command_management(input, session_id).await? {
+        if let Some(response) = self
+            .handle_command_management(input, session_id, provider)
+            .await?
+        {
             return Ok(RuntimeResponse::Text(response));
         }
 
@@ -314,18 +331,11 @@ impl MycelRuntime {
             return self.run_user_command(user_cmd, &args, session_id).await;
         }
 
-        // 4. Check if it looks like a command (single word or starts with common command pattern)
-        if !first_word.is_empty()
-            && !first_word.contains(' ')
-            && first_word
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-        {
-            // Check if command exists
-            let check = self
-                .executor
-                .run(&format!("which {} 2>/dev/null", first_word))
-                .await;
+        // 4. Narrow missing-command probe: only probe inputs that clearly look
+        // like a CLI command invocation (never plain single-word chat or slash
+        // commands), and always shell-escape the `which` query.
+        if let Some(probe_cmd) = extract_command_probe(input_trimmed) {
+            let check = self.executor.run(&build_which_command(probe_cmd)).await;
             if let Ok(result) = &check {
                 let out = result.trim();
                 // `which` exits non-zero with no output when the command is
@@ -334,16 +344,21 @@ impl MycelRuntime {
                 let not_found = out.is_empty() || out.starts_with("Command exited with code");
                 if not_found {
                     // Command not found - search for package
-                    return self.handle_missing_command(first_word).await;
+                    return self.handle_missing_command(probe_cmd).await;
                 }
             }
         }
 
-        // The LLM decides what to do - use MCP tools if available
-        let response = self
-            .ai_router
-            .process_with_tools(input, &context, &self.mcp_manager)
-            .await?;
+        // 5. The LLM decides what to do - use MCP tools if available
+        let response = if provider == ipc::LlmProvider::Auto {
+            self.ai_router
+                .process_with_tools(input, &context, &self.mcp_manager)
+                .await?
+        } else {
+            self.ai_router
+                .process_with_tools_provider(input, &context, &self.mcp_manager, provider)
+                .await?
+        };
 
         self.dispatch_llm_response(response, session_id).await
     }
@@ -362,31 +377,6 @@ impl MycelRuntime {
             Some(code) => self.execute_code_with_policy(code, session_id).await,
             None => Ok(RuntimeResponse::Text(response)),
         }
-    }
-
-    /// Process user input with a specific LLM provider
-    pub async fn process_input_with_provider(
-        &self,
-        input: &str,
-        session_id: &str,
-        provider: ipc::LlmProvider,
-    ) -> Result<RuntimeResponse> {
-        use ipc::LlmProvider;
-
-        // If auto, use normal process_input
-        if provider == LlmProvider::Auto {
-            return self.process_input(input, session_id).await;
-        }
-
-        let context = self.context_manager.get_context(session_id).await?;
-
-        // Use provider-aware processing
-        let response = self
-            .ai_router
-            .process_with_tools_provider(input, &context, &self.mcp_manager, provider)
-            .await?;
-
-        self.dispatch_llm_response(response, session_id).await
     }
 
     /// Update history and sync with mesh
@@ -425,12 +415,10 @@ impl MycelRuntime {
             ActionPolicy::Allow => {
                 let output = self.executor.run(code).await?;
 
-                // Check if command not found in the output
-                if output.contains("command not found") || output.contains("not found") {
-                    let cmd = code.split_whitespace().next().unwrap_or("");
-                    if !cmd.is_empty() {
-                        return self.handle_missing_command(cmd).await;
-                    }
+                // Only treat output as a missing command when the shell itself
+                // reports that the invoked command was not found.
+                if let Some(cmd) = detect_missing_command_in_output(code, &output) {
+                    return self.handle_missing_command(&cmd).await;
                 }
 
                 Ok(RuntimeResponse::Text(output))
@@ -518,6 +506,7 @@ impl MycelRuntime {
         &self,
         input: &str,
         session_id: &str,
+        provider: ipc::LlmProvider,
     ) -> Result<Option<String>> {
         let lower = input.trim().to_lowercase();
 
@@ -585,7 +574,7 @@ impl MycelRuntime {
         }
 
         // Create a command: "make a command called X that ..."
-        if let Some(def) = self.parse_command_definition(input).await? {
+        if let Some(def) = self.parse_command_definition(input, provider).await? {
             // Show the expanded form and ask for confirmation before saving.
             let mut preview = format!("i'll create '{}':\n", def.name);
             if !def.params.is_empty() {
@@ -602,11 +591,7 @@ impl MycelRuntime {
                 }
             }
             // Check for collision with a real binary.
-            if let Ok(which) = self
-                .executor
-                .run(&format!("which {} 2>/dev/null", def.name))
-                .await
-            {
+            if let Ok(which) = self.executor.run(&build_which_command(&def.name)).await {
                 let out = which.trim();
                 if !out.is_empty() && !out.starts_with("Command exited with code") {
                     preview.push_str(&format!(
@@ -633,6 +618,7 @@ impl MycelRuntime {
     async fn parse_command_definition(
         &self,
         input: &str,
+        provider: ipc::LlmProvider,
     ) -> Result<Option<commands::PendingCommandDef>> {
         let lower = input.to_lowercase();
         // Match "make a command called X that ..." / "create a command X that ..."
@@ -695,7 +681,7 @@ Example for 'backup a folder': {{\"params\":[\"folder\"],\"steps\":[\"tar czf ~/
         );
         let llm_out = self
             .ai_router
-            .generate_with_provider(&def_prompt, crate::ipc::LlmProvider::Auto)
+            .generate_with_provider(&def_prompt, provider)
             .await?;
 
         let (params, steps, script) = parse_command_def_json(&llm_out);
@@ -950,6 +936,104 @@ async fn run_dev_cli(runtime: MycelRuntime) {
     }
 }
 
+/// Decide whether raw user input should be probed as a CLI command via `which`.
+///
+/// Plain single-word natural language (e.g. "hello", "help", "thanks"),
+/// slash commands (e.g. "/help"), multi-word prose, and quoted or metacharacter
+/// inputs return `None` so they reach the LLM instead of `handle_missing_command`.
+/// Only inputs that unambiguously look like a CLI command invocation are probed:
+/// - A single valid command identifier containing a CLI-style separator or digit
+///   (e.g. `docker-compose`, `python3.11`, `g++`, `my_tool`), or
+/// - A valid command identifier followed by a CLI flag argument (e.g. `jq --version`,
+///   `rg -i pattern`).
+fn extract_command_probe(input: &str) -> Option<&str> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        return None;
+    }
+
+    let mut words = trimmed.split_whitespace();
+    let first = words.next()?;
+    let safe_first = sanitize_missing_command_name(first)?;
+
+    match words.next() {
+        None => {
+            // Reject purely alphabetic single words so greetings, "help", and
+            // other single-word chat always reach the LLM.
+            if safe_first.chars().all(|c| c.is_ascii_alphabetic()) {
+                None
+            } else {
+                Some(safe_first)
+            }
+        }
+        Some(second) => {
+            let is_cli_flag = second.starts_with('-')
+                && second.len() > 1
+                && second
+                    .chars()
+                    .nth(1)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-');
+            if is_cli_flag {
+                Some(safe_first)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Build a shell-escaped `which` probe for `cmd`.
+fn build_which_command(cmd: &str) -> String {
+    format!("which -- {} 2>/dev/null", commands::shell_escape(cmd))
+}
+
+/// Detect whether shell execution output is a genuine "command not found"
+/// diagnostic for the command invoked by `code`, rather than ordinary command
+/// output that happens to contain the words "not found".
+///
+/// Recognized prefixes are the shells themselves (`sh`, `bash`, `dash`, `zsh`,
+/// with or without a path) and the executor's generated script path (`*.sh`),
+/// which is exactly how bash reports a missing command inside a script file.
+fn detect_missing_command_in_output(code: &str, output: &str) -> Option<String> {
+    let invoked = code.split_whitespace().next()?;
+    // A path-qualified invocation is reported by name, and a trailing shell
+    // operator is not part of the name.
+    let invoked = invoked.trim_end_matches(&[';', '|', '&'][..]);
+    let invoked = invoked.rsplit('/').next().unwrap_or(invoked);
+    let invoked = sanitize_missing_command_name(invoked)?;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        let Some((prefix, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let shell_name = prefix.rsplit('/').next().unwrap_or(prefix).trim();
+        if !matches!(shell_name, "sh" | "bash" | "dash" | "zsh") && !shell_name.ends_with(".sh") {
+            continue;
+        }
+
+        let reported = if let Some(before) = rest
+            .strip_suffix(": command not found")
+            .or_else(|| rest.strip_suffix(": not found"))
+        {
+            before.rsplit(':').next().map(str::trim)
+        } else if let Some((_, after)) = rest.split_once("command not found:") {
+            Some(after.trim())
+        } else {
+            None
+        };
+
+        if let Some(cmd) = reported {
+            let cmd = cmd.rsplit('/').next().unwrap_or(cmd);
+            if cmd == invoked {
+                return Some(invoked.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 /// Validate that a missing command name is a safe package/command identifier
 /// before interpolating it into a shell search command.
 fn sanitize_missing_command_name(cmd: &str) -> Option<&str> {
@@ -969,11 +1053,16 @@ fn sanitize_missing_command_name(cmd: &str) -> Option<&str> {
 
 fn build_missing_command_search(cmd: &str) -> Option<(String, String)> {
     let safe = sanitize_missing_command_name(cmd)?;
+    let exact_pattern = commands::shell_escape(&format!("^{}$", safe));
+    let broad_pattern = commands::shell_escape(safe);
     let exact = format!(
-        "apt-cache search -- '^{}$' 2>/dev/null | head -5 || apt-cache search -- '{}' 2>/dev/null | head -5",
-        safe, safe
+        "apt-cache search -- {} 2>/dev/null | head -5 || apt-cache search -- {} 2>/dev/null | head -5",
+        exact_pattern, broad_pattern
     );
-    let broad = format!("apt-cache search -- '{}' 2>/dev/null | head -5", safe);
+    let broad = format!(
+        "apt-cache search -- {} 2>/dev/null | head -5",
+        broad_pattern
+    );
     Some((exact, broad))
 }
 
@@ -1054,5 +1143,400 @@ mod tests {
                 "expected no shell command for {evil:?}"
             );
         }
+    }
+
+    async fn build_test_runtime(dir: &std::path::Path) -> MycelRuntime {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut config = MycelConfig {
+            context_path: dir.to_string_lossy().to_string(),
+            ollama_url: "http://127.0.0.1:1".to_string(),
+            openrouter_api_key: String::new(),
+            ..Default::default()
+        };
+        config.mcp.enabled = false;
+        config.sandbox.mode = config::SandboxMode::Host;
+
+        let context_manager = context::ContextManager::new(&config).await.unwrap();
+        let ai_router = ai::AiRouter::cloud_only(&config).await.unwrap();
+        let executor = executor::CodeExecutor::new(&config).unwrap();
+        let policy_evaluator = policy::PolicyEvaluator::with_defaults();
+        let ui_factory = ui::UiFactory::new(&config).unwrap();
+        let (event_bus, _) = tokio::sync::broadcast::channel(16);
+        let mcp_manager = mcp::McpManager::new(&config.mcp, ".", event_bus.clone())
+            .await
+            .unwrap();
+        let sync_service = sync::SyncService::new(&config, None, event_bus)
+            .await
+            .unwrap();
+        let selfdev =
+            selfdev::SelfDevService::new(config.selfdev.clone(), dir.join("selfdev.json")).await;
+        let command_registry = commands::CommandRegistry::load(dir.join("commands.json")).await;
+
+        MycelRuntime {
+            config,
+            context_manager,
+            ai_router,
+            executor,
+            policy_evaluator,
+            ui_factory,
+            sync_service,
+            mcp_manager,
+            selfdev,
+            command_registry,
+        }
+    }
+
+    fn temp_test_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("mycel-test-{}-{}", tag, uuid::Uuid::new_v4()))
+    }
+
+    fn unwrap_text(resp: RuntimeResponse) -> String {
+        match resp {
+            RuntimeResponse::Text(t) => t,
+            RuntimeResponse::Stream(_) => panic!("expected RuntimeResponse::Text"),
+        }
+    }
+
+    #[test]
+    fn test_extract_command_probe_skips_single_word_chat_and_slash_commands() {
+        for chat in [
+            "hello",
+            "hi",
+            "hey",
+            "help",
+            "thanks",
+            "status",
+            "weather",
+            "explain",
+            "hello world",
+            "explain rust ownership",
+            "/help",
+            "/status",
+            "/clear",
+            "/model claude",
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                extract_command_probe(chat),
+                None,
+                "expected {chat:?} to reach the LLM instead of which/apt"
+            );
+        }
+
+        // Genuine CLI-style probes are still recognized.
+        assert_eq!(extract_command_probe("jq --version"), Some("jq"));
+        assert_eq!(extract_command_probe("ripgrep -i foo"), Some("ripgrep"));
+        assert_eq!(
+            extract_command_probe("docker-compose"),
+            Some("docker-compose")
+        );
+        assert_eq!(extract_command_probe("python3.11"), Some("python3.11"));
+        assert_eq!(extract_command_probe("g++"), Some("g++"));
+    }
+
+    #[test]
+    fn test_quoted_and_metacharacter_command_probes_rejected_and_escaped() {
+        for evil in [
+            "\"jq\" --version",
+            "'jq' --version",
+            "jq;id --version",
+            "$(whoami) --help",
+            "`id` --help",
+            "foo|bar --baz",
+            "foo&&bar --baz",
+            "-v",
+            "--help",
+            "explain - why",
+        ] {
+            assert_eq!(
+                extract_command_probe(evil),
+                None,
+                "expected quoted/metacharacter probe {evil:?} to be rejected"
+            );
+        }
+
+        assert_eq!(
+            build_which_command("foo'bar;id"),
+            "which -- 'foo'\\''bar;id' 2>/dev/null"
+        );
+    }
+
+    #[test]
+    fn test_detect_missing_command_in_output_ignores_ordinary_output() {
+        // Genuine shell diagnostics for the invoked command are detected.
+        assert_eq!(
+            detect_missing_command_in_output("jq --version", "sh: 1: jq: not found\n"),
+            Some("jq".to_string())
+        );
+        assert_eq!(
+            detect_missing_command_in_output(
+                "my_tool --help",
+                "/bin/bash: line 1: my_tool: command not found\n"
+            ),
+            Some("my_tool".to_string())
+        );
+        assert_eq!(
+            detect_missing_command_in_output("rg foo", "zsh:1: command not found: rg\n"),
+            Some("rg".to_string())
+        );
+        // The executor runs generated script files, so bash prefixes the
+        // diagnostic with the script path rather than "bash".
+        assert_eq!(
+            detect_missing_command_in_output(
+                "mycel-tool --version",
+                "/home/u/.cache/mycel/code/e753.sh: line 1: mycel-tool: command not found\n"
+            ),
+            Some("mycel-tool".to_string())
+        );
+        // Path-qualified invocations and trailing operators are normalized.
+        assert_eq!(
+            detect_missing_command_in_output(
+                "./mycel-tool --version",
+                "sh: 1: ./mycel-tool: not found\n"
+            ),
+            Some("mycel-tool".to_string())
+        );
+        assert_eq!(
+            detect_missing_command_in_output(
+                "mycel-tool; echo done",
+                "sh: 1: mycel-tool: not found\n"
+            ),
+            Some("mycel-tool".to_string())
+        );
+
+        // Ordinary command output containing "not found" or fake shell lines must not trigger.
+        assert_eq!(
+            detect_missing_command_in_output("echo 'file not found'", "file not found\n"),
+            None
+        );
+        assert_eq!(
+            detect_missing_command_in_output(
+                "python3 -c 'print(\"key not found\")'",
+                "key not found\n"
+            ),
+            None
+        );
+        assert_eq!(
+            detect_missing_command_in_output(
+                "echo 'bash: line 1: foo: command not found'",
+                "bash: line 1: foo: command not found\n"
+            ),
+            None
+        );
+        assert_eq!(
+            detect_missing_command_in_output(
+                "curl -s https://example.com/missing",
+                "404 Not Found\nresource not found\n"
+            ),
+            None
+        );
+        // A script-path prefix is only accepted for *.sh files.
+        assert_eq!(
+            detect_missing_command_in_output(
+                "cat notes.txt",
+                "notes.txt: line 1: xyz: command not found\n"
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_word_chat_does_not_hit_missing_command_handler() {
+        let dir = temp_test_dir("single-word");
+        let runtime = build_test_runtime(&dir).await;
+
+        for word in ["hello", "help", "/help"] {
+            // With no LLM configured, reaching the LLM path returns an Err or
+            // non-package-search reply; it must never return the missing-command
+            // apt-cache message.
+            if let Ok(resp) = runtime.process_input(word, "sess-chat").await {
+                let text = unwrap_text(resp);
+                assert!(
+                    !text.contains("not found and no package available")
+                        && !text.contains("not installed."),
+                    "single-word input {word:?} was misrouted to handle_missing_command: {text}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_confirmation_works_on_both_input_paths() {
+        let dir = temp_test_dir("confirm");
+        let runtime = build_test_runtime(&dir).await;
+
+        // Ensure sessions exist before setting pending commands.
+        runtime
+            .context_manager
+            .get_context("sess-confirm-1")
+            .await
+            .unwrap();
+        runtime
+            .context_manager
+            .get_context("sess-confirm-2")
+            .await
+            .unwrap();
+
+        // Path 1: process_input — confirm with "y"
+        runtime
+            .context_manager
+            .set_pending_command("sess-confirm-1", Some("echo confirmed_default".to_string()))
+            .await
+            .unwrap();
+        let out = unwrap_text(runtime.process_input("y", "sess-confirm-1").await.unwrap());
+        assert_eq!(out.trim(), "confirmed_default");
+
+        // Path 1: process_input — deny with "n"
+        runtime
+            .context_manager
+            .set_pending_command("sess-confirm-1", Some("echo should_not_run".to_string()))
+            .await
+            .unwrap();
+        let out = unwrap_text(runtime.process_input("n", "sess-confirm-1").await.unwrap());
+        assert_eq!(out, "action cancelled.");
+
+        // Path 2: process_input_with_provider (non-Auto) — confirm with "y"
+        runtime
+            .context_manager
+            .set_pending_command(
+                "sess-confirm-2",
+                Some("echo confirmed_provider".to_string()),
+            )
+            .await
+            .unwrap();
+        let out = unwrap_text(
+            runtime
+                .process_input_with_provider("y", "sess-confirm-2", ipc::LlmProvider::Cloud)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(out.trim(), "confirmed_provider");
+
+        // Path 2: process_input_with_provider (non-Auto) — deny with "n"
+        runtime
+            .context_manager
+            .set_pending_command("sess-confirm-2", Some("echo should_not_run".to_string()))
+            .await
+            .unwrap();
+        let out = unwrap_text(
+            runtime
+                .process_input_with_provider("n", "sess-confirm-2", ipc::LlmProvider::Cloud)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(out, "action cancelled.");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_user_commands_and_command_management_work_with_explicit_provider() {
+        let dir = temp_test_dir("user-cmds");
+        let runtime = build_test_runtime(&dir).await;
+
+        runtime
+            .command_registry
+            .define_full(
+                "sayhi",
+                "print a greeting",
+                vec![commands::CommandStep::shell("echo hi {who}")],
+                vec!["who".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Command management via explicit provider
+        let list_out = unwrap_text(
+            runtime
+                .process_input_with_provider("list commands", "sess-cmd", ipc::LlmProvider::Cloud)
+                .await
+                .unwrap(),
+        );
+        assert!(list_out.contains("sayhi"));
+
+        // User-defined command execution via explicit provider
+        let run_out = unwrap_text(
+            runtime
+                .process_input_with_provider("sayhi world", "sess-cmd", ipc::LlmProvider::Cloud)
+                .await
+                .unwrap(),
+        );
+        assert!(run_out.contains("hi world"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_ordinary_output_looking_like_command_not_found_is_not_misrouted() {
+        let dir = temp_test_dir("ordinary-output");
+        let runtime = build_test_runtime(&dir).await;
+
+        let out1 = unwrap_text(
+            runtime
+                .execute_code_with_policy("echo 'file not found'", "sess-out")
+                .await
+                .unwrap(),
+        );
+        assert_eq!(out1.trim(), "file not found");
+
+        let out2 = unwrap_text(
+            runtime
+                .execute_code_with_policy("echo 'bash: line 1: foo: command not found'", "sess-out")
+                .await
+                .unwrap(),
+        );
+        assert_eq!(out2.trim(), "bash: line 1: foo: command not found");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end: a genuine shell "command not found" diagnostic still reaches
+    /// the package-install offer through the real executor.
+    #[tokio::test]
+    async fn test_real_missing_command_reaches_package_offer() {
+        let dir = temp_test_dir("real-missing");
+        let runtime = build_test_runtime(&dir).await;
+
+        let out = unwrap_text(
+            runtime
+                .execute_code_with_policy("mycel-nonexistent-tool", "sess-missing")
+                .await
+                .unwrap(),
+        );
+        assert!(
+            out.contains("mycel-nonexistent-tool")
+                && (out.contains("not installed")
+                    || out.contains("no package available")
+                    || out.contains("install with")),
+            "missing command did not reach handle_missing_command: {out}"
+        );
+        assert!(
+            !out.starts_with("bash: line"),
+            "raw shell error leaked: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end: a CLI-shaped probe on the input path is still detected as a
+    /// missing command, while single-word chat stays on the LLM path.
+    #[tokio::test]
+    async fn test_cli_shaped_probe_routes_to_missing_command_handler() {
+        let dir = temp_test_dir("probe-missing");
+        let runtime = build_test_runtime(&dir).await;
+
+        let out = unwrap_text(
+            runtime
+                .process_input("mycel-nonexistent-tool --version", "sess-probe")
+                .await
+                .unwrap(),
+        );
+        assert!(
+            out.contains("mycel-nonexistent-tool")
+                && (out.contains("not installed")
+                    || out.contains("no package available")
+                    || out.contains("install with")),
+            "CLI-shaped probe did not reach handle_missing_command: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
