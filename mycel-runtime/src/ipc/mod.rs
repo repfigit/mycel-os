@@ -31,6 +31,40 @@ const RATE_LIMIT_REQUESTS: u32 = 100;
 /// Rate limit window duration
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
+/// A line buffer that keeps its allocation across frames so small messages
+/// don't allocate, but releases it after an unusually large frame so one big
+/// message does not pin memory for the connection's lifetime.
+struct LineBuffer {
+    buf: String,
+}
+
+/// Capacity kept after a large frame. Anything above this is handed back to
+/// the allocator.
+const LINE_BUFFER_KEEP_BYTES: usize = 64 * 1024;
+
+impl LineBuffer {
+    fn new() -> Self {
+        Self {
+            buf: String::with_capacity(1024),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.buf
+    }
+
+    /// Reset for the next frame, handing capacity beyond the keep threshold
+    /// back to the allocator. A large frame keeps its buffer while it is
+    /// processed, but the memory is released as soon as the frame is done
+    /// instead of for the lifetime of the connection.
+    fn reset(&mut self) {
+        self.buf.clear();
+        if self.buf.capacity() > LINE_BUFFER_KEEP_BYTES {
+            self.buf.shrink_to(LINE_BUFFER_KEEP_BYTES);
+        }
+    }
+}
+
 /// Rate limiter for a connection
 struct RateLimiter {
     requests: Vec<Instant>,
@@ -125,18 +159,20 @@ impl IpcServer {
 
 enum BoundedRead {
     Eof,
-    Line(String),
+    /// A line was read into the caller's [`LineBuffer`].
+    Line,
     TooLarge(usize),
 }
 
 async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
+    line: &mut LineBuffer,
     max_size: usize,
 ) -> std::io::Result<BoundedRead> {
-    let mut line = String::new();
+    line.reset();
     let n = reader
         .take((max_size + 1) as u64)
-        .read_line(&mut line)
+        .read_line(&mut line.buf)
         .await?;
     if n == 0 {
         return Ok(BoundedRead::Eof);
@@ -144,7 +180,7 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     if n > max_size {
         return Ok(BoundedRead::TooLarge(n));
     }
-    Ok(BoundedRead::Line(line))
+    Ok(BoundedRead::Line)
 }
 
 async fn handle_connection(
@@ -159,12 +195,13 @@ async fn handle_connection(
     let mut session_id = uuid::Uuid::new_v4().to_string();
     let mut authenticated = false;
     let mut rate_limiter = RateLimiter::new(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW);
+    let mut line_buf = LineBuffer::new();
 
     debug!("New IPC connection, session: {}", session_id);
 
     loop {
         // Read with size limit enforced before allocation
-        match read_bounded_line(&mut reader, MAX_MESSAGE_SIZE).await {
+        match read_bounded_line(&mut reader, &mut line_buf, MAX_MESSAGE_SIZE).await {
             Ok(BoundedRead::Eof) => break,
             Ok(BoundedRead::TooLarge(n)) => {
                 warn!("Message exceeds size limit ({} bytes)", n);
@@ -177,8 +214,8 @@ async fn handle_connection(
                 w.flush().await?;
                 break;
             }
-            Ok(BoundedRead::Line(line)) => {
-                let trimmed = line.trim();
+            Ok(BoundedRead::Line) => {
+                let trimmed = line_buf.as_str().trim();
                 if trimmed.is_empty() {
                     continue;
                 }
@@ -782,7 +819,8 @@ mod tests {
     async fn test_read_bounded_line_rejects_oversized_without_newline() {
         // Infinite stream of 'a' with no newline: must stop at MAX_MESSAGE_SIZE + 1 without OOM.
         let mut reader = BufReader::new(tokio::io::repeat(b'a'));
-        match read_bounded_line(&mut reader, MAX_MESSAGE_SIZE)
+        let mut buf = LineBuffer::new();
+        match read_bounded_line(&mut reader, &mut buf, MAX_MESSAGE_SIZE)
             .await
             .unwrap()
         {
@@ -792,21 +830,23 @@ mod tests {
                 std::mem::discriminant(&other)
             ),
         }
+        assert_eq!(buf.as_str().len(), MAX_MESSAGE_SIZE + 1);
     }
 
     #[tokio::test]
     async fn test_read_bounded_line_accepts_valid_and_rejects_oversized_with_newline() {
         let valid = b"{\"type\":\"Ping\"}\n";
         let mut reader = BufReader::new(&valid[..]);
-        match read_bounded_line(&mut reader, MAX_MESSAGE_SIZE)
-            .await
-            .unwrap()
-        {
-            BoundedRead::Line(line) => assert_eq!(line, "{\"type\":\"Ping\"}\n"),
-            _ => panic!("expected Line"),
-        }
+        let mut buf = LineBuffer::new();
         assert!(matches!(
-            read_bounded_line(&mut reader, MAX_MESSAGE_SIZE)
+            read_bounded_line(&mut reader, &mut buf, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap(),
+            BoundedRead::Line
+        ));
+        assert_eq!(buf.as_str(), "{\"type\":\"Ping\"}\n");
+        assert!(matches!(
+            read_bounded_line(&mut reader, &mut buf, MAX_MESSAGE_SIZE)
                 .await
                 .unwrap(),
             BoundedRead::Eof
@@ -815,12 +855,46 @@ mod tests {
         let mut oversized = vec![b'x'; MAX_MESSAGE_SIZE + 100];
         oversized.push(b'\n');
         let mut reader = BufReader::new(&oversized[..]);
-        match read_bounded_line(&mut reader, MAX_MESSAGE_SIZE)
+        match read_bounded_line(&mut reader, &mut buf, MAX_MESSAGE_SIZE)
             .await
             .unwrap()
         {
             BoundedRead::TooLarge(n) => assert_eq!(n, MAX_MESSAGE_SIZE + 1),
             _ => panic!("expected TooLarge"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_line_buffer_reuses_and_releases_capacity() {
+        let big = LINE_BUFFER_KEEP_BYTES * 4;
+        let mut data = vec![b'x'; big];
+        data.push(b'\n');
+        data.extend_from_slice(b"{\"type\":\"Ping\"}\n");
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = LineBuffer::new();
+
+        // A large frame grows the buffer.
+        assert!(matches!(
+            read_bounded_line(&mut reader, &mut buf, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap(),
+            BoundedRead::Line
+        ));
+        assert_eq!(buf.as_str().len(), big + 1);
+        assert!(buf.buf.capacity() >= big);
+
+        // The next frame reuses the buffer but releases the large capacity.
+        assert!(matches!(
+            read_bounded_line(&mut reader, &mut buf, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap(),
+            BoundedRead::Line
+        ));
+        assert_eq!(buf.as_str(), "{\"type\":\"Ping\"}\n");
+        assert!(
+            buf.buf.capacity() <= LINE_BUFFER_KEEP_BYTES,
+            "large capacity retained: {}",
+            buf.buf.capacity()
+        );
     }
 }

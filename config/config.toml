@@ -71,6 +71,10 @@ writable_paths = []
 # Extra paths to hide, in addition to the built-in credential list
 hidden_paths = []
 tmp_size_mb = 64
+# Task cap inside the sandbox (RLIMIT_NPROC) - stops fork bombs.
+# Counts every task/thread of the sandbox user across the host, so keep it
+# above your usual desktop task count. Root bypasses it.
+max_processes = 4096
 
 # Timeout and Python memory cap come from top-level keys:
 #   execution_timeout_secs = 30

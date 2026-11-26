@@ -105,8 +105,10 @@ Mycel OS is an AI-native operating system where users interact through natural l
 **Mitigations**:
 - Execution timeout limits
 - Memory limits on sandbox
+- Task-count limit (`RLIMIT_NPROC`) against fork bombs
 - Rate limiting on IPC
 - Message size limits
+- Bounded mesh event log
 
 ### T8: Code Injection via UI
 **Description**: XSS attacks through generated UI surfaces.

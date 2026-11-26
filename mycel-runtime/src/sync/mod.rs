@@ -274,8 +274,46 @@ fn seal_event(own: &StaticSecret, peer: &PublicKey, event: &SyncEvent) -> Result
 #[derive(Default)]
 struct SyncState {
     peers: HashMap<String, PeerInfo>,
+    /// Bounded, causally ordered window of recent events (see
+    /// [`EVENT_LOG_CAP`]). Older events are pruned; their clocks are already
+    /// merged into `local_clock`, so pruning does not lose causal state.
     event_log: Vec<SyncEvent>,
     local_clock: VectorClock,
+}
+
+/// Maximum number of events retained in the in-memory log.
+///
+/// The log exists to deduplicate retransmissions and to keep a recent view of
+/// mesh activity, not as history: it must stay bounded so neither dedup nor
+/// the causal sort grows without limit.
+const EVENT_LOG_CAP: usize = 512;
+
+impl SyncState {
+    /// Insert `event`, keeping the log deduplicated, causally ordered and
+    /// capped. Prunes the oldest entries. Returns `false` when an event with
+    /// the same id is already retained.
+    fn insert_event(&mut self, event: SyncEvent) -> bool {
+        // Bounded linear scan: the log never exceeds EVENT_LOG_CAP.
+        if self.event_log.iter().any(|e| e.id == event.id) {
+            return false;
+        }
+
+        self.event_log.push(event);
+        self.event_log.sort_by(|a, b| {
+            if a.clock.is_ahead_of(&b.clock) {
+                std::cmp::Ordering::Greater
+            } else if b.clock.is_ahead_of(&a.clock) {
+                std::cmp::Ordering::Less
+            } else {
+                a.timestamp.cmp(&b.timestamp)
+            }
+        });
+        if self.event_log.len() > EVENT_LOG_CAP {
+            let excess = self.event_log.len() - EVENT_LOG_CAP;
+            self.event_log.drain(..excess);
+        }
+        true
+    }
 }
 
 #[derive(Clone)]
@@ -696,7 +734,7 @@ impl SyncService {
             signature: Vec::new(),
         };
 
-        state.event_log.push(event.clone());
+        state.insert_event(event.clone());
 
         let peers = state.peers.clone();
         drop(state);
@@ -736,22 +774,14 @@ impl SyncService {
 
         let mut state = self.state.write().await;
 
-        if state.event_log.iter().any(|e| e.id == event.id) {
-            return Ok(());
-        }
-
         state.local_clock.merge(&event.clock);
 
-        state.event_log.push(event.clone());
-        state.event_log.sort_by(|a, b| {
-            if a.clock.is_ahead_of(&b.clock) {
-                std::cmp::Ordering::Greater
-            } else if b.clock.is_ahead_of(&a.clock) {
-                std::cmp::Ordering::Less
-            } else {
-                a.timestamp.cmp(&b.timestamp)
-            }
-        });
+        // Fresh id in the common case, but peers may retransmit; insert_event
+        // deduplicates within the retained window and enforces the cap.
+        if !state.insert_event(event.clone()) {
+            debug!(event_id = %event.id, "Duplicate sync event ignored");
+            return Ok(());
+        }
         drop(state);
 
         info!(event_id = %event.id, "Event integrated into local mesh log");
@@ -1102,5 +1132,52 @@ mod tests {
         DeviceKeys::load_or_generate(&dir).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn test_event_log_is_capped_prunes_oldest_and_stays_ordered() {
+        let mut state = SyncState::default();
+        let base = Utc::now();
+        for i in 0..(EVENT_LOG_CAP + 25) {
+            let mut e = event_from("dev", pref());
+            e.timestamp = base + chrono::Duration::milliseconds(i as i64);
+            assert!(state.insert_event(e), "event {i} rejected");
+        }
+
+        assert_eq!(state.event_log.len(), EVENT_LOG_CAP);
+        // The 25 oldest entries were pruned; the newest is still last.
+        assert_eq!(
+            state.event_log[0].timestamp,
+            base + chrono::Duration::milliseconds(25)
+        );
+        assert_eq!(
+            state.event_log.last().unwrap().timestamp,
+            base + chrono::Duration::milliseconds((EVENT_LOG_CAP + 24) as i64)
+        );
+        assert!(state
+            .event_log
+            .windows(2)
+            .all(|w| w[0].timestamp <= w[1].timestamp));
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_event_applied_once_and_order_kept() {
+        let (friend_secret, friend) = peer_keys();
+        let svc = service(std::slice::from_ref(&friend), false, false).await;
+
+        let earlier = event_from(&friend, pref());
+        let mut later = event_from(&friend, pref());
+        later.clock.increment(&friend);
+
+        // Deliver out of causal order, then retransmit the later event.
+        for event in [&later, &earlier, &later, &later] {
+            let packet = seal_event(&friend_secret, &svc.keys.public, event).unwrap();
+            deliver(&svc, &packet).await;
+        }
+
+        let state = svc.state.read().await;
+        assert_eq!(state.event_log.len(), 2, "duplicates were not deduplicated");
+        assert_eq!(state.event_log[0].id, earlier.id);
+        assert_eq!(state.event_log[1].id, later.id);
     }
 }
