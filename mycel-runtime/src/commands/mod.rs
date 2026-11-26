@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 
 /// A single operation within a user command.
@@ -119,6 +119,7 @@ pub struct PendingCommandDef {
 pub struct CommandRegistry {
     commands: Arc<RwLock<HashMap<String, UserCommand>>>,
     path: Option<PathBuf>,
+    persist_lock: Arc<Mutex<()>>,
 }
 
 impl CommandRegistry {
@@ -137,6 +138,7 @@ impl CommandRegistry {
         Self {
             commands: Arc::new(RwLock::new(commands)),
             path: Some(path),
+            persist_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -146,6 +148,7 @@ impl CommandRegistry {
         Self {
             commands: Arc::new(RwLock::new(HashMap::new())),
             path: None,
+            persist_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -235,14 +238,23 @@ impl CommandRegistry {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let commands = self.commands.read().await;
-        let json = serde_json::to_string_pretty(&*commands)?;
+        let _guard = self.persist_lock.lock().await;
+        let json = {
+            let commands = self.commands.read().await;
+            serde_json::to_string_pretty(&*commands)?
+        };
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
-        let tmp = path.with_extension("tmp");
-        tokio::fs::write(&tmp, json).await?;
-        tokio::fs::rename(&tmp, path).await?;
+        let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        if let Err(e) = tokio::fs::write(&tmp, json).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
         Ok(())
     }
 }
@@ -430,5 +442,54 @@ mod tests {
         assert_eq!(escaped, "'$(rm -rf /)'"); // inert single-quoted string
                                               // Single quotes are escaped.
         assert_eq!(shell_escape("o'brien"), "'o'\\''brien'");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_persist_does_not_clobber() {
+        let dir = std::env::temp_dir().join(format!("mycel-cmd-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("commands.json");
+        let reg = CommandRegistry::load(path.clone()).await;
+
+        let count = 24;
+        let mut handles = Vec::with_capacity(count);
+        for i in 0..count {
+            let reg = reg.clone();
+            handles.push(tokio::spawn(async move {
+                let cmd_str = format!("echo {i}");
+                reg.define(
+                    &format!("cmd_{i}"),
+                    &format!("desc {i}"),
+                    vec![CommandStep::shell(&cmd_str)],
+                )
+                .await
+            }));
+        }
+
+        for h in handles {
+            h.await
+                .unwrap()
+                .expect("concurrent define/persist must succeed");
+        }
+
+        // Reload from disk and verify every command survived intact.
+        let reloaded = CommandRegistry::load(path).await;
+        let list = reloaded.list().await;
+        assert_eq!(list.len(), count);
+        for i in 0..count {
+            assert!(
+                reloaded.contains(&format!("cmd_{i}")).await,
+                "missing cmd_{i} after concurrent persist"
+            );
+        }
+
+        // No leftover .tmp files in the directory.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover tmp files: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

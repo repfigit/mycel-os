@@ -470,18 +470,19 @@ impl MycelRuntime {
             })
             .await;
 
+        let Some((exact_search_cmd, broad_search_cmd)) = build_missing_command_search(cmd) else {
+            return Ok(RuntimeResponse::Text(format!(
+                "'{}' is not a valid command name. check spelling or install manually.",
+                cmd
+            )));
+        };
+
         // Search for package (works on Debian/Ubuntu - devcontainer)
-        let search_result = self.executor.run(&format!(
-            "apt-cache search '^{}$' 2>/dev/null | head -5 || apt-cache search '{}' 2>/dev/null | head -5",
-            cmd, cmd
-        )).await?;
+        let search_result = self.executor.run(&exact_search_cmd).await?;
 
         if search_result.trim().is_empty() {
             // Try broader search
-            let broad_search = self
-                .executor
-                .run(&format!("apt-cache search '{}' 2>/dev/null | head -5", cmd))
-                .await?;
+            let broad_search = self.executor.run(&broad_search_cmd).await?;
 
             if broad_search.trim().is_empty() {
                 return Ok(RuntimeResponse::Text(format!(
@@ -949,6 +950,33 @@ async fn run_dev_cli(runtime: MycelRuntime) {
     }
 }
 
+/// Validate that a missing command name is a safe package/command identifier
+/// before interpolating it into a shell search command.
+fn sanitize_missing_command_name(cmd: &str) -> Option<&str> {
+    if cmd.is_empty() || cmd.len() > 128 {
+        return None;
+    }
+    let mut chars = cmd.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphanumeric() {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+')) {
+        return None;
+    }
+    Some(cmd)
+}
+
+fn build_missing_command_search(cmd: &str) -> Option<(String, String)> {
+    let safe = sanitize_missing_command_name(cmd)?;
+    let exact = format!(
+        "apt-cache search -- '^{}$' 2>/dev/null | head -5 || apt-cache search -- '{}' 2>/dev/null | head -5",
+        safe, safe
+    );
+    let broad = format!("apt-cache search -- '{}' 2>/dev/null | head -5", safe);
+    Some((exact, broad))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,5 +1016,43 @@ mod tests {
         assert_eq!(exec_payload("```\nls\n```"), None);
         assert_eq!(exec_payload("here is #!exec\nls"), None);
         assert_eq!(exec_payload("#!execute me"), None);
+    }
+
+    #[test]
+    fn test_missing_command_sanitization_blocks_shell_injection() {
+        // Legitimate command/package names are allowed.
+        for valid in ["jq", "g++", "python3.11", "my_tool-1", "ripgrep"] {
+            assert_eq!(sanitize_missing_command_name(valid), Some(valid));
+            let (exact, broad) = build_missing_command_search(valid).unwrap();
+            assert!(exact.contains(&format!("'^{valid}$'")));
+            assert!(broad.contains(&format!("'{valid}'")));
+        }
+
+        // Shell metacharacters, flag injection, and whitespace must be rejected.
+        for evil in [
+            "",
+            "foo'; id; echo '",
+            "$(whoami)",
+            "`id`",
+            "foo | cat /etc/passwd",
+            "foo && touch /tmp/pwned",
+            "foo;rm -rf /",
+            "foo\nid",
+            "-o",
+            "--version",
+            "foo bar",
+            "foo\"bar",
+            "foo$HOME",
+        ] {
+            assert_eq!(
+                sanitize_missing_command_name(evil),
+                None,
+                "expected {evil:?} to be rejected"
+            );
+            assert!(
+                build_missing_command_search(evil).is_none(),
+                "expected no shell command for {evil:?}"
+            );
+        }
     }
 }

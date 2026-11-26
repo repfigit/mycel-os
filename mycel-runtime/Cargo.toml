@@ -43,7 +43,7 @@ notify = "6.1"
 minijinja = "1.0"
 
 # Sandboxing (Linux namespaces)
-nix = { version = "0.27", features = ["process", "sched", "mount"] }
+nix = { version = "0.27", features = ["process", "sched", "mount", "signal"] }
 
 # IPC
 interprocess = "1.2"

@@ -57,13 +57,24 @@ dedup_window_days = 7
 # Actually file to GitHub (vs. log locally). Requires `gh` authenticated.
 file_to_github = false
 
-[executor]
-# Sandboxed code execution
-enabled = true
-sandbox_type = "firejail"  # or "bubblewrap"
-timeout_secs = 30
-max_memory_mb = 512
-allowed_languages = ["python", "javascript", "bash"]
+[sandbox]
+# Isolation for AI-generated code. The model's output is untrusted.
+# "bwrap" (default): bubblewrap - no network, read-only filesystem, credential
+#   dirs (~/.ssh, ~/.aws, ~/.config/gh, ...) hidden, empty environment,
+#   private /tmp and /run. If bubblewrap is missing, execution is REFUSED.
+# "host": run directly with the daemon's privileges (opt-in, not recommended).
+mode = "bwrap"
+bwrap_path = "bwrap"
+allow_network = false
+# Directories generated code may write to (everything else is read-only)
+writable_paths = []
+# Extra paths to hide, in addition to the built-in credential list
+hidden_paths = []
+tmp_size_mb = 64
+
+# Timeout and Python memory cap come from top-level keys:
+#   execution_timeout_secs = 30
+#   execution_memory_mb = 512
 
 [collective]
 # Decentralized network participation

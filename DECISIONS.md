@@ -136,6 +136,13 @@ This document captures key decisions made during Mycel OS design. Claude Code sh
 
 ## ADR-006: Code Sandbox
 
+> **Implemented as:** bubblewrap is the primary (and only) sandbox. It ships
+> in Void's base repos, needs no setuid on kernels with unprivileged user
+> namespaces, and is what Flatpak uses. Firejail is not used. See
+> `mycel-runtime/src/executor/mod.rs` and `[sandbox]` in `config/config.toml`.
+> The model is treated as untrusted; execution is refused (not run on the
+> host) if bubblewrap is unavailable, unless `[sandbox] mode = "host"`.
+
 **Decision:** Firejail as primary sandbox, bubblewrap as fallback
 
 **Context:** AI-generated code must run safely:
