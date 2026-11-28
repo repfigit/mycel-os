@@ -1,612 +1,25 @@
 //! Bittensor Integration
 //!
-//! Handles communication with Bittensor network for:
-//! - Distributed inference
-//! - Pattern evaluation
-//!
-//! Note: This module is scaffolded - blockchain integration is deferred.
-#![allow(dead_code)]
-//! - Federated learning
-//! - TAO rewards
+//! Evaluates pattern quality against a configured Bittensor HTTP evaluator
+//! endpoint, with a deterministic offline local scoring fallback.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use std::time::Duration;
+use tracing::debug;
 
-use super::patterns::{Pattern, PatternId};
+const DEFAULT_EVAL_TIMEOUT_SECS: u64 = 10;
 
-/// Bittensor client for Mycel OS
-#[derive(Clone)]
-pub struct BittensorClient {
-    config: BittensorConfig,
-    http_client: reqwest::Client,
-    wallet: Option<BittensorWallet>,
-}
-
-impl BittensorClient {
-    pub async fn new(config: &BittensorConfig) -> Result<Self> {
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()?;
-
-        // Load wallet if configured
-        let wallet = if let Some(ref wallet_path) = config.wallet_path {
-            Some(BittensorWallet::load(wallet_path)?)
-        } else {
-            None
-        };
-
-        let client = Self {
-            config: config.clone(),
-            http_client,
-            wallet,
-        };
-
-        if config.verify_on_start {
-            client.verify_connection().await?;
-        }
-
-        Ok(client)
-    }
-
-    async fn verify_connection(&self) -> Result<()> {
-        // Check connection to Bittensor network
-        let metagraph = self.get_metagraph().await?;
-        info!(
-            "Connected to Bittensor subnet {} with {} neurons",
-            self.config.subnet_uid,
-            metagraph.neurons.len()
-        );
-        Ok(())
-    }
-
-    /// Get the subnet metagraph
-    pub async fn get_metagraph(&self) -> Result<Metagraph> {
-        let response = self
-            .http_client
-            .get(format!(
-                "{}/metagraph/{}",
-                self.config.api_url, self.config.subnet_uid
-            ))
-            .send()
-            .await?
-            .json::<Metagraph>()
-            .await?;
-
-        Ok(response)
-    }
-
-    /// Submit a pattern for evaluation by the network
-    pub async fn submit_pattern_for_evaluation(
-        &self,
-        pattern_id: &PatternId,
-        pattern: &Pattern,
-    ) -> Result<EvaluationResult> {
-        debug!("Submitting pattern {} for evaluation", pattern_id);
-
-        // Create evaluation request
-        let request = EvaluationRequest {
-            pattern_id: pattern_id.clone(),
-            pattern_trigger: pattern.trigger.clone(),
-            pattern_solution: pattern.solution_summary(),
-            domain: pattern.domain.clone(),
-        };
-
-        // Query miners for evaluation
-        let responses = self
-            .query_miners(
-                MycelSynapse::EvaluatePattern(request),
-                self.config.evaluation_timeout_secs,
-            )
-            .await?;
-
-        // Aggregate evaluations
-        let result = self.aggregate_evaluations(responses)?;
-
-        info!(
-            "Pattern {} evaluated: score={:.2}, confidence={:.2}",
-            pattern_id, result.score, result.confidence
-        );
-
-        Ok(result)
-    }
-
-    /// Query the network for inference (when local + cloud isn't enough)
-    pub async fn distributed_inference(
-        &self,
-        query: &str,
-        context: &str,
-        patterns: Vec<PatternId>,
-    ) -> Result<InferenceResult> {
-        debug!("Requesting distributed inference");
-
-        let request = InferenceRequest {
-            query: query.to_string(),
-            context: context.to_string(),
-            available_patterns: patterns,
-            max_tokens: self.config.max_inference_tokens,
-        };
-
-        let responses = self
-            .query_miners(
-                MycelSynapse::Inference(request),
-                self.config.inference_timeout_secs,
-            )
-            .await?;
-
-        // Select best response based on quality scoring
-        let best = self.select_best_response(responses)?;
-
-        Ok(best)
-    }
-
-    /// Perform semantic search for patterns across the network
-    pub async fn semantic_pattern_search(
-        &self,
-        query_embedding: Vec<f32>,
-        k: usize,
-    ) -> Result<Vec<SemanticMatch>> {
-        let request = SemanticSearchRequest {
-            embedding: query_embedding,
-            k,
-            min_similarity: self.config.min_semantic_similarity,
-        };
-
-        let responses = self
-            .query_miners(
-                MycelSynapse::SemanticSearch(request),
-                self.config.search_timeout_secs,
-            )
-            .await?;
-
-        // Merge and deduplicate results
-        let matches = self.merge_semantic_results(responses, k)?;
-
-        Ok(matches)
-    }
-
-    /// Report pattern outcome for reputation/training
-    pub async fn report_pattern_outcome(
-        &self,
-        pattern_id: &PatternId,
-        success: bool,
-    ) -> Result<()> {
-        // This contributes to the collective training signal
-        let report = OutcomeReport {
-            pattern_id: pattern_id.clone(),
-            success,
-            timestamp: chrono::Utc::now(),
-        };
-
-        // Broadcast to subnet validators
-        self.broadcast_to_validators(ValidatorMessage::PatternOutcome(report))
-            .await?;
-
-        Ok(())
-    }
-
-    /// Submit gradients for federated learning
-    pub async fn submit_gradients(&self, gradients: &PrivateGradients) -> Result<()> {
-        debug!("Submitting gradients for federated learning");
-
-        let submission = GradientSubmission {
-            model_id: gradients.model_id.clone(),
-            gradient_hash: gradients.hash.clone(),
-            compressed_gradients: gradients.compressed.clone(),
-            sample_count: gradients.sample_count,
-            privacy_budget_used: gradients.epsilon,
-        };
-
-        self.broadcast_to_validators(ValidatorMessage::GradientSubmission(submission))
-            .await?;
-
-        info!("Gradients submitted for model {}", gradients.model_id);
-        Ok(())
-    }
-
-    /// Get current model weights from the network
-    pub async fn get_model_weights(&self, model_id: &str) -> Result<ModelWeights> {
-        let response = self
-            .http_client
-            .get(format!(
-                "{}/models/{}/weights",
-                self.config.api_url, model_id
-            ))
-            .send()
-            .await?
-            .json::<ModelWeights>()
-            .await?;
-
-        Ok(response)
-    }
-
-    /// Get TAO balance
-    pub async fn get_balance(&self) -> Result<f64> {
-        let wallet = self
-            .wallet
-            .as_ref()
-            .ok_or_else(|| anyhow!("Wallet not configured"))?;
-
-        let response = self
-            .http_client
-            .get(format!("{}/balance/{}", self.config.api_url, wallet.hotkey))
-            .send()
-            .await?
-            .json::<BalanceResponse>()
-            .await?;
-
-        Ok(response.balance)
-    }
-
-    /// Get rewards earned
-    pub async fn get_rewards(&self) -> Result<RewardsSummary> {
-        let wallet = self
-            .wallet
-            .as_ref()
-            .ok_or_else(|| anyhow!("Wallet not configured"))?;
-
-        let response = self
-            .http_client
-            .get(format!(
-                "{}/rewards/{}/{}",
-                self.config.api_url, self.config.subnet_uid, wallet.hotkey
-            ))
-            .send()
-            .await?
-            .json::<RewardsSummary>()
-            .await?;
-
-        Ok(response)
-    }
-
-    // Helper methods
-
-    async fn query_miners(
-        &self,
-        synapse: MycelSynapse,
-        timeout_secs: u64,
-    ) -> Result<Vec<MinerResponse>> {
-        let metagraph = self.get_metagraph().await?;
-
-        // Select top miners by stake/incentive
-        let top_miners: Vec<_> = metagraph
-            .neurons
-            .iter()
-            .filter(|n| n.is_active && n.axon_info.is_some())
-            .take(self.config.max_miners_to_query)
-            .collect();
-
-        if top_miners.is_empty() {
-            return Err(anyhow!("No active miners available"));
-        }
-
-        // Query miners in parallel
-        let mut responses = Vec::new();
-        let client = self.http_client.clone();
-
-        for neuron in top_miners {
-            let Some(axon) = neuron.axon_info.as_ref() else {
-                continue;
-            };
-            let url = format!("http://{}:{}/forward", axon.ip, axon.port);
-
-            let request = MinerRequest {
-                synapse: synapse.clone(),
-                timeout: timeout_secs,
-            };
-
-            match client
-                .post(&url)
-                .timeout(std::time::Duration::from_secs(timeout_secs))
-                .json(&request)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    if let Ok(miner_resp) = resp.json::<MinerResponse>().await {
-                        responses.push(miner_resp);
-                    }
-                }
-                Err(e) => {
-                    debug!("Miner {} failed: {}", neuron.uid, e);
-                }
-            }
-        }
-
-        if responses.is_empty() {
-            return Err(anyhow!("All miners failed to respond"));
-        }
-
-        Ok(responses)
-    }
-
-    async fn broadcast_to_validators(&self, message: ValidatorMessage) -> Result<()> {
-        let metagraph = self.get_metagraph().await?;
-
-        // Find validators
-        let validators: Vec<_> = metagraph
-            .neurons
-            .iter()
-            .filter(|n| n.is_validator && n.axon_info.is_some())
-            .collect();
-
-        for validator in validators {
-            let Some(axon) = validator.axon_info.as_ref() else {
-                continue;
-            };
-            let url = format!("http://{}:{}/validator", axon.ip, axon.port);
-
-            // Fire and forget
-            let _ = self.http_client.post(&url).json(&message).send().await;
-        }
-
-        Ok(())
-    }
-
-    fn aggregate_evaluations(&self, responses: Vec<MinerResponse>) -> Result<EvaluationResult> {
-        let mut total_score = 0.0;
-        let mut total_weight = 0.0;
-
-        for resp in &responses {
-            if let MycelSynapseResult::Evaluation(eval) = &resp.result {
-                let weight = resp.stake_weight;
-                total_score += eval.score * weight;
-                total_weight += weight;
-            }
-        }
-
-        if total_weight == 0.0 {
-            return Err(anyhow!("No valid evaluations"));
-        }
-
-        Ok(EvaluationResult {
-            score: total_score / total_weight,
-            confidence: (responses.len() as f64 / self.config.max_miners_to_query as f64).min(1.0),
-            evaluator_count: responses.len(),
-        })
-    }
-
-    fn select_best_response(&self, responses: Vec<MinerResponse>) -> Result<InferenceResult> {
-        let mut best: Option<(f64, InferenceResult)> = None;
-
-        for resp in responses {
-            if let MycelSynapseResult::Inference(result) = resp.result {
-                let score = result.quality_score * resp.stake_weight;
-
-                if best
-                    .as_ref()
-                    .is_none_or(|(best_score, _)| score > *best_score)
-                {
-                    best = Some((score, result));
-                }
-            }
-        }
-
-        best.map(|(_, r)| r)
-            .ok_or_else(|| anyhow!("No valid inference results"))
-    }
-
-    fn merge_semantic_results(
-        &self,
-        responses: Vec<MinerResponse>,
-        k: usize,
-    ) -> Result<Vec<SemanticMatch>> {
-        let mut all_matches: Vec<SemanticMatch> = Vec::new();
-
-        for resp in responses {
-            if let MycelSynapseResult::SemanticSearch(matches) = resp.result {
-                all_matches.extend(matches);
-            }
-        }
-
-        // Sort by similarity and deduplicate
-        all_matches.sort_by(|a, b| {
-            b.similarity
-                .partial_cmp(&a.similarity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        all_matches.dedup_by(|a, b| a.pattern_id == b.pattern_id);
-        all_matches.truncate(k);
-
-        Ok(all_matches)
-    }
-}
-
-/// Bittensor configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BittensorConfig {
-    /// Subnet UID for Mycel
-    pub subnet_uid: u16,
-
-    /// API endpoint URL
-    pub api_url: String,
-
-    /// Wallet path
-    pub wallet_path: Option<String>,
-
-    /// Maximum miners to query
-    pub max_miners_to_query: usize,
-
-    /// Timeouts
-    pub evaluation_timeout_secs: u64,
-    pub inference_timeout_secs: u64,
-    pub search_timeout_secs: u64,
-
-    /// Inference settings
-    pub max_inference_tokens: u32,
-    pub min_semantic_similarity: f32,
-
-    /// Verify connection on start
-    pub verify_on_start: bool,
-}
-
-impl Default for BittensorConfig {
-    fn default() -> Self {
-        Self {
-            subnet_uid: 32, // Hypothetical Clay subnet
-            api_url: "https://api.bittensor.com".to_string(),
-            wallet_path: None,
-            max_miners_to_query: 10,
-            evaluation_timeout_secs: 30,
-            inference_timeout_secs: 60,
-            search_timeout_secs: 10,
-            max_inference_tokens: 2048,
-            min_semantic_similarity: 0.7,
-            verify_on_start: true,
-        }
-    }
-}
-
-/// Bittensor wallet
-#[derive(Debug, Clone)]
-pub struct BittensorWallet {
-    pub name: String,
-    pub hotkey: String,
-    pub coldkey: String,
-}
-
-impl BittensorWallet {
-    pub fn load(_path: &str) -> Result<Self> {
-        // In production, load from encrypted wallet file
-        warn!("Wallet loading not fully implemented");
-        Ok(Self {
-            name: "default".to_string(),
-            hotkey: "mock_hotkey".to_string(),
-            coldkey: "mock_coldkey".to_string(),
-        })
-    }
-}
-
-// Network data structures
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Metagraph {
-    pub neurons: Vec<Neuron>,
-    pub block: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Neuron {
-    pub uid: u16,
-    pub hotkey: String,
-    pub stake: f64,
-    pub incentive: f64,
-    pub is_active: bool,
-    pub is_validator: bool,
-    pub axon_info: Option<AxonInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AxonInfo {
-    pub ip: String,
-    pub port: u16,
-}
-
-// Synapse types
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MycelSynapse {
-    EvaluatePattern(EvaluationRequest),
-    Inference(InferenceRequest),
-    SemanticSearch(SemanticSearchRequest),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvaluationRequest {
-    pub pattern_id: PatternId,
-    pub pattern_trigger: String,
-    pub pattern_solution: String,
-    pub domain: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InferenceRequest {
-    pub query: String,
-    pub context: String,
-    pub available_patterns: Vec<PatternId>,
-    pub max_tokens: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SemanticSearchRequest {
-    pub embedding: Vec<f32>,
-    pub k: usize,
-    pub min_similarity: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MinerRequest {
-    pub synapse: MycelSynapse,
-    pub timeout: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MinerResponse {
-    pub result: MycelSynapseResult,
-    pub process_time: f64,
-    pub stake_weight: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MycelSynapseResult {
-    Evaluation(EvaluationResponse),
-    Inference(InferenceResult),
-    SemanticSearch(Vec<SemanticMatch>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvaluationResponse {
-    pub score: f64,
-    pub relevance: f64,
-    pub quality: f64,
-    pub safety: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Result of evaluating a pattern's quality.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvaluationResult {
     pub score: f64,
     pub confidence: f64,
     pub evaluator_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InferenceResult {
-    pub response: String,
-    pub quality_score: f64,
-    pub patterns_used: Vec<PatternId>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SemanticMatch {
-    pub pattern_id: PatternId,
-    pub similarity: f64,
-    pub metadata_cid: String,
-}
-
-// Validator messages
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ValidatorMessage {
-    PatternOutcome(OutcomeReport),
-    GradientSubmission(GradientSubmission),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutcomeReport {
-    pub pattern_id: PatternId,
-    pub success: bool,
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GradientSubmission {
-    pub model_id: String,
-    pub gradient_hash: String,
-    pub compressed_gradients: Vec<u8>,
-    pub sample_count: usize,
-    pub privacy_budget_used: f64,
-}
-
+/// Private gradients structure used by federated privacy helpers.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrivateGradients {
     pub model_id: String,
@@ -616,23 +29,189 @@ pub struct PrivateGradients {
     pub epsilon: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelWeights {
-    pub model_id: String,
-    pub version: u64,
-    pub weights_cid: String,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+/// Bittensor pattern evaluator client.
+#[derive(Clone, Debug)]
+pub struct BittensorClient {
+    api_url: Option<String>,
+    network: String,
+    subnet: u16,
+    http_client: reqwest::Client,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BalanceResponse {
-    pub balance: f64,
+impl BittensorClient {
+    /// Create a new Bittensor evaluator client.
+    pub fn new(api_url: Option<String>, network: String, subnet: u16) -> Result<Self> {
+        let normalized_url = api_url
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty());
+
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(DEFAULT_EVAL_TIMEOUT_SECS))
+            .build()
+            .context("Failed to build Bittensor HTTP client")?;
+
+        Ok(Self {
+            api_url: normalized_url,
+            network,
+            subnet,
+            http_client,
+        })
+    }
+
+    /// Evaluate a pattern record using the configured HTTP `/evaluate` endpoint
+    /// if reachable, falling back deterministically to `score_pattern_locally`.
+    pub async fn evaluate_pattern_record(
+        &self,
+        name: &str,
+        description: &str,
+        category: &str,
+    ) -> EvaluationResult {
+        if let Some(ref base_url) = self.api_url {
+            let endpoint = format!("{}/evaluate", base_url);
+            let payload = serde_json::json!({
+                "name": name,
+                "description": description,
+                "category": category,
+                "network": self.network,
+                "subnet": self.subnet,
+            });
+
+            match self.http_client.post(&endpoint).json(&payload).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(parsed) = resp.json::<EvaluationResult>().await {
+                        return EvaluationResult {
+                            score: sanitize_unit_float(parsed.score, 0.5),
+                            confidence: sanitize_unit_float(parsed.confidence, 0.5),
+                            evaluator_count: parsed.evaluator_count,
+                        };
+                    }
+                    debug!("Bittensor /evaluate returned unparseable JSON; using local fallback");
+                }
+                Ok(resp) => {
+                    debug!(
+                        "Bittensor /evaluate returned HTTP {}; using local fallback",
+                        resp.status()
+                    );
+                }
+                Err(err) => {
+                    debug!(
+                        "Bittensor /evaluate unreachable ({}); using local fallback",
+                        err
+                    );
+                }
+            }
+        }
+
+        score_pattern_locally(name, description, category)
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RewardsSummary {
-    pub total_earned: f64,
-    pub last_day: f64,
-    pub last_week: f64,
-    pub rank: u32,
+/// Deterministically compute a local quality score in `[0.0, 1.0]` with zero panics.
+pub fn score_pattern_locally(name: &str, description: &str, category: &str) -> EvaluationResult {
+    let name_trimmed = name.trim();
+    let desc_trimmed = description.trim();
+    let cat_trimmed = category.trim();
+
+    if name_trimmed.is_empty() && desc_trimmed.is_empty() {
+        return EvaluationResult {
+            score: 0.05,
+            confidence: 0.5,
+            evaluator_count: 1,
+        };
+    }
+
+    let name_words = name_trimmed.split_whitespace().count();
+    let desc_words = desc_trimmed.split_whitespace().count();
+    let desc_chars = desc_trimmed.chars().count();
+
+    let name_component = (name_words.min(6) as f64 / 6.0) * 0.25;
+    let desc_word_component = (desc_words.min(20) as f64 / 20.0) * 0.45;
+    let desc_len_component = (desc_chars.min(160) as f64 / 160.0) * 0.20;
+    let cat_component = if cat_trimmed.is_empty() { 0.0 } else { 0.10 };
+
+    let score =
+        (name_component + desc_word_component + desc_len_component + cat_component).clamp(0.0, 1.0);
+
+    EvaluationResult {
+        score,
+        confidence: 0.6,
+        evaluator_count: 1,
+    }
+}
+
+fn sanitize_unit_float(val: f64, fallback: f64) -> f64 {
+    if val.is_finite() {
+        val.clamp(0.0, 1.0)
+    } else {
+        fallback
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn local_scoring_is_deterministic_and_bounded() {
+        let a = score_pattern_locally(
+            "Rust Error Handling",
+            "Use anyhow::Result and ? propagation instead of unwrap in production code",
+            "coding",
+        );
+        let b = score_pattern_locally(
+            "Rust Error Handling",
+            "Use anyhow::Result and ? propagation instead of unwrap in production code",
+            "coding",
+        );
+        assert_eq!(a, b);
+        assert!((0.0..=1.0).contains(&a.score));
+        assert!(a.score > 0.5);
+
+        let empty = score_pattern_locally("", "", "");
+        assert!((0.0..=1.0).contains(&empty.score));
+        assert!(empty.score < a.score);
+    }
+
+    #[tokio::test]
+    async fn bittensor_client_uses_http_endpoint_and_falls_back_offline() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock bittensor");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"score":0.91,"confidence":0.88,"evaluator_count":7}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let client =
+            BittensorClient::new(Some(format!("http://{}", addr)), "finney".to_string(), 32)
+                .expect("client");
+        let eval = client
+            .evaluate_pattern_record("test", "a helpful pattern", "coding")
+            .await;
+        assert!((eval.score - 0.91).abs() < 1e-6);
+        assert!((eval.confidence - 0.88).abs() < 1e-6);
+        assert_eq!(eval.evaluator_count, 7);
+
+        let offline = BittensorClient::new(None, "finney".to_string(), 0).expect("offline");
+        let local_eval = offline
+            .evaluate_pattern_record("test", "a helpful pattern", "coding")
+            .await;
+        assert_eq!(
+            local_eval,
+            score_pattern_locally("test", "a helpful pattern", "coding")
+        );
+    }
 }

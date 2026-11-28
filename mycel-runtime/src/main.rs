@@ -34,6 +34,7 @@ mod recovery;
 mod selfdev;
 mod sync;
 mod ui;
+mod wine;
 
 use crate::config::MycelConfig;
 
@@ -162,6 +163,10 @@ async fn main() -> Result<()> {
         .set_context_manager(context_manager.clone())
         .await;
 
+    let collective_service =
+        collective::CollectiveService::new(&config, args.no_collective).await?;
+    let wine_service = wine::WineService::new(&config);
+
     // Create the main runtime
     let runtime = MycelRuntime {
         config,
@@ -175,6 +180,8 @@ async fn main() -> Result<()> {
         mcp_manager,
         selfdev,
         command_registry,
+        collective_service,
+        wine_service,
         event_bus,
     };
 
@@ -247,6 +254,8 @@ pub struct MycelRuntime {
     pub mcp_manager: mcp::McpManager,
     pub selfdev: selfdev::SelfDevService,
     pub command_registry: commands::CommandRegistry,
+    pub collective_service: collective::CollectiveService,
+    pub wine_service: wine::WineService,
     pub event_bus: tokio::sync::broadcast::Sender<events::SystemEvent>,
 }
 
@@ -1480,6 +1489,10 @@ mod tests {
         let selfdev =
             selfdev::SelfDevService::new(config.selfdev.clone(), dir.join("selfdev.json")).await;
         let command_registry = commands::CommandRegistry::load(dir.join("commands.json")).await;
+        let collective_service = collective::CollectiveService::new(&config, false)
+            .await
+            .unwrap();
+        let wine_service = wine::WineService::new(&config);
 
         MycelRuntime {
             config,
@@ -1493,6 +1506,8 @@ mod tests {
             mcp_manager,
             selfdev,
             command_registry,
+            collective_service,
+            wine_service,
             event_bus,
         }
     }

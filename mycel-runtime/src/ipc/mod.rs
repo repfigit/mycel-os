@@ -758,6 +758,18 @@ async fn process_request(
                         IpcResponse::Ok {
                             message: format!("Action {} denied", pending.id),
                         }
+                    } else if let Some(payload) = pending.code.strip_prefix(WINE_CONFIRM_PREFIX) {
+                        match serde_json::from_str::<PendingWineRun>(payload) {
+                            Ok(req) => wine_result_to_ipc(
+                                runtime
+                                    .wine_service
+                                    .run_windows_app(&req.app_name, &req.exe_path, &req.args)
+                                    .await,
+                            ),
+                            Err(e) => IpcResponse::Error {
+                                message: format!("Invalid pending Wine request: {}", e),
+                            },
+                        }
                     } else {
                         execute_and_report(runtime, &pending.code).await
                     }
@@ -865,8 +877,162 @@ async fn process_request(
                 },
             }
         }
+        IpcRequest::CollectiveStatus => {
+            let status = runtime.collective_service.status().await;
+            IpcResponse::CollectiveStatus {
+                enabled: status.enabled,
+                near_network: status.near_network,
+                near_rpc_url: status.near_rpc_url,
+                near_account: status.near_account,
+                near_connected: status.near_connected,
+                ipfs_enabled: status.ipfs_enabled,
+                ipfs_api: status.ipfs_api,
+                bittensor_enabled: status.bittensor_enabled,
+                local_patterns: status.local_patterns,
+                patterns_shared: status.patterns_shared,
+                share_patterns_enabled: status.share_patterns_enabled,
+            }
+        }
+        IpcRequest::ListPatterns => {
+            let patterns = runtime.collective_service.list_patterns().await;
+            IpcResponse::Patterns { patterns }
+        }
+        IpcRequest::SharePattern {
+            name,
+            description,
+            category,
+        } => match runtime
+            .collective_service
+            .share_pattern(name, description, category)
+            .await
+        {
+            Ok(pattern) => IpcResponse::PatternShared { pattern },
+            Err(e) => IpcResponse::Error {
+                message: e.to_string(),
+            },
+        },
+        IpcRequest::WineStatus => {
+            let status = runtime.wine_service.status().await;
+            IpcResponse::WineStatus {
+                enabled: status.enabled,
+                available: status.available,
+                wine_binary: status.wine_binary,
+                resolved_binary: status.resolved_binary,
+                wine_version: status.wine_version,
+                prefix_root: status.prefix_root,
+                sandbox_with_bwrap: status.sandbox_with_bwrap,
+                allow_network: status.allow_network,
+                prefixes: status.prefixes,
+                install_guidance: status.install_guidance,
+            }
+        }
+        IpcRequest::RunWindowsApp {
+            app_name,
+            exe_path,
+            args,
+        } => {
+            if !runtime.wine_service.is_enabled() {
+                return IpcResponse::Error {
+                    message: "Wine subsystem is disabled; set [wine] enabled = true in config.toml to run Windows applications.".to_string(),
+                };
+            }
+            if let Err(e) = crate::wine::WineService::sanitize_app_name(app_name) {
+                return IpcResponse::Error {
+                    message: e.to_string(),
+                };
+            }
+            if let Err(e) = crate::wine::WineService::validate_exe_path(exe_path) {
+                return IpcResponse::Error {
+                    message: e.to_string(),
+                };
+            }
+
+            let command_display = if args.is_empty() {
+                format!("wine {}", exe_path)
+            } else {
+                format!("wine {} {}", exe_path, args.join(" "))
+            };
+            use crate::policy::ActionPolicy;
+            match runtime.policy_evaluator.evaluate_code(&command_display) {
+                ActionPolicy::Deny { reason } => IpcResponse::Error {
+                    message: format!("denied by policy: {}", reason),
+                },
+                ActionPolicy::RequiresConfirmation { message, .. } => {
+                    let payload = PendingWineRun {
+                        app_name: app_name.clone(),
+                        exe_path: exe_path.clone(),
+                        args: args.clone(),
+                    };
+                    let marker = match serde_json::to_string(&payload) {
+                        Ok(json) => format!("{}{}", WINE_CONFIRM_PREFIX, json),
+                        Err(e) => {
+                            return IpcResponse::Error {
+                                message: format!("Failed to encode Wine confirmation: {}", e),
+                            };
+                        }
+                    };
+                    let pending = runtime
+                        .confirmations
+                        .insert(session_id, "run_windows_app", &marker, &message)
+                        .await;
+                    let _ =
+                        runtime
+                            .event_bus
+                            .send(crate::events::SystemEvent::ConfirmationRequired {
+                                id: pending.id.clone(),
+                                session_id: session_id.clone(),
+                                command: command_display.clone(),
+                                reason: message.clone(),
+                            });
+                    IpcResponse::ConfirmationRequired {
+                        id: pending.id,
+                        action: pending.action,
+                        code: command_display,
+                        reason: message,
+                    }
+                }
+                ActionPolicy::Allow => wine_result_to_ipc(
+                    runtime
+                        .wine_service
+                        .run_windows_app(app_name, exe_path, args)
+                        .await,
+                ),
+            }
+        }
         IpcRequest::Ping => IpcResponse::Pong,
     }
+}
+
+const WINE_CONFIRM_PREFIX: &str = "#!wine\n";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingWineRun {
+    app_name: String,
+    exe_path: String,
+    args: Vec<String>,
+}
+
+fn wine_result_to_ipc(res: Result<crate::wine::WineRunResult>) -> IpcResponse {
+    match res {
+        Ok(r) => IpcResponse::WineResult {
+            app_name: r.app_name,
+            exe_path: r.exe_path,
+            prefix_path: r.prefix_path,
+            sandboxed: r.sandboxed,
+            exit_code: r.exit_code,
+            timed_out: r.timed_out,
+            stdout: r.stdout,
+            stderr: r.stderr,
+            success: r.success,
+        },
+        Err(e) => IpcResponse::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn default_pattern_category() -> String {
+    "general".to_string()
 }
 
 /// LLM provider selection
@@ -939,6 +1105,26 @@ pub enum IpcRequest {
         provider: String,
         #[serde(default)]
         model: Option<String>,
+    },
+    /// Get collective network status
+    CollectiveStatus,
+    /// List stored collective patterns
+    ListPatterns,
+    /// Share a pattern with the collective (PII-redacted)
+    SharePattern {
+        name: String,
+        description: String,
+        #[serde(default = "default_pattern_category")]
+        category: String,
+    },
+    /// Get Wine compatibility subsystem status
+    WineStatus,
+    /// Run a Windows executable inside an isolated Wine prefix
+    RunWindowsApp {
+        app_name: String,
+        exe_path: String,
+        #[serde(default)]
+        args: Vec<String>,
     },
     /// Ping for health check (allowed without auth)
     Ping,
@@ -1018,6 +1204,53 @@ pub enum IpcResponse {
         active_provider: Option<String>,
         active_model: Option<String>,
         providers: Vec<crate::ai::providers::ProviderSummary>,
+    },
+    /// Collective network status
+    CollectiveStatus {
+        enabled: bool,
+        near_network: String,
+        near_rpc_url: String,
+        near_account: String,
+        near_connected: bool,
+        ipfs_enabled: bool,
+        ipfs_api: String,
+        bittensor_enabled: bool,
+        local_patterns: usize,
+        patterns_shared: usize,
+        share_patterns_enabled: bool,
+    },
+    /// Stored collective patterns
+    Patterns {
+        patterns: Vec<crate::collective::patterns::CollectivePatternRecord>,
+    },
+    /// Newly shared pattern record
+    PatternShared {
+        pattern: crate::collective::patterns::CollectivePatternRecord,
+    },
+    /// Wine compatibility subsystem status
+    WineStatus {
+        enabled: bool,
+        available: bool,
+        wine_binary: String,
+        resolved_binary: Option<String>,
+        wine_version: Option<String>,
+        prefix_root: String,
+        sandbox_with_bwrap: bool,
+        allow_network: bool,
+        prefixes: Vec<String>,
+        install_guidance: Option<String>,
+    },
+    /// Result of running a Windows application via Wine
+    WineResult {
+        app_name: String,
+        exe_path: String,
+        prefix_path: String,
+        sandboxed: bool,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        stdout: String,
+        stderr: String,
+        success: bool,
     },
     /// Error response
     Error { message: String },
@@ -1359,6 +1592,10 @@ mod tests {
                 .await;
         let command_registry =
             crate::commands::CommandRegistry::load(dir.join("commands.json")).await;
+        let collective_service = crate::collective::CollectiveService::new(&config, false)
+            .await
+            .unwrap();
+        let wine_service = crate::wine::WineService::new(&config);
 
         crate::MycelRuntime {
             config,
@@ -1372,6 +1609,8 @@ mod tests {
             mcp_manager,
             selfdev,
             command_registry,
+            collective_service,
+            wine_service,
             event_bus,
         }
     }
@@ -2329,6 +2568,185 @@ mod tests {
 
         handle.abort();
         drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_collective_disabled_and_enabled_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "mycel-ipc-collective-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut runtime = build_test_runtime(&dir).await;
+        let mut session = "collective-test".to_string();
+
+        // 1. Disabled by default: CollectiveStatus reports !enabled, ListPatterns empty, SharePattern refused.
+        match process_request(&IpcRequest::CollectiveStatus, &runtime, &mut session).await {
+            IpcResponse::CollectiveStatus {
+                enabled,
+                local_patterns,
+                ..
+            } => {
+                assert!(!enabled);
+                assert_eq!(local_patterns, 0);
+            }
+            other => panic!("expected CollectiveStatus, got {other:?}"),
+        }
+
+        match process_request(&IpcRequest::ListPatterns, &runtime, &mut session).await {
+            IpcResponse::Patterns { patterns } => assert!(patterns.is_empty()),
+            other => panic!("expected empty Patterns, got {other:?}"),
+        }
+
+        match process_request(
+            &IpcRequest::SharePattern {
+                name: "test".to_string(),
+                description: "desc".to_string(),
+                category: "general".to_string(),
+            },
+            &runtime,
+            &mut session,
+        )
+        .await
+        {
+            IpcResponse::Error { message } => {
+                assert!(
+                    message.to_lowercase().contains("disabled"),
+                    "expected disabled error, got: {message}"
+                );
+            }
+            other => panic!("expected Error when collective disabled, got {other:?}"),
+        }
+
+        // 2. Enabled with share_patterns = true: PII is redacted and pattern persists across reloads.
+        runtime.config.collective.enabled = true;
+        runtime.config.collective.share_patterns = true;
+        runtime.collective_service =
+            crate::collective::CollectiveService::new(&runtime.config, false)
+                .await
+                .unwrap();
+
+        match process_request(
+            &IpcRequest::SharePattern {
+                name: "net-diag".to_string(),
+                description: "Contact alice@example.com or check /home/alice/.ssh/config for help"
+                    .to_string(),
+                category: "network".to_string(),
+            },
+            &runtime,
+            &mut session,
+        )
+        .await
+        {
+            IpcResponse::PatternShared { pattern } => {
+                assert_eq!(pattern.name, "net-diag");
+                assert_eq!(pattern.category, "network");
+                assert!(!pattern.description.contains("alice@example.com"));
+                assert!(!pattern.description.contains("/home/alice"));
+                assert!(!pattern.approved_for_execution);
+            }
+            other => panic!("expected PatternShared, got {other:?}"),
+        }
+
+        match process_request(&IpcRequest::ListPatterns, &runtime, &mut session).await {
+            IpcResponse::Patterns { patterns } => {
+                assert_eq!(patterns.len(), 1);
+                assert_eq!(patterns[0].name, "net-diag");
+            }
+            other => panic!("expected Patterns with 1 entry, got {other:?}"),
+        }
+
+        // Reload CollectiveService from the same context_path to verify persistence.
+        let reloaded = crate::collective::CollectiveService::new(&runtime.config, false)
+            .await
+            .unwrap();
+        let persisted = reloaded.list_patterns().await;
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].name, "net-diag");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_wine_disabled_and_validation() {
+        let dir =
+            std::env::temp_dir().join(format!("mycel-ipc-wine-test-{}", uuid::Uuid::new_v4()));
+        let mut runtime = build_test_runtime(&dir).await;
+        let mut session = "wine-test".to_string();
+
+        // 1. Disabled by default: WineStatus reports !enabled, RunWindowsApp refused cleanly.
+        match process_request(&IpcRequest::WineStatus, &runtime, &mut session).await {
+            IpcResponse::WineStatus {
+                enabled,
+                sandbox_with_bwrap,
+                allow_network,
+                ..
+            } => {
+                assert!(!enabled);
+                assert!(sandbox_with_bwrap);
+                assert!(!allow_network);
+            }
+            other => panic!("expected WineStatus, got {other:?}"),
+        }
+
+        match process_request(
+            &IpcRequest::RunWindowsApp {
+                app_name: "notepad".to_string(),
+                exe_path: "/tmp/notepad.exe".to_string(),
+                args: vec![],
+            },
+            &runtime,
+            &mut session,
+        )
+        .await
+        {
+            IpcResponse::Error { message } => {
+                assert!(
+                    message.to_lowercase().contains("disabled"),
+                    "expected disabled error, got: {message}"
+                );
+            }
+            other => panic!("expected Error when wine disabled, got {other:?}"),
+        }
+
+        // 2. Enabled: path traversal in app_name or exe_path is rejected.
+        runtime.config.wine.enabled = true;
+        runtime.wine_service = crate::wine::WineService::new(&runtime.config);
+
+        match process_request(
+            &IpcRequest::RunWindowsApp {
+                app_name: "../escape".to_string(),
+                exe_path: "/tmp/app.exe".to_string(),
+                args: vec![],
+            },
+            &runtime,
+            &mut session,
+        )
+        .await
+        {
+            IpcResponse::Error { message } => {
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected Error for invalid app_name, got {other:?}"),
+        }
+
+        match process_request(
+            &IpcRequest::RunWindowsApp {
+                app_name: "goodapp".to_string(),
+                exe_path: "../evil.exe".to_string(),
+                args: vec![],
+            },
+            &runtime,
+            &mut session,
+        )
+        .await
+        {
+            IpcResponse::Error { message } => {
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected Error for path traversal exe_path, got {other:?}"),
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

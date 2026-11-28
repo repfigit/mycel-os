@@ -116,27 +116,39 @@ max_candidate_bytes = 32768
 require_repeat_check = false
 
 [collective]
-# Decentralized network participation
+# Decentralized network participation (opt-in, off by default)
 enabled = false
 
 # NEAR Protocol (coordination, registry, payments)
 near_network = "testnet"  # or "mainnet"
+near_rpc_url = "https://rpc.testnet.near.org"
 near_account = ""
 near_contract = "patterns.mycel.testnet"
 
-# Bittensor (AI evaluation, rewards)
+# IPFS (pattern storage via local Kubo HTTP RPC)
+ipfs_enabled = false
+ipfs_api = "http://127.0.0.1:5001"
+
+# Bittensor (AI evaluation, rewards via HTTP bridge)
+bittensor_enabled = false
+# bittensor_api_url = "http://127.0.0.1:8090"
 bittensor_network = "finney"  # or "test"
 bittensor_coldkey = ""
 bittensor_hotkey = ""
 bittensor_subnet = 0  # TBD
 
-# IPFS (pattern storage)
-ipfs_enabled = false
-ipfs_api = "/ip4/127.0.0.1/tcp/5001"
-
 # Privacy settings
 share_patterns = false  # Opt-in to share learned patterns
 differential_privacy_epsilon = 1.0
+
+[wine]
+# Windows application compatibility via Wine (opt-in, off by default)
+enabled = false
+wine_binary = "wine"
+sandbox_with_bwrap = true
+allow_network = false
+timeout_secs = 60
+# prefix_root = "/var/lib/mycel/wine-prefixes"
 
 [mesh]
 # Personal device mesh (sync between your devices). Off by default: no UDP

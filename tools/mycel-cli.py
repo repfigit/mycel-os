@@ -388,27 +388,138 @@ def cmd_mesh(args):
 def cmd_collective(args):
     """Collective network commands."""
     if args.collective_cmd == "status":
-        response = send_request({"type": "collective_status"})
-        if "error" in response:
-            print(f"Error: {response['error']}")
-        else:
-            print(f"NEAR Account: {response.get('near_account', 'not configured')}")
-            print(f"Bittensor Hotkey: {response.get('bittensor_hotkey', 'not configured')}")
-            print(f"Patterns Shared: {response.get('patterns_shared', 0)}")
-            print(f"Patterns Adopted: {response.get('patterns_adopted', 0)}")
-            print(f"Rewards Earned: {response.get('rewards', '0 TAO')}")
+        response = send_request({"type": "CollectiveStatus"})
+        _handle_mesh_error(response)
+        enabled = "enabled" if response.get("enabled") else "disabled"
+        print(f"Collective: {enabled}")
+        print(f"NEAR Network: {response.get('near_network', 'unknown')}")
+        print(f"NEAR RPC: {response.get('near_rpc_url', 'unknown')}")
+        print(f"NEAR Account: {response.get('near_account') or 'not configured'}")
+        print(f"NEAR Connected: {'yes' if response.get('near_connected') else 'no'}")
+        print(f"IPFS Enabled: {'yes' if response.get('ipfs_enabled') else 'no'}")
+        print(f"IPFS API: {response.get('ipfs_api', 'unknown')}")
+        print(f"Bittensor Enabled: {'yes' if response.get('bittensor_enabled') else 'no'}")
+        print(f"Share Patterns: {'yes' if response.get('share_patterns_enabled') else 'no'}")
+        print(f"Local Patterns: {response.get('local_patterns', 0)}")
+        print(f"Patterns Shared: {response.get('patterns_shared', 0)}")
+
+    elif args.collective_cmd == "patterns":
+        response = send_request({"type": "ListPatterns"})
+        _handle_mesh_error(response)
+        patterns = response.get("patterns", [])
+        if not patterns:
+            print("No collective patterns stored.")
+            return
+        print(f"Collective Patterns ({len(patterns)}):")
+        for p in patterns:
+            pid = p.get("id", "unknown")
+            name = p.get("name", "unnamed")
+            cat = p.get("category", "general")
+            desc = p.get("description", "")
+            cid = p.get("ipfs_cid")
+            cid_str = f" [cid:{cid}]" if cid else ""
+            print(f"  - {name} ({cat}) [{pid}]{cid_str}: {desc}")
 
     elif args.collective_cmd == "share":
-        response = send_request({"type": "collective_share"})
-        if "error" in response:
-            print(f"Error: {response['error']}")
+        response = send_request({
+            "type": "SharePattern",
+            "name": args.name,
+            "description": args.description,
+            "category": args.category,
+        })
+        _handle_mesh_error(response)
+        pattern = response.get("pattern", {})
+        print(f"Shared pattern: {pattern.get('name', args.name)} ({pattern.get('id', 'unknown')})")
+        if pattern.get("ipfs_cid"):
+            print(f"IPFS CID: {pattern['ipfs_cid']}")
+        print(f"Description: {pattern.get('description', '')}")
+
+
+def _print_wine_result(response: dict) -> None:
+    """Print details from a WineResult response."""
+    print(f"App: {response.get('app_name', 'unknown')}")
+    print(f"Executable: {response.get('exe_path', 'unknown')}")
+    print(f"Prefix: {response.get('prefix_path', 'unknown')}")
+    print(f"Sandboxed: {'yes' if response.get('sandboxed') else 'no'}")
+    print(f"Success: {'yes' if response.get('success') else 'no'}")
+    if response.get("timed_out"):
+        print("Timed Out: yes")
+    if response.get("exit_code") is not None:
+        print(f"Exit Code: {response['exit_code']}")
+    if response.get("stdout"):
+        print(f"Stdout:\n{response['stdout']}")
+    if response.get("stderr"):
+        print(f"Stderr:\n{response['stderr']}")
+
+
+def cmd_wine(args):
+    """Windows app compatibility (Wine) commands."""
+    if args.wine_cmd == "status":
+        response = send_request({"type": "WineStatus"})
+        _handle_mesh_error(response)
+        enabled = "enabled" if response.get("enabled") else "disabled"
+        print(f"Wine: {enabled}")
+        print(f"Binary: {response.get('wine_binary', 'unknown')}")
+        print(f"Available: {'yes' if response.get('available') else 'no'}")
+        if response.get("resolved_binary"):
+            print(f"Resolved Binary: {response['resolved_binary']}")
+        if response.get("wine_version"):
+            print(f"Version: {response['wine_version']}")
+        print(f"Sandbox (bwrap): {'yes' if response.get('sandbox_with_bwrap') else 'no'}")
+        print(f"Allow Network: {'yes' if response.get('allow_network') else 'no'}")
+        if response.get("prefix_root"):
+            print(f"Prefix Root: {response['prefix_root']}")
+        prefixes = response.get("prefixes", [])
+        if prefixes:
+            print(f"Prefixes: {', '.join(prefixes)}")
+        if response.get("install_guidance"):
+            print(f"Guidance: {response['install_guidance']}")
+
+    elif args.wine_cmd == "run":
+        response = send_request({
+            "type": "RunWindowsApp",
+            "app_name": args.app,
+            "exe_path": args.exe,
+            "args": args.args,
+        })
+        if response.get("type") == "Error":
+            print(f"Error: {response.get('message', 'Unknown error')}", file=sys.stderr)
+            sys.exit(1)
+        elif response.get("type") == "ConfirmationRequired":
+            req_id = response.get("id", "")
+            print(f"Confirmation required (id: {req_id})")
+            if response.get("action"):
+                print(f"Action: {response['action']}")
+            if response.get("reason"):
+                print(f"Reason: {response['reason']}")
+            try:
+                ans = input("Confirm? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "n"
+            approved = ans in ("y", "yes")
+            confirm_resp = send_request({
+                "type": "ConfirmAction",
+                "id": req_id,
+                "approved": approved,
+            })
+            if confirm_resp.get("type") == "Error":
+                print(f"Error: {confirm_resp.get('message', 'Unknown error')}", file=sys.stderr)
+                sys.exit(1)
+            elif confirm_resp.get("type") == "WineResult":
+                _print_wine_result(confirm_resp)
+            elif confirm_resp.get("type") == "Ok":
+                print(confirm_resp.get("message", "Ok"))
+            else:
+                print(json.dumps(confirm_resp, indent=2))
+        elif response.get("type") == "WineResult":
+            _print_wine_result(response)
         else:
-            print(f"Shared {response.get('count', 0)} patterns to the collective.")
+            print(json.dumps(response, indent=2))
 
 
 def main():
     # Check for direct query mode first (most common use case)
-    if len(sys.argv) > 1 and sys.argv[1] not in ('chat', 'run', 'status', 'providers', 'provider', 'mesh', 'collective', '-h', '--help', '--version'):
+    if len(sys.argv) > 1 and sys.argv[1] not in ('chat', 'run', 'status', 'providers', 'provider', 'mesh', 'collective', 'wine', '-h', '--help', '--version'):
         # Direct query: mycel "tell me a joke"
         class Args:
             command = sys.argv[1:]
@@ -492,9 +603,32 @@ Environment:
 
     # Collective
     collective_parser = subparsers.add_parser('collective', help='Collective network commands')
-    collective_parser.add_argument('collective_cmd', choices=['status', 'share'],
-                                   help='Collective subcommand')
-    collective_parser.set_defaults(func=cmd_collective)
+    collective_subparsers = collective_parser.add_subparsers(dest='collective_cmd', required=True)
+
+    collective_status_parser = collective_subparsers.add_parser('status', help='Show collective status')
+    collective_status_parser.set_defaults(func=cmd_collective)
+
+    collective_patterns_parser = collective_subparsers.add_parser('patterns', help='List stored collective patterns')
+    collective_patterns_parser.set_defaults(func=cmd_collective)
+
+    collective_share_parser = collective_subparsers.add_parser('share', help='Share a pattern with the collective')
+    collective_share_parser.add_argument('name', help='Pattern name')
+    collective_share_parser.add_argument('description', help='Pattern description')
+    collective_share_parser.add_argument('--category', default='general', help='Pattern category (default: general)')
+    collective_share_parser.set_defaults(func=cmd_collective)
+
+    # Wine
+    wine_parser = subparsers.add_parser('wine', help='Windows application compatibility (Wine)')
+    wine_subparsers = wine_parser.add_subparsers(dest='wine_cmd', required=True)
+
+    wine_status_parser = wine_subparsers.add_parser('status', help='Show Wine subsystem status')
+    wine_status_parser.set_defaults(func=cmd_wine)
+
+    wine_run_parser = wine_subparsers.add_parser('run', help='Run a Windows executable in an isolated Wine prefix')
+    wine_run_parser.add_argument('app', help='Application name (used for Wine prefix isolation)')
+    wine_run_parser.add_argument('exe', help='Path to Windows executable (.exe)')
+    wine_run_parser.add_argument('args', nargs=argparse.REMAINDER, help='Arguments passed to the executable')
+    wine_run_parser.set_defaults(func=cmd_wine)
 
     args = parser.parse_args()
 
