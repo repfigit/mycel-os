@@ -155,12 +155,21 @@ sync_ai_context = false
 # Discovery (only advertises/accepts devices listed in trusted_peers)
 mdns_enabled = true
 
+# NAT traversal (safe defaults; STUN only runs when stun_servers is non-empty)
+stun_servers = []
+persistent_keepalive_secs = 25
+
+# Zero-knowledge E2E-encrypted relay (opt-in, off by default)
+relay_enabled = false
+# relay_addr = "relay.example.com:51822"
+relay_server_enabled = false
+# relay_listen_addr = "0.0.0.0:51822"
+
 # --- Planned, not yet implemented by the runtime ---
 # interface = "mycel0"
 # sync_config = true
 # sync_patterns = true
 # sync_documents = false
-# relay_enabled = true
 
 [ui]
 # Interface settings

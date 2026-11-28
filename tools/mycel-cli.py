@@ -341,6 +341,10 @@ def cmd_mesh(args):
             print(f"Interface: {response['interface']}")
         if response.get("listen_addr"):
             print(f"Listen Addr: {response['listen_addr']}")
+        if response.get("public_endpoint"):
+            print(f"Public Endpoint: {response['public_endpoint']}")
+        relay_status = "connected" if bool(response.get("relay_connected", False)) else "disconnected"
+        print(f"Relay: {relay_status}")
         print(f"Trusted Peers: {response.get('trusted_peers', 0)}")
         print(f"Connected Peers: {response.get('connected_peers', 0)}")
         print(f"Event Log Length: {response.get('event_log_len', 0)}")

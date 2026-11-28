@@ -208,6 +208,10 @@ pub enum IpcResponse {
         transport: String,
         interface: Option<String>,
         listen_addr: Option<String>,
+        #[serde(default)]
+        public_endpoint: Option<String>,
+        #[serde(default)]
+        relay_connected: bool,
         trusted_peers: usize,
         connected_peers: usize,
         event_log_len: usize,
@@ -378,6 +382,8 @@ mod tests {
                 transport: "wireguard".to_string(),
                 interface: Some("wg0".to_string()),
                 listen_addr: Some("0.0.0.0:51820".to_string()),
+                public_endpoint: Some("203.0.113.5:51820".to_string()),
+                relay_connected: true,
                 trusted_peers: 2,
                 connected_peers: 1,
                 event_log_len: 15,
@@ -652,6 +658,39 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<IpcResponse>(&added_json).unwrap(),
             added_resp
+        );
+    }
+
+    #[test]
+    fn test_sync_status_legacy_payload_defaults() {
+        let legacy_json = r#"{
+            "type": "SyncStatus",
+            "enabled": true,
+            "device_id": "legacy-node",
+            "transport": "wireguard",
+            "interface": "wg0",
+            "listen_addr": "0.0.0.0:51820",
+            "trusted_peers": 1,
+            "connected_peers": 0,
+            "event_log_len": 3,
+            "peers": []
+        }"#;
+        let parsed: IpcResponse = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(
+            parsed,
+            IpcResponse::SyncStatus {
+                enabled: true,
+                device_id: "legacy-node".to_string(),
+                transport: "wireguard".to_string(),
+                interface: Some("wg0".to_string()),
+                listen_addr: Some("0.0.0.0:51820".to_string()),
+                public_endpoint: None,
+                relay_connected: false,
+                trusted_peers: 1,
+                connected_peers: 0,
+                event_log_len: 3,
+                peers: vec![],
+            }
         );
     }
 }
