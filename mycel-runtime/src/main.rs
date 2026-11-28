@@ -30,6 +30,7 @@ mod ipc;
 mod mcp;
 mod models;
 mod policy;
+mod recovery;
 mod selfdev;
 mod sync;
 mod ui;
@@ -169,6 +170,7 @@ async fn main() -> Result<()> {
         mcp_manager,
         selfdev,
         command_registry,
+        event_bus,
     };
 
     let ipc_server = ipc::IpcServer::new(&runtime).await?;
@@ -209,6 +211,7 @@ pub struct MycelRuntime {
     pub mcp_manager: mcp::McpManager,
     pub selfdev: selfdev::SelfDevService,
     pub command_registry: commands::CommandRegistry,
+    pub event_bus: tokio::sync::broadcast::Sender<events::SystemEvent>,
 }
 
 impl MycelRuntime {
@@ -292,12 +295,17 @@ impl MycelRuntime {
 
             // Pending code execution?
             if confirmed {
-                // User confirmed - clear and execute
+                // User confirmed - clear and execute (never auto-repaired, but
+                // failures are still reported on the event bus).
                 self.context_manager
                     .clear_pending_command(session_id)
                     .await?;
-                let output = self.executor.run(pending_code).await?;
-                return Ok(RuntimeResponse::Text(output));
+                let report = self.executor.run_detailed(pending_code).await?;
+                if !report.succeeded() {
+                    let class = recovery::classify_failure(&report);
+                    self.emit_execution_failed(&report, class);
+                }
+                return Ok(RuntimeResponse::Text(report.combined_output()));
             } else if denied {
                 // User denied - clear and inform
                 self.context_manager
@@ -335,16 +343,21 @@ impl MycelRuntime {
         // like a CLI command invocation (never plain single-word chat or slash
         // commands), and always shell-escape the `which` query.
         if let Some(probe_cmd) = extract_command_probe(input_trimmed) {
-            let check = self.executor.run(&build_which_command(probe_cmd)).await;
-            if let Ok(result) = &check {
-                let out = result.trim();
-                // `which` exits non-zero with no output when the command is
-                // missing; the executor surfaces that as an empty string OR a
-                // "Command exited with code" placeholder. Both mean "not found".
-                let not_found = out.is_empty() || out.starts_with("Command exited with code");
-                if not_found {
-                    // Command not found - search for package
-                    return self.handle_missing_command(probe_cmd).await;
+            let check = self
+                .executor
+                .run_detailed(&build_which_command(probe_cmd))
+                .await;
+            if let Ok(report) = &check {
+                // Skip inconclusive probes (missing sandbox, timeout, signal)
+                // so ordinary chat falls through to the LLM instead of failing.
+                if !report.sandbox_unavailable && !report.timed_out && report.signal.is_none() {
+                    // `which` prints the resolved path on success and nothing when
+                    // the command is missing.
+                    let found = report.succeeded() && !report.stdout.trim().is_empty();
+                    if !found {
+                        // Command not found - search for package
+                        return self.handle_missing_command(probe_cmd).await;
+                    }
                 }
             }
         }
@@ -412,17 +425,7 @@ impl MycelRuntime {
         use crate::policy::ActionPolicy;
 
         match self.policy_evaluator.evaluate_code(code) {
-            ActionPolicy::Allow => {
-                let output = self.executor.run(code).await?;
-
-                // Only treat output as a missing command when the shell itself
-                // reports that the invoked command was not found.
-                if let Some(cmd) = detect_missing_command_in_output(code, &output) {
-                    return self.handle_missing_command(&cmd).await;
-                }
-
-                Ok(RuntimeResponse::Text(output))
-            }
+            ActionPolicy::Allow => self.run_and_recover(code).await,
             ActionPolicy::RequiresConfirmation { message, .. } => {
                 // Store in session and ask user
                 self.context_manager
@@ -437,6 +440,209 @@ impl MycelRuntime {
                 Ok(RuntimeResponse::Text(format!("blocked: {}", reason)))
             }
         }
+    }
+
+    /// Run policy-approved code and, on failure, classify it, emit events, and
+    /// (only when explicitly enabled and safe) attempt a verified repair.
+    async fn run_and_recover(&self, code: &str) -> Result<RuntimeResponse> {
+        let report = self.executor.run_detailed(code).await?;
+        if report.succeeded() {
+            return Ok(RuntimeResponse::Text(report.combined_output()));
+        }
+
+        let class = recovery::classify_failure(&report);
+        self.emit_execution_failed(&report, class);
+
+        // A missing command is fixed by installation, not code repair; route it
+        // to the package-search handler only when the shell diagnostic confirms
+        // the invoked command was missing (never guess from the first token).
+        let combined = report.combined_output();
+        if let Some(cmd) = detect_missing_command_in_output(code, &combined) {
+            return self.handle_missing_command(&cmd).await;
+        }
+
+        if !self.config.recovery.enabled {
+            return Ok(RuntimeResponse::Text(combined));
+        }
+
+        let decision = recovery::decide_recovery(&report, &self.config.recovery, 0);
+        self.emit_recovery_decided(&decision, false, 0);
+
+        match decision {
+            recovery::RecoveryDecision::ProposeRepair { .. } => {
+                self.attempt_repair(code, &report).await
+            }
+            recovery::RecoveryDecision::ReturnFailure { .. } => Ok(RuntimeResponse::Text(combined)),
+            recovery::RecoveryDecision::AbortForInspection { class, reason } => {
+                self.report_execution_limitation(&report, &reason).await;
+                let output = if combined.trim().is_empty() {
+                    format!("execution failed: {}", class.as_str())
+                } else {
+                    combined
+                };
+                Ok(RuntimeResponse::Text(output))
+            }
+        }
+    }
+
+    /// Emit an `ExecutionFailed` event for a failed report.
+    fn emit_execution_failed(
+        &self,
+        report: &executor::ExecutionReport,
+        class: recovery::FailureClass,
+    ) {
+        let _ = self.event_bus.send(events::SystemEvent::ExecutionFailed {
+            language: report.language.as_str().to_string(),
+            failure_class: class.as_str().to_string(),
+            exit_code: report.exit_code,
+            signal: report.signal,
+            timed_out: report.timed_out,
+            sandbox_mode: report.sandbox_mode.as_str().to_string(),
+        });
+    }
+
+    /// Emit a `RecoveryDecided` event for a classification decision.
+    fn emit_recovery_decided(
+        &self,
+        decision: &recovery::RecoveryDecision,
+        verified: bool,
+        attempts: u32,
+    ) {
+        let _ = self.event_bus.send(events::SystemEvent::RecoveryDecided {
+            decision: decision.kind_str().to_string(),
+            reason: decision.reason().to_string(),
+            verified,
+            attempts,
+        });
+    }
+
+    /// Report a failed execution to the self-development loop. Only structured
+    /// facts (class, exit code, sandbox mode) are shared - never raw output,
+    /// which may contain secrets.
+    async fn report_execution_limitation(&self, report: &executor::ExecutionReport, reason: &str) {
+        let class = recovery::classify_failure(report);
+        let _ = self
+            .selfdev
+            .report(selfdev::Limitation {
+                kind: selfdev::LimitationKind::ExecutionFailure,
+                summary: format!("generated code failed ({})", class.as_str()),
+                detail: format!(
+                    "sandbox_mode={} exit_code={:?} signal={:?} timed_out={} reason={}",
+                    report.sandbox_mode.as_str(),
+                    report.exit_code,
+                    report.signal,
+                    report.timed_out,
+                    reason
+                ),
+                suggestion: Some(
+                    "Improve code generation or expand tool coverage for this task.".to_string(),
+                ),
+            })
+            .await;
+    }
+
+    /// Attempt opt-in, verified repairs of an eligible failure up to
+    /// `config.recovery.max_repair_attempts`. The model may only *propose* a
+    /// candidate; the recovery layer enforces safety preconditions and
+    /// postconditions before anything is accepted.
+    async fn attempt_repair(
+        &self,
+        original_code: &str,
+        report: &executor::ExecutionReport,
+    ) -> Result<RuntimeResponse> {
+        let max_attempts = self.config.recovery.max_repair_attempts;
+        // Require non-empty output so silent no-ops like `true` or `exit 0`
+        // cannot pass verification.
+        let postcondition = recovery::Postcondition {
+            must_not_be_empty: true,
+            ..Default::default()
+        };
+
+        let mut last_feedback: Option<String> = None;
+        let mut last_reason = "repair not verified".to_string();
+
+        for attempt in 0..max_attempts {
+            if !matches!(
+                recovery::decide_recovery(report, &self.config.recovery, attempt),
+                recovery::RecoveryDecision::ProposeRepair { .. }
+            ) {
+                break;
+            }
+
+            let attempt_num = attempt + 1;
+            let prompt = build_repair_prompt(original_code, report, last_feedback.as_deref());
+            let raw = match self
+                .ai_router
+                .generate_with_provider(&prompt, ipc::LlmProvider::Auto)
+                .await
+            {
+                Ok(raw) => raw,
+                Err(e) => {
+                    tracing::debug!("repair generation failed (attempt {}): {}", attempt_num, e);
+                    last_reason = "repair generation failed".to_string();
+                    break;
+                }
+            };
+
+            let Some(candidate) = recovery::extract_repair_candidate(&raw) else {
+                last_feedback = Some("previous reply had no valid fenced code block".to_string());
+                last_reason = "no usable repair candidate".to_string();
+                let _ = self.event_bus.send(events::SystemEvent::RecoveryDecided {
+                    decision: "repair_rejected".to_string(),
+                    reason: last_reason.clone(),
+                    verified: false,
+                    attempts: attempt_num,
+                });
+                continue;
+            };
+
+            let verification = recovery::verify_and_run_repair(
+                original_code,
+                &candidate,
+                &self.executor,
+                &self.policy_evaluator,
+                &self.config.recovery,
+                &postcondition,
+            )
+            .await?;
+
+            let detail = match &verification.reject_reason {
+                Some(reason) => format!("tier {}: {:?}", verification.tier_reached, reason),
+                None => format!("verified at tier {}", verification.tier_reached),
+            };
+
+            let _ = self.event_bus.send(events::SystemEvent::RecoveryDecided {
+                decision: if verification.accepted {
+                    "repair_accepted".to_string()
+                } else {
+                    "repair_rejected".to_string()
+                },
+                reason: detail.clone(),
+                verified: verification.accepted,
+                attempts: attempt_num,
+            });
+
+            if verification.accepted {
+                let output = verification
+                    .report
+                    .as_ref()
+                    .map(executor::ExecutionReport::combined_output)
+                    .unwrap_or_default();
+                return Ok(RuntimeResponse::Text(output));
+            }
+
+            if verification.dangerous_attempt {
+                // Stop immediately on any dangerous candidate rather than retrying.
+                last_reason = "repair rejected: dangerous candidate".to_string();
+                break;
+            }
+
+            last_feedback = Some(detail);
+            last_reason = "repair not verified".to_string();
+        }
+
+        self.report_execution_limitation(report, &last_reason).await;
+        Ok(RuntimeResponse::Text(report.combined_output()))
     }
 
     /// Handle missing command - search repos and offer to install
@@ -591,12 +797,16 @@ impl MycelRuntime {
                 }
             }
             // Check for collision with a real binary.
-            if let Ok(which) = self.executor.run(&build_which_command(&def.name)).await {
-                let out = which.trim();
-                if !out.is_empty() && !out.starts_with("Command exited with code") {
+            if let Ok(report) = self
+                .executor
+                .run_detailed(&build_which_command(&def.name))
+                .await
+            {
+                if report.succeeded() && !report.stdout.trim().is_empty() {
                     preview.push_str(&format!(
                         "\nwarning: '{}' is also a real command at {}. your version takes precedence in chat.",
-                        def.name, out
+                        def.name,
+                        report.stdout.trim()
                     ));
                 }
             }
@@ -744,8 +954,12 @@ Example for 'backup a folder': {{\"params\":[\"folder\"],\"steps\":[\"tar czf ~/
             use crate::policy::ActionPolicy;
             return match self.policy_evaluator.evaluate_code(&expanded) {
                 ActionPolicy::Allow => {
-                    let out = self.executor.run(&expanded).await?;
-                    Ok(RuntimeResponse::Text(out))
+                    let report = self.executor.run_detailed(&expanded).await?;
+                    if !report.succeeded() {
+                        let class = recovery::classify_failure(&report);
+                        self.emit_execution_failed(&report, class);
+                    }
+                    Ok(RuntimeResponse::Text(report.combined_output()))
                 }
                 ActionPolicy::RequiresConfirmation { message, .. } => {
                     self.context_manager
@@ -771,8 +985,17 @@ Example for 'backup a folder': {{\"params\":[\"folder\"],\"steps\":[\"tar czf ~/
                     use crate::policy::ActionPolicy;
                     match self.policy_evaluator.evaluate_code(&expanded) {
                         ActionPolicy::Allow => {
-                            let out = self.executor.run(&expanded).await?;
-                            outputs.push(format!("{}. {}\n{}", i + 1, expanded, out.trim()));
+                            let report = self.executor.run_detailed(&expanded).await?;
+                            if !report.succeeded() {
+                                let class = recovery::classify_failure(&report);
+                                self.emit_execution_failed(&report, class);
+                            }
+                            outputs.push(format!(
+                                "{}. {}\n{}",
+                                i + 1,
+                                expanded,
+                                report.combined_output().trim()
+                            ));
                         }
                         ActionPolicy::RequiresConfirmation { message, .. } => {
                             self.context_manager
@@ -1066,6 +1289,36 @@ fn build_missing_command_search(cmd: &str) -> Option<(String, String)> {
     Some((exact, broad))
 }
 
+/// Compact prompt asking the model to repair a failed program. Only the
+/// model's *candidate* is ever executed, and only after the recovery layer's
+/// static, safety and policy gates.
+fn build_repair_prompt(
+    original_code: &str,
+    report: &executor::ExecutionReport,
+    previous_rejection: Option<&str>,
+) -> String {
+    let class = recovery::classify_failure(report);
+    let output = report.combined_output();
+    let output = output.chars().take(2000).collect::<String>();
+    let feedback = previous_rejection
+        .map(|r| format!("\nPrevious candidate rejected: {r}\n"))
+        .unwrap_or_default();
+    format!(
+        "A generated program failed. Propose a corrected version.\n\
+         Failure class: {class}\n\
+         Exit code: {exit:?}\n\
+         Output:\n{output}\n\
+         Original program:\n{original}{feedback}\n\
+         Reply with ONLY a single fenced code block containing the corrected program. \
+         Do not include reasoning.",
+        class = class.as_str(),
+        exit = report.exit_code,
+        output = output,
+        original = original_code,
+        feedback = feedback,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1165,7 +1418,7 @@ mod tests {
         let mcp_manager = mcp::McpManager::new(&config.mcp, ".", event_bus.clone())
             .await
             .unwrap();
-        let sync_service = sync::SyncService::new(&config, None, event_bus)
+        let sync_service = sync::SyncService::new(&config, None, event_bus.clone())
             .await
             .unwrap();
         let selfdev =
@@ -1183,6 +1436,7 @@ mod tests {
             mcp_manager,
             selfdev,
             command_registry,
+            event_bus,
         }
     }
 
@@ -1536,6 +1790,169 @@ mod tests {
                     || out.contains("no package available")
                     || out.contains("install with")),
             "CLI-shaped probe did not reach handle_missing_command: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn drain_events(
+        rx: &mut tokio::sync::broadcast::Receiver<events::SystemEvent>,
+    ) -> Vec<events::SystemEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_execute_code_failure_emits_events_without_retry() {
+        let dir = temp_test_dir("recovery-events");
+        let runtime = build_test_runtime(&dir).await;
+        let mut rx = runtime.event_bus.subscribe();
+
+        let out = unwrap_text(
+            runtime
+                .execute_code_with_policy("exit 1", "sess-recovery")
+                .await
+                .unwrap(),
+        );
+        assert!(out.contains("Some(1)"), "unexpected output: {out}");
+
+        let events = drain_events(&mut rx);
+        let failures = events
+            .iter()
+            .filter(|e| matches!(e, events::SystemEvent::ExecutionFailed { .. }))
+            .count();
+        // Exactly one failed run: the failure is reported, never silently retried.
+        assert_eq!(failures, 1, "expected exactly one ExecutionFailed event");
+
+        let decided: Vec<(String, bool, u32)> = events
+            .iter()
+            .filter_map(|e| match e {
+                events::SystemEvent::RecoveryDecided {
+                    decision,
+                    verified,
+                    attempts,
+                    ..
+                } => Some((decision.clone(), *verified, *attempts)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(decided.len(), 1, "expected one RecoveryDecided event");
+        assert_eq!(decided[0].2, 0);
+        assert!(!decided[0].1);
+        // Host mode is never auto-repaired.
+        assert_ne!(decided[0].0, "propose_repair");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_host_mode_never_proposes_repair_even_when_enabled() {
+        let dir = temp_test_dir("recovery-host");
+        let mut runtime = build_test_runtime(&dir).await;
+        runtime.config.recovery.auto_repair = true;
+        let mut rx = runtime.event_bus.subscribe();
+
+        let out = unwrap_text(
+            runtime
+                .execute_code_with_policy("exit 1", "sess-host")
+                .await
+                .unwrap(),
+        );
+        assert!(!out.is_empty());
+
+        let events = drain_events(&mut rx);
+        let decisions: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                events::SystemEvent::RecoveryDecided { decision, .. } => Some(decision.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(decisions, vec!["abort_for_inspection".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_probe_with_missing_bwrap_does_not_misreport_missing_command() {
+        let dir = temp_test_dir("probe-no-bwrap");
+        let mut runtime = build_test_runtime(&dir).await;
+        runtime.config.sandbox.mode = config::SandboxMode::Bwrap;
+        runtime.config.sandbox.bwrap_path = "/nonexistent/bwrap".to_string();
+        runtime.executor = executor::CodeExecutor::new(&runtime.config).unwrap();
+
+        // Probe must skip when sandbox is unavailable rather than routing to
+        // handle_missing_command (which would fail on missing bwrap or falsely
+        // claim the command isn't installed). Because there is no LLM configured,
+        // falling through to the LLM produces an AI error, NOT a missing-command
+        // response or a sandbox-unavailable error.
+        let res = runtime
+            .process_input_with_provider(
+                "mycel-missing-probe-cmd --version",
+                "sess-probe",
+                ipc::LlmProvider::Auto,
+            )
+            .await;
+        match res {
+            Ok(RuntimeResponse::Text(text)) => {
+                assert!(
+                    !text.contains("not installed") && !text.contains("sandbox unavailable"),
+                    "probe should have been skipped, got: {text}"
+                );
+            }
+            Ok(RuntimeResponse::Stream(_)) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("sandbox unavailable"),
+                    "probe failed on missing sandbox instead of falling through: {msg}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_exit_127_without_shell_diagnostic_does_not_guess_first_word() {
+        let dir = temp_test_dir("exit-127");
+        let runtime = build_test_runtime(&dir).await;
+
+        let out = unwrap_text(
+            runtime
+                .execute_code_with_policy("cd /tmp && exit 127", "sess-127")
+                .await
+                .unwrap(),
+        );
+        assert!(
+            !out.contains("'cd'") && !out.contains("install"),
+            "must not misidentify 'cd' as a missing command, got: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_recovery_disabled_skips_recovery_decision_events() {
+        let dir = temp_test_dir("recovery-disabled");
+        let mut runtime = build_test_runtime(&dir).await;
+        runtime.config.recovery.enabled = false;
+        let mut rx = runtime.event_bus.subscribe();
+
+        let out = unwrap_text(
+            runtime
+                .execute_code_with_policy("exit 1", "sess-disabled")
+                .await
+                .unwrap(),
+        );
+        assert!(out.contains("Some(1)"), "unexpected output: {out}");
+
+        let events = drain_events(&mut rx);
+        let decided_count = events
+            .iter()
+            .filter(|e| matches!(e, events::SystemEvent::RecoveryDecided { .. }))
+            .count();
+        assert_eq!(
+            decided_count, 0,
+            "expected no RecoveryDecided when disabled"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

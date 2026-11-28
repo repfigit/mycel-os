@@ -27,7 +27,7 @@
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
@@ -111,15 +111,61 @@ impl CodeExecutor {
         })
     }
 
-    /// Execute code and return output
+    /// Execute code and return its combined output. Errors when the sandbox is
+    /// unavailable or execution times out; callers that need structured
+    /// failure information should use [`Self::run_detailed`].
     pub async fn run(&self, code: &str) -> Result<String> {
+        let report = self.run_detailed(code).await?;
+        if report.sandbox_unavailable {
+            return Err(anyhow!("{}", report.stderr));
+        }
+        if report.timed_out {
+            return Err(anyhow!("{}", report.stderr));
+        }
+        Ok(report.combined_output())
+    }
+
+    /// The configured sandbox, so callers can verify safety before re-running
+    /// generated code.
+    pub fn sandbox_config(&self) -> &SandboxConfig {
+        &self.config.sandbox
+    }
+
+    /// Execute code and return a structured [`ExecutionReport`]. Unlike
+    /// [`Self::run`], a missing sandbox or a timeout is recorded in the
+    /// returned report instead of as an `Err`, so the recovery layer can
+    /// classify the failure deterministically. `Err` is reserved for failures
+    /// that prevent execution from starting (e.g. the program cannot be
+    /// written or the process cannot be spawned).
+    pub async fn run_detailed(&self, code: &str) -> Result<ExecutionReport> {
         let language = self.detect_language(code);
         info!(language = ?language, mode = ?self.config.sandbox.mode, "Executing generated code");
 
+        let start = Instant::now();
         let script = self.write_program(code, language.extension()).await?;
-        let result = self.execute(language, &script).await;
+        let result = self.execute_detailed(language, &script, start).await;
         let _ = tokio::fs::remove_file(&script).await;
         result
+    }
+
+    /// The baseline report carrying the sandbox facts that are known before
+    /// the process runs.
+    fn base_report(&self, language: Language) -> ExecutionReport {
+        ExecutionReport {
+            language,
+            sandbox_mode: self.config.sandbox.mode,
+            allow_network: self.config.sandbox.allow_network,
+            has_writable_paths: !self.config.sandbox.writable_paths.is_empty(),
+            exit_code: None,
+            signal: None,
+            timed_out: false,
+            sandbox_unavailable: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration_ms: 0,
+        }
     }
 
     fn detect_language(&self, code: &str) -> Language {
@@ -212,17 +258,26 @@ impl CodeExecutor {
         ]
     }
 
-    async fn execute(&self, language: Language, script: &Path) -> Result<String> {
+    async fn execute_detailed(
+        &self,
+        language: Language,
+        script: &Path,
+        start: Instant,
+    ) -> Result<ExecutionReport> {
         let inner = self.inner_argv(language);
         let mut cmd = match self.config.sandbox.mode {
             SandboxMode::Bwrap => {
                 if !bwrap_available(&self.config.sandbox.bwrap_path) {
-                    return Err(anyhow!(
+                    let mut report = self.base_report(language);
+                    report.sandbox_unavailable = true;
+                    report.stderr = format!(
                         "sandbox unavailable: bubblewrap not found at '{}'. Refusing to run \
                          generated code on the host. Install bubblewrap, or set \
                          [sandbox] mode = \"host\" to opt out.",
                         self.config.sandbox.bwrap_path
-                    ));
+                    );
+                    report.duration_ms = start.elapsed().as_millis() as u64;
+                    return Ok(report);
                 }
                 let args = bwrap_args(
                     &self.config.sandbox,
@@ -241,10 +296,15 @@ impl CodeExecutor {
                 c
             }
         };
-        self.execute_with_timeout(&mut cmd).await
+        self.capture(language, &mut cmd, start).await
     }
 
-    async fn execute_with_timeout(&self, cmd: &mut Command) -> Result<String> {
+    async fn capture(
+        &self,
+        language: Language,
+        cmd: &mut Command,
+        start: Instant,
+    ) -> Result<ExecutionReport> {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -272,41 +332,109 @@ impl CodeExecutor {
                 if let Some(pgid) = pgid {
                     kill_group(pgid);
                 }
-                return Err(anyhow!("Execution timed out after {} seconds", secs));
+                let mut report = self.base_report(language);
+                report.timed_out = true;
+                report.stderr = format!("Execution timed out after {} seconds", secs);
+                report.duration_ms = start.elapsed().as_millis() as u64;
+                return Ok(report);
             }
         };
         let status = status?;
         let (stdout, out_truncated) = out?;
         let (stderr, err_truncated) = err?;
 
-        let mut result = if status.success() {
-            if stdout.is_empty() && !stderr.is_empty() {
-                // Some commands output to stderr even on success
-                stderr
+        use std::os::unix::process::ExitStatusExt;
+        let mut report = self.base_report(language);
+        report.exit_code = status.code();
+        report.signal = status.signal();
+        report.stdout = stdout;
+        report.stderr = stderr;
+        report.stdout_truncated = out_truncated;
+        report.stderr_truncated = err_truncated;
+        report.duration_ms = start.elapsed().as_millis() as u64;
+        debug!(
+            exit = ?report.exit_code,
+            signal = ?report.signal,
+            bytes = report.stdout.len() + report.stderr.len(),
+            "Execution finished"
+        );
+        Ok(report)
+    }
+}
+
+/// Structured result of a single code execution.
+///
+/// Unlike the string returned by [`CodeExecutor::run`], this preserves the
+/// machine-readable facts (exit code, signal, timeout, sandbox availability,
+/// output truncation) that the recovery layer needs to classify a failure and
+/// decide whether a repair is safe to attempt.
+#[derive(Debug, Clone)]
+pub struct ExecutionReport {
+    pub language: Language,
+    pub sandbox_mode: SandboxMode,
+    pub allow_network: bool,
+    pub has_writable_paths: bool,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    pub sandbox_unavailable: bool,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub duration_ms: u64,
+}
+
+impl ExecutionReport {
+    /// True only for a clean exit: code 0, no signal, no timeout, and the
+    /// sandbox actually ran the code.
+    pub fn succeeded(&self) -> bool {
+        !self.timed_out
+            && !self.sandbox_unavailable
+            && self.signal.is_none()
+            && self.exit_code == Some(0)
+    }
+
+    /// The user-facing output string, formatted exactly as [`CodeExecutor::run`]
+    /// formats it: on success stdout (or stderr when stdout is empty); on
+    /// failure stderr then stdout, falling back to a diagnostic when both are
+    /// empty. A truncation marker is appended when either stream was capped.
+    pub fn combined_output(&self) -> String {
+        let mut result = if self.succeeded() {
+            if self.stdout.is_empty() && !self.stderr.is_empty() {
+                // Some commands output to stderr even on success.
+                self.stderr.clone()
             } else {
-                stdout
+                self.stdout.clone()
             }
         } else {
             let mut r = String::new();
-            if !stderr.is_empty() {
-                r.push_str(&stderr);
+            if !self.stderr.is_empty() {
+                r.push_str(&self.stderr);
             }
-            if !stdout.is_empty() {
+            if !self.stdout.is_empty() {
                 if !r.is_empty() {
                     r.push('\n');
                 }
-                r.push_str(&stdout);
+                r.push_str(&self.stdout);
             }
             if r.is_empty() {
-                r = format!("Command exited with code: {:?}", status.code());
+                r = if self.timed_out {
+                    "Execution timed out".to_string()
+                } else if self.sandbox_unavailable {
+                    "Sandbox unavailable".to_string()
+                } else if let Some(sig) = self.signal {
+                    format!("Command terminated by signal {}", sig)
+                } else {
+                    format!("Command exited with code: {:?}", self.exit_code)
+                };
             }
             r
         };
-        if out_truncated || err_truncated {
+        if self.stdout_truncated || self.stderr_truncated {
             result.push_str("\n[output truncated]");
         }
-        debug!(exit = ?status.code(), bytes = result.len(), "Execution finished");
-        Ok(result)
+        result
     }
 }
 
@@ -488,14 +616,23 @@ fn bwrap_args(
     a
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Language {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Language {
     Python,
     JavaScript,
     Shell,
 }
 
 impl Language {
+    /// Stable lowercase name used in events and diagnostics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Language::Python => "python",
+            Language::JavaScript => "javascript",
+            Language::Shell => "shell",
+        }
+    }
+
     fn extension(self) -> &'static str {
         match self {
             Language::Python => "py",
@@ -882,6 +1019,73 @@ mod tests {
             5,
         );
         assert_eq!(exec.run("echo host").await.unwrap().trim(), "host");
+    }
+
+    /// Host-mode executor: deterministic across environments (no bwrap needed)
+    /// for asserting the structured facts of a report.
+    fn host_executor(timeout: u64) -> CodeExecutor {
+        executor_with(
+            SandboxConfig {
+                mode: SandboxMode::Host,
+                ..Default::default()
+            },
+            timeout,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_run_detailed_success_reports_exit_zero() {
+        let exec = host_executor(5);
+        let report = exec.run_detailed("echo ok").await.unwrap();
+        assert_eq!(report.exit_code, Some(0));
+        assert!(report.succeeded());
+        assert!(report.signal.is_none());
+        assert!(!report.timed_out);
+        assert!(!report.sandbox_unavailable);
+        assert_eq!(report.stdout.trim(), "ok");
+        assert_eq!(report.combined_output().trim(), "ok");
+    }
+
+    #[tokio::test]
+    async fn test_run_detailed_failure_reports_exit_code() {
+        let exec = host_executor(5);
+        let report = exec.run_detailed("exit 7").await.unwrap();
+        assert_eq!(report.exit_code, Some(7));
+        assert!(!report.succeeded());
+        assert!(report.combined_output().contains("Some(7)"));
+    }
+
+    #[tokio::test]
+    async fn test_run_detailed_timeout_is_reported() {
+        let exec = host_executor(1);
+        let report = exec.run_detailed("sleep 60").await.unwrap();
+        assert!(report.timed_out);
+        assert!(!report.succeeded());
+        assert!(report.stderr.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn test_run_detailed_signal_is_reported() {
+        let exec = host_executor(5);
+        let report = exec.run_detailed("kill -9 $$").await.unwrap();
+        assert_eq!(report.signal, Some(9));
+        assert!(report.exit_code.is_none());
+        assert!(!report.succeeded());
+    }
+
+    #[tokio::test]
+    async fn test_run_detailed_reports_sandbox_unavailable() {
+        let exec = executor_with(
+            SandboxConfig {
+                bwrap_path: "/nonexistent/bwrap".to_string(),
+                ..Default::default()
+            },
+            5,
+        );
+        let report = exec.run_detailed("echo hi").await.unwrap();
+        assert!(report.sandbox_unavailable);
+        assert!(!report.succeeded());
+        assert!(report.stderr.contains("sandbox unavailable"));
     }
 
     #[test]

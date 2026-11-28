@@ -80,6 +80,25 @@ max_processes = 4096
 #   execution_timeout_secs = 30
 #   execution_memory_mb = 512
 
+[recovery]
+# Execution recovery: when generated code fails, classify the failure and
+# decide whether a repair may be attempted. The decision itself is pure Rust;
+# the model can only *propose* a fix.
+#
+# SAFETY: auto_repair is OFF by default. Even when enabled, only a plain
+# non-zero exit inside a fully isolated bubblewrap sandbox (no network, no
+# writable paths, untruncated output) is eligible; timeouts, signals, a missing
+# sandbox and host mode all abort for inspection instead.
+enabled = true
+# Opt-in: allow a verified repair attempt for eligible failures.
+auto_repair = false
+# Maximum repair attempts before aborting for inspection.
+max_repair_attempts = 1
+# Largest candidate program accepted, in bytes.
+max_candidate_bytes = 32768
+# Re-run an accepted candidate and require identical output.
+require_repeat_check = false
+
 [collective]
 # Decentralized network participation
 enabled = false
