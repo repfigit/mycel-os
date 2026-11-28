@@ -1,0 +1,30 @@
+[package]
+name = "mycel-compositor"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Standalone thin Wayland compositor for Mycel OS built on Smithay 0.7"
+
+[features]
+default = []
+winit = ["smithay/backend_winit", "smithay/renderer_glow"]
+drm = [
+    "smithay/backend_drm",
+    "smithay/backend_gbm",
+    "smithay/backend_libinput",
+    "smithay/backend_udev",
+    "smithay/backend_session_libseat",
+    "smithay/renderer_pixman",
+]
+
+[dependencies]
+anyhow = "1"
+calloop = { version = "0.14", features = ["signals"] }
+clap = { version = "4", features = ["derive"] }
+smithay = { version = "0.7", default-features = false, features = ["wayland_frontend", "desktop"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }

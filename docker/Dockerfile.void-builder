@@ -24,7 +24,16 @@ RUN xbps-install -Syu -y && xbps-install -y \
     gcc \
     llvm-libunwind-devel \
     rust \
-    cargo
+    cargo \
+    pkg-config \
+    libxkbcommon-devel \
+    seatd-devel \
+    libinput-devel \
+    eudev-libudev-devel \
+    libdrm-devel \
+    MesaLib-devel \
+    pixman-devel \
+    wayland-devel
 
 WORKDIR /build
 
