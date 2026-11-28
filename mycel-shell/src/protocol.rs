@@ -38,6 +38,18 @@ pub enum IpcRequest {
     },
     /// Get mesh sync status.
     SyncStatus,
+    /// Generate a pairing code for this device.
+    GeneratePairingCode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<String>,
+    },
+    /// Pair a peer using a pairing code or device ID.
+    PairPeer { code: String },
+    /// Trigger an immediate mesh sync with one or all peers.
+    TriggerSync {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_id: Option<String>,
+    },
     /// List available LLM providers.
     ListProviders,
     /// Switch active LLM provider and optional model.
@@ -201,6 +213,17 @@ pub enum IpcResponse {
         event_log_len: usize,
         peers: Vec<PeerInfo>,
     },
+    /// Generated pairing code.
+    PairingCode {
+        device_id: String,
+        code: String,
+        endpoint: Option<String>,
+    },
+    /// Trusted peer added/paired.
+    PeerAdded {
+        peer: PeerInfo,
+        synced_events: usize,
+    },
     /// Available LLM providers.
     Providers {
         active_provider: Option<String>,
@@ -269,6 +292,17 @@ mod tests {
             },
             IpcRequest::Subscribe { events: None },
             IpcRequest::SyncStatus,
+            IpcRequest::GeneratePairingCode {
+                endpoint: Some("10.42.0.1:51820".to_string()),
+            },
+            IpcRequest::GeneratePairingCode { endpoint: None },
+            IpcRequest::PairPeer {
+                code: "mycel-pair-v1:abc".to_string(),
+            },
+            IpcRequest::TriggerSync {
+                peer_id: Some("peer-1".to_string()),
+            },
+            IpcRequest::TriggerSync { peer_id: None },
             IpcRequest::ListProviders,
             IpcRequest::SetProvider {
                 provider: "venice".to_string(),
@@ -367,6 +401,25 @@ mod tests {
                         addresses: vec![],
                     },
                 ],
+            },
+            IpcResponse::PairingCode {
+                device_id: "dev-1".to_string(),
+                code: "mycel-pair-v1:dev-1".to_string(),
+                endpoint: Some("10.42.0.1:51820".to_string()),
+            },
+            IpcResponse::PairingCode {
+                device_id: "dev-1".to_string(),
+                code: "mycel-pair-v1:dev-1".to_string(),
+                endpoint: None,
+            },
+            IpcResponse::PeerAdded {
+                peer: PeerInfo {
+                    id: "peer-4".to_string(),
+                    name: "workstation".to_string(),
+                    status: PeerStatus::Connected,
+                    addresses: vec!["10.42.0.2:51820".to_string()],
+                },
+                synced_events: 7,
             },
             IpcResponse::Error {
                 message: "boom".to_string(),
@@ -545,6 +598,60 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<IpcResponse>(&resp_json).unwrap(),
             resp
+        );
+    }
+
+    #[test]
+    fn mesh_pairing_protocol_roundtrip() {
+        let gen_none = IpcRequest::GeneratePairingCode { endpoint: None };
+        let gen_none_json = serde_json::to_string(&gen_none).unwrap();
+        assert_eq!(gen_none_json, r#"{"type":"GeneratePairingCode"}"#);
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&gen_none_json).unwrap(),
+            gen_none
+        );
+
+        let sync_none = IpcRequest::TriggerSync { peer_id: None };
+        let sync_none_json = serde_json::to_string(&sync_none).unwrap();
+        assert_eq!(sync_none_json, r#"{"type":"TriggerSync"}"#);
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&sync_none_json).unwrap(),
+            sync_none
+        );
+
+        let pair_req = IpcRequest::PairPeer {
+            code: "mycel-pair-v1:node-2@10.0.0.2:51820".to_string(),
+        };
+        let pair_json = serde_json::to_string(&pair_req).unwrap();
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&pair_json).unwrap(),
+            pair_req
+        );
+
+        let pairing_resp = IpcResponse::PairingCode {
+            device_id: "node-1".to_string(),
+            code: "mycel-pair-v1:node-1".to_string(),
+            endpoint: Some("10.0.0.1:51820".to_string()),
+        };
+        let pairing_json = serde_json::to_string(&pairing_resp).unwrap();
+        assert_eq!(
+            serde_json::from_str::<IpcResponse>(&pairing_json).unwrap(),
+            pairing_resp
+        );
+
+        let added_resp = IpcResponse::PeerAdded {
+            peer: PeerInfo {
+                id: "node-2".to_string(),
+                name: "node-2".to_string(),
+                status: PeerStatus::Connected,
+                addresses: vec!["10.0.0.2:51820".to_string()],
+            },
+            synced_events: 12,
+        };
+        let added_json = serde_json::to_string(&added_resp).unwrap();
+        assert_eq!(
+            serde_json::from_str::<IpcResponse>(&added_json).unwrap(),
+            added_resp
         );
     }
 }

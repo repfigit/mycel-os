@@ -20,6 +20,8 @@ and verifies:
      and non-empty final `Chat` response
   6. Policy-gated `ExecuteCode` -> `ConfirmationRequired` -> `ConfirmAction`
      round-trip inside the guest
+  7. Authenticated `ListProviders` IPC (`>= 45` providers, key IDs present, zero
+     secret fields) and `mycel providers` CLI output
 
 Uses Python 3 standard library only.
 """
@@ -329,7 +331,7 @@ class QemuDesktopHarness:
         )
 
     def boot_and_login(self) -> None:
-        print("[1/7] Waiting for Void Linux live serial login prompt...")
+        print("[1/8] Waiting for Void Linux live serial login prompt...")
         login_re = re.compile(r"(?:^|\n)[^\n]*login:\s*$", re.MULTILINE)
         self.wait_for_regex(
             login_re,
@@ -498,7 +500,7 @@ def run_desktop_e2e_checks(harness: QemuDesktopHarness) -> list[tuple[str, str]]
     results: list[tuple[str, str]] = []
 
     # 2. Runit services: seatd, udevd, mycel-runtime
-    print("[2/7] Checking runit services (seatd, udevd, mycel-runtime)...")
+    print("[2/8] Checking runit services (seatd, udevd, mycel-runtime)...")
     rc, out = harness.run_cmd(
         "for svc in udevd seatd mycel-runtime; do "
         "  ok=0; "
@@ -518,7 +520,7 @@ def run_desktop_e2e_checks(harness: QemuDesktopHarness) -> list[tuple[str, str]]
 
     # 3. Ensure guest networking -> host Ollama is up, restart mycel-runtime if needed,
     #    and verify runtime.sock, 0600 token, and `mycel status`
-    print("[3/7] Checking host Ollama reachability, /run/mycel/runtime.sock, 0600 token, and `mycel status`...")
+    print("[3/8] Checking host Ollama reachability, /run/mycel/runtime.sock, 0600 token, and `mycel status`...")
     rc, out = harness.run_cmd(
         "for i in $(seq 1 20); do "
         "  curl -sf http://10.0.2.2:11434/api/tags >/dev/null && break; "
@@ -550,7 +552,7 @@ def run_desktop_e2e_checks(harness: QemuDesktopHarness) -> list[tuple[str, str]]
     results.append(("Runtime socket, 0600 token & mycel status", out))
 
     # 4. Launch /usr/local/bin/mycel-session on tty1 and verify compositor + shell
-    print("[4/7] Launching /usr/local/bin/mycel-session on tty1 and verifying Wayland + shell...")
+    print("[4/8] Launching /usr/local/bin/mycel-session on tty1 and verifying Wayland + shell...")
     rc, out = harness.run_cmd(
         "export XDG_RUNTIME_DIR=/run/user/0; "
         "mkdir -p \"$XDG_RUNTIME_DIR\" && chmod 0700 \"$XDG_RUNTIME_DIR\"; "
@@ -595,7 +597,7 @@ def run_desktop_e2e_checks(harness: QemuDesktopHarness) -> list[tuple[str, str]]
     results.append(("mycel-session (Wayland + compositor + shell alive)", out_alive))
 
     # 5. QEMU screendump -> PPM -> PNG + pixel verification
-    print("[5/7] Capturing QEMU screendump and verifying rendered GUI pixels...")
+    print("[5/8] Capturing QEMU screendump and verifying rendered GUI pixels...")
     _remove_host_file(PPM_OUT)
     _remove_host_file(PNG_OUT)
     time.sleep(2.0)
@@ -635,7 +637,7 @@ def run_desktop_e2e_checks(harness: QemuDesktopHarness) -> list[tuple[str, str]]
     results.append(("QEMU screendump -> PNG & pixel check", screen_summary))
 
     # 6. Live natural-language Chat turn over /run/mycel/runtime.sock -> host Ollama (qwen3:8b)
-    print("[6/7] Running live Chat turn against host Ollama (10.0.2.2:11434, qwen3:8b)...")
+    print("[6/8] Running live Chat turn against host Ollama (10.0.2.2:11434, qwen3:8b)...")
     chat_script = """import json, socket
 
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -687,7 +689,7 @@ print(f"CHUNKS={len(chunks)} RESPONSE={resp_text!r}")
     results.append(("Live Ollama Chat (qwen3:8b, streaming)", out_chat))
 
     # 7. Policy-gated ExecuteCode -> ConfirmationRequired -> ConfirmAction round-trip
-    print("[7/7] Testing policy-gated ExecuteCode -> ConfirmationRequired -> ConfirmAction...")
+    print("[7/8] Testing policy-gated ExecuteCode -> ConfirmationRequired -> ConfirmAction...")
     py_confirm = (
         "python3 -c '"
         "import json, socket; "
@@ -719,6 +721,68 @@ print(f"CHUNKS={len(chunks)} RESPONSE={resp_text!r}")
             f"ConfirmationRequired -> ConfirmAction check failed (rc={rc_conf}):\n{out_conf}"
         )
     results.append(("Policy ConfirmationRequired -> ConfirmAction", out_conf))
+
+    # 8. Authenticated ListProviders IPC + `mycel providers` CLI verification
+    print("[8/8] Verifying ListProviders IPC (>= 45 providers, zero secrets) and `mycel providers` CLI...")
+    providers_script = """import json, socket
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(30)
+s.connect("/run/mycel/runtime.sock")
+f = s.makefile("r", encoding="utf-8")
+
+tok = open("/run/mycel/runtime.token", encoding="utf-8").read().strip()
+s.sendall((json.dumps({"type": "Authenticate", "token": tok}) + "\\n").encode())
+auth = json.loads(f.readline())
+assert auth.get("type") == "Ok", auth
+
+s.sendall((json.dumps({"type": "ListProviders"}) + "\\n").encode())
+resp = json.loads(f.readline())
+assert resp.get("type") == "Providers", f"Expected Providers, got {resp}"
+
+providers = resp.get("providers", [])
+assert len(providers) >= 45, f"Expected >= 45 providers, got {len(providers)}"
+
+ids = {p.get("id") for p in providers}
+required_ids = {
+    "venice",
+    "openrouter",
+    "anthropic",
+    "openai",
+    "google",
+    "amazon-bedrock",
+    "llama-cpp",
+}
+missing = sorted(required_ids - ids)
+assert not missing, f"Missing required provider IDs: {missing}"
+
+forbidden_keys = {"api_key", "secret", "token"}
+for p in providers:
+    leaked = forbidden_keys.intersection(p.keys())
+    assert not leaked, f"Secret fields {sorted(leaked)} leaked in provider {p.get('id')}: {p}"
+
+print(f"PROVIDER_COUNT={len(providers)} REQUIRED_PRESENT=OK SECRETS_LEAKED=0")
+"""
+    prov_b64 = base64.b64encode(providers_script.encode("utf-8")).decode("ascii")
+    rc_prov, out_prov = harness.run_cmd(
+        f"echo '{prov_b64}' | base64 -d | python3 - && "
+        "prov_cli=$(MYCEL_SOCKET=/run/mycel/runtime.sock mycel providers) && "
+        "echo \"$prov_cli\" | grep -q 'venice' && "
+        "echo \"$prov_cli\" | grep -q 'openrouter' && "
+        "echo \"$prov_cli\" | grep -E 'venice|openrouter'",
+        timeout=35.0,
+    )
+    if (
+        rc_prov != 0
+        or "REQUIRED_PRESENT=OK" not in out_prov
+        or "SECRETS_LEAKED=0" not in out_prov
+        or "venice" not in out_prov
+        or "openrouter" not in out_prov
+    ):
+        raise AssertionError(
+            f"ListProviders IPC / mycel providers CLI check failed (rc={rc_prov}):\n{out_prov}"
+        )
+    results.append(("ListProviders IPC (>= 45, zero secrets) & mycel providers CLI", out_prov))
 
     return results
 

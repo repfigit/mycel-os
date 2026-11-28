@@ -9,7 +9,9 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::protocol::{IpcRequest, IpcResponse, LlmProvider, PeerInfo, SystemEvent};
+use crate::protocol::{
+    IpcRequest, IpcResponse, LlmProvider, PeerInfo, ProviderSummary, SystemEvent,
+};
 
 /// Maximum NDJSON frame size in bytes (1 MiB), matching `mycel-runtime`.
 pub const MAX_IPC_FRAME_BYTES: usize = 1024 * 1024;
@@ -108,6 +110,29 @@ pub struct SyncSnapshot {
     pub connected_peers: usize,
     pub event_log_len: usize,
     pub peers: Vec<PeerInfo>,
+}
+
+/// Snapshot of cloud AI providers returned by `IpcRequestClient::fetch_providers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvidersSnapshot {
+    pub active_provider: Option<String>,
+    pub active_model: Option<String>,
+    pub providers: Vec<ProviderSummary>,
+}
+
+/// Snapshot of a generated pairing code returned by `IpcRequestClient::generate_pairing_code`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingCodeSnapshot {
+    pub device_id: String,
+    pub code: String,
+    pub endpoint: Option<String>,
+}
+
+/// Snapshot of a newly paired peer returned by `IpcRequestClient::pair_peer`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAddedSnapshot {
+    pub peer: PeerInfo,
+    pub synced_events: usize,
 }
 
 /// Events emitted by the dedicated push-only `Subscribe` stream.
@@ -210,6 +235,105 @@ impl IpcRequestClient {
             Some(IpcResponse::Error { message }) => Err(anyhow!("SyncStatus error: {}", message)),
             Some(other) => Err(anyhow!("Unexpected response to SyncStatus: {:?}", other)),
             None => Err(anyhow!("Connection closed before SyncStatus response")),
+        }
+    }
+
+    /// Fetch available cloud AI providers and the active selection.
+    pub async fn fetch_providers(&self) -> Result<ProvidersSnapshot> {
+        let (mut reader, mut writer) = self.connect_session().await?;
+        send_request(&mut writer, &IpcRequest::ListProviders).await?;
+
+        match read_response(&mut reader).await? {
+            Some(IpcResponse::Providers {
+                active_provider,
+                active_model,
+                providers,
+            }) => Ok(ProvidersSnapshot {
+                active_provider,
+                active_model,
+                providers,
+            }),
+            Some(IpcResponse::Error { message }) => {
+                Err(anyhow!("ListProviders error: {}", message))
+            }
+            Some(other) => Err(anyhow!("Unexpected response to ListProviders: {:?}", other)),
+            None => Err(anyhow!("Connection closed before ListProviders response")),
+        }
+    }
+
+    /// Switch the active cloud AI provider and optional model override.
+    pub async fn set_provider(&self, provider: String, model: Option<String>) -> Result<String> {
+        let (mut reader, mut writer) = self.connect_session().await?;
+        send_request(&mut writer, &IpcRequest::SetProvider { provider, model }).await?;
+
+        match read_response(&mut reader).await? {
+            Some(IpcResponse::Ok { message }) => Ok(message),
+            Some(IpcResponse::Error { message }) => Err(anyhow!("SetProvider error: {}", message)),
+            Some(other) => Err(anyhow!("Unexpected response to SetProvider: {:?}", other)),
+            None => Err(anyhow!("Connection closed before SetProvider response")),
+        }
+    }
+
+    /// Generate a mesh pairing code for this device.
+    pub async fn generate_pairing_code(
+        &self,
+        endpoint: Option<String>,
+    ) -> Result<PairingCodeSnapshot> {
+        let (mut reader, mut writer) = self.connect_session().await?;
+        send_request(&mut writer, &IpcRequest::GeneratePairingCode { endpoint }).await?;
+
+        match read_response(&mut reader).await? {
+            Some(IpcResponse::PairingCode {
+                device_id,
+                code,
+                endpoint,
+            }) => Ok(PairingCodeSnapshot {
+                device_id,
+                code,
+                endpoint,
+            }),
+            Some(IpcResponse::Error { message }) => {
+                Err(anyhow!("GeneratePairingCode error: {}", message))
+            }
+            Some(other) => Err(anyhow!(
+                "Unexpected response to GeneratePairingCode: {:?}",
+                other
+            )),
+            None => Err(anyhow!(
+                "Connection closed before GeneratePairingCode response"
+            )),
+        }
+    }
+
+    /// Pair a peer using a pairing code or peer ID.
+    pub async fn pair_peer(&self, code: String) -> Result<PeerAddedSnapshot> {
+        let (mut reader, mut writer) = self.connect_session().await?;
+        send_request(&mut writer, &IpcRequest::PairPeer { code }).await?;
+
+        match read_response(&mut reader).await? {
+            Some(IpcResponse::PeerAdded {
+                peer,
+                synced_events,
+            }) => Ok(PeerAddedSnapshot {
+                peer,
+                synced_events,
+            }),
+            Some(IpcResponse::Error { message }) => Err(anyhow!("PairPeer error: {}", message)),
+            Some(other) => Err(anyhow!("Unexpected response to PairPeer: {:?}", other)),
+            None => Err(anyhow!("Connection closed before PairPeer response")),
+        }
+    }
+
+    /// Trigger an immediate mesh sync with one or all peers.
+    pub async fn trigger_sync(&self, peer_id: Option<String>) -> Result<String> {
+        let (mut reader, mut writer) = self.connect_session().await?;
+        send_request(&mut writer, &IpcRequest::TriggerSync { peer_id }).await?;
+
+        match read_response(&mut reader).await? {
+            Some(IpcResponse::Ok { message }) => Ok(message),
+            Some(IpcResponse::Error { message }) => Err(anyhow!("TriggerSync error: {}", message)),
+            Some(other) => Err(anyhow!("Unexpected response to TriggerSync: {:?}", other)),
+            None => Err(anyhow!("Connection closed before TriggerSync response")),
         }
     }
 
@@ -1008,6 +1132,215 @@ mod tests {
             *observed_sessions.lock().await,
             vec!["sess-confirm-42", "sess-confirm-42"]
         );
+        let _ = std::fs::remove_dir_all(sock_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn providers_and_mesh_pairing_ipc_roundtrips() {
+        use crate::protocol::PeerStatus;
+
+        let sock_path = temp_socket_path("providers-mesh");
+        let sock_str = sock_path.to_string_lossy().to_string();
+        let tok_path = token_path_for_socket(&sock_str);
+        std::fs::write(&tok_path, "pm-tok").unwrap();
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let server = tokio::spawn(async move {
+            for idx in 0..6 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (r, mut w) = stream.into_split();
+                let mut r = BufReader::new(r);
+
+                assert_eq!(
+                    read_req(&mut r).await.unwrap(),
+                    IpcRequest::Authenticate {
+                        token: "pm-tok".to_string()
+                    }
+                );
+                write_frame(
+                    &mut w,
+                    &IpcResponse::Ok {
+                        message: "ok".to_string(),
+                    },
+                )
+                .await;
+
+                assert_eq!(
+                    read_req(&mut r).await.unwrap(),
+                    IpcRequest::SetSession {
+                        id: "sess-pm".to_string()
+                    }
+                );
+                write_frame(
+                    &mut w,
+                    &IpcResponse::Ok {
+                        message: "ok".to_string(),
+                    },
+                )
+                .await;
+
+                match idx {
+                    0 => {
+                        assert_eq!(read_req(&mut r).await.unwrap(), IpcRequest::ListProviders);
+                        write_frame(
+                            &mut w,
+                            &IpcResponse::Providers {
+                                active_provider: Some("venice".to_string()),
+                                active_model: Some("llama-3.3-70b".to_string()),
+                                providers: vec![ProviderSummary {
+                                    id: "venice".to_string(),
+                                    name: "Venice AI".to_string(),
+                                    api: "openai-compatible".to_string(),
+                                    configured: true,
+                                    env_var: "VENICE_API_KEY".to_string(),
+                                    default_model: "llama-3.3-70b".to_string(),
+                                    base_url: "https://api.venice.ai/api/v1".to_string(),
+                                }],
+                            },
+                        )
+                        .await;
+                    }
+                    1 => {
+                        assert_eq!(
+                            read_req(&mut r).await.unwrap(),
+                            IpcRequest::SetProvider {
+                                provider: "openrouter".to_string(),
+                                model: Some("anthropic/claude-sonnet-4".to_string()),
+                            }
+                        );
+                        write_frame(
+                            &mut w,
+                            &IpcResponse::Ok {
+                                message: "Active cloud provider set to openrouter/anthropic/claude-sonnet-4".to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                    2 => {
+                        assert_eq!(read_req(&mut r).await.unwrap(), IpcRequest::SyncStatus);
+                        write_frame(
+                            &mut w,
+                            &IpcResponse::SyncStatus {
+                                enabled: true,
+                                device_id: "node-alpha".to_string(),
+                                transport: "wireguard".to_string(),
+                                interface: Some("mycel0".to_string()),
+                                listen_addr: Some("0.0.0.0:51820".to_string()),
+                                trusted_peers: 1,
+                                connected_peers: 1,
+                                event_log_len: 42,
+                                peers: vec![PeerInfo {
+                                    id: "node-beta".to_string(),
+                                    name: "beta".to_string(),
+                                    status: PeerStatus::Connected,
+                                    addresses: vec!["10.42.0.2:51820".to_string()],
+                                }],
+                            },
+                        )
+                        .await;
+                    }
+                    3 => {
+                        assert_eq!(
+                            read_req(&mut r).await.unwrap(),
+                            IpcRequest::GeneratePairingCode {
+                                endpoint: Some("10.42.0.1:51820".to_string()),
+                            }
+                        );
+                        write_frame(
+                            &mut w,
+                            &IpcResponse::PairingCode {
+                                device_id: "node-alpha".to_string(),
+                                code: "mycel-pair-v1:node-alpha@10.42.0.1:51820".to_string(),
+                                endpoint: Some("10.42.0.1:51820".to_string()),
+                            },
+                        )
+                        .await;
+                    }
+                    4 => {
+                        assert_eq!(
+                            read_req(&mut r).await.unwrap(),
+                            IpcRequest::PairPeer {
+                                code: "mycel-pair-v1:node-gamma@10.42.0.3:51820".to_string(),
+                            }
+                        );
+                        write_frame(
+                            &mut w,
+                            &IpcResponse::PeerAdded {
+                                peer: PeerInfo {
+                                    id: "node-gamma".to_string(),
+                                    name: "gamma".to_string(),
+                                    status: PeerStatus::Connected,
+                                    addresses: vec!["10.42.0.3:51820".to_string()],
+                                },
+                                synced_events: 5,
+                            },
+                        )
+                        .await;
+                    }
+                    _ => {
+                        assert_eq!(
+                            read_req(&mut r).await.unwrap(),
+                            IpcRequest::TriggerSync { peer_id: None }
+                        );
+                        write_frame(
+                            &mut w,
+                            &IpcResponse::Ok {
+                                message: "Synced 3 event(s) across mesh".to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
+        let client = IpcRequestClient::new(IpcClientConfig {
+            socket_path: sock_str,
+            session_id: "sess-pm".to_string(),
+        });
+
+        let providers = client.fetch_providers().await.unwrap();
+        assert_eq!(providers.active_provider.as_deref(), Some("venice"));
+        assert_eq!(providers.active_model.as_deref(), Some("llama-3.3-70b"));
+        assert_eq!(providers.providers.len(), 1);
+        assert_eq!(providers.providers[0].id, "venice");
+
+        let set_msg = client
+            .set_provider(
+                "openrouter".to_string(),
+                Some("anthropic/claude-sonnet-4".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(set_msg.contains("openrouter"));
+
+        let sync = client.fetch_sync_status().await.unwrap();
+        assert!(sync.enabled);
+        assert_eq!(sync.device_id, "node-alpha");
+        assert_eq!(sync.interface.as_deref(), Some("mycel0"));
+        assert_eq!(sync.event_log_len, 42);
+        assert_eq!(sync.peers.len(), 1);
+
+        let pairing = client
+            .generate_pairing_code(Some("10.42.0.1:51820".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(pairing.device_id, "node-alpha");
+        assert!(pairing.code.starts_with("mycel-pair-v1:"));
+        assert_eq!(pairing.endpoint.as_deref(), Some("10.42.0.1:51820"));
+
+        let paired = client
+            .pair_peer("mycel-pair-v1:node-gamma@10.42.0.3:51820".to_string())
+            .await
+            .unwrap();
+        assert_eq!(paired.peer.id, "node-gamma");
+        assert_eq!(paired.synced_events, 5);
+
+        let sync_msg = client.trigger_sync(None).await.unwrap();
+        assert_eq!(sync_msg, "Synced 3 event(s) across mesh");
+
+        server.await.unwrap();
         let _ = std::fs::remove_dir_all(sock_path.parent().unwrap());
     }
 }
