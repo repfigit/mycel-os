@@ -3,8 +3,11 @@
 
 FROM ghcr.io/void-linux/void-musl-full:latest
 
-# Install void-mklive and Rust musl build dependencies
-RUN xbps-install -Syu -y && xbps-install -y \
+# Install void-mklive and Rust/Wayland build dependencies in ONE xbps
+# transaction: a second `xbps-install` errors "already installed" for packages
+# that `-Syu` pulled in as dependencies (tar, gzip, liblz4). `seatd-devel` does
+# not exist in the Void musl pool — `libseat` ships the headers.
+RUN xbps-install -Syu -y \
     bash \
     git \
     xorriso \
@@ -14,11 +17,8 @@ RUN xbps-install -Syu -y && xbps-install -y \
     mtools \
     grub-x86_64-efi \
     grub \
-    liblz4 \
     xz \
     curl \
-    tar \
-    gzip \
     cpio \
     file \
     gcc \
@@ -27,7 +27,7 @@ RUN xbps-install -Syu -y && xbps-install -y \
     cargo \
     pkg-config \
     libxkbcommon-devel \
-    seatd-devel \
+    libseat \
     libinput-devel \
     eudev-libudev-devel \
     libdrm-devel \
