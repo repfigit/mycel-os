@@ -351,9 +351,13 @@ impl WineService {
         a.extend([
             "--die-with-parent".to_string(),
             "--new-session".to_string(),
+            "--unshare-user".to_string(),
+            "--disable-userns".to_string(),
             "--unshare-pid".to_string(),
             "--unshare-ipc".to_string(),
             "--unshare-uts".to_string(),
+            "--cap-drop".to_string(),
+            "ALL".to_string(),
         ]);
         if !self.config.allow_network {
             a.push("--unshare-net".to_string());
@@ -374,16 +378,9 @@ impl WineService {
             "/run".to_string(),
         ]);
 
-        // Writable bind mount ONLY for this app's isolated WINEPREFIX.
-        let prefix_str = prefix_dir.to_string_lossy().into_owned();
-        a.extend(["--bind".to_string(), prefix_str.clone(), prefix_str.clone()]);
-
-        // Read-only bind mount for the target .exe.
-        let exe_str = exe_path.to_string_lossy().into_owned();
-        a.extend(["--ro-bind".to_string(), exe_str.clone(), exe_str.clone()]);
-
-        // Hide host credential and runtime-state locations (applied after
-        // writable prefix bind so masks always take precedence).
+        // Hide host credential and runtime-state locations BEFORE binding the
+        // app's WINEPREFIX and .exe so masking parent directories (e.g.
+        // /var/lib/mycel or $HOME/.local/share/mycel) never overmounts them.
         let mut hidden: Vec<PathBuf> = HIDDEN_SYSTEM_PATHS.iter().map(PathBuf::from).collect();
         if let Some(h) = home {
             hidden.extend(HIDDEN_HOME_PATHS.iter().map(|p| h.join(p)));
@@ -404,6 +401,14 @@ impl WineService {
                 a.extend(["--ro-bind".to_string(), "/dev/null".to_string(), s]);
             }
         }
+
+        // Writable bind mount ONLY for this app's isolated WINEPREFIX.
+        let prefix_str = prefix_dir.to_string_lossy().into_owned();
+        a.extend(["--bind".to_string(), prefix_str.clone(), prefix_str.clone()]);
+
+        // Read-only bind mount for the target .exe.
+        let exe_str = exe_path.to_string_lossy().into_owned();
+        a.extend(["--ro-bind".to_string(), exe_str.clone(), exe_str.clone()]);
 
         // Cleared environment with explicit Wine variables.
         a.extend([
@@ -855,9 +860,12 @@ mod tests {
         assert!(args_no_net.contains(&"--clearenv".to_string()));
         assert!(args_no_net.contains(&"--die-with-parent".to_string()));
         assert!(args_no_net.contains(&"--new-session".to_string()));
+        assert!(args_no_net.contains(&"--unshare-user".to_string()));
+        assert!(args_no_net.contains(&"--disable-userns".to_string()));
         assert!(args_no_net.contains(&"--unshare-pid".to_string()));
         assert!(args_no_net.contains(&"--unshare-ipc".to_string()));
         assert!(args_no_net.contains(&"--unshare-uts".to_string()));
+        assert!(args_no_net.windows(2).any(|w| w == ["--cap-drop", "ALL"]));
 
         // Verify --ro-bind / /
         assert!(args_no_net.windows(3).any(|w| w == ["--ro-bind", "/", "/"]));
@@ -963,6 +971,62 @@ mod tests {
                 .expect_err("missing wine binary must refuse");
             assert!(err.to_string().contains("Flatpak/Bottles"));
         }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_build_bwrap_args_prefix_inside_hidden_parent_not_overmounted() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "mycel-wine-bwrap-order-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = temp_dir.join("home");
+        let hidden_parent = home.join(".local/share/mycel");
+        let prefix = hidden_parent.join("wine-prefixes/app1");
+        let exe = hidden_parent.join("apps/app1.exe");
+        std::fs::create_dir_all(&prefix).expect("create prefix dir");
+        std::fs::create_dir_all(exe.parent().expect("exe parent")).expect("create exe parent");
+        std::fs::write(&exe, b"MZ").expect("write exe");
+
+        let svc = test_service(WineConfig::default(), "/tmp/ctx", "bwrap");
+        let args = svc.build_bwrap_args_with_env(
+            &prefix,
+            &exe,
+            Path::new("/usr/bin/wine"),
+            &[],
+            Some(&home),
+            None,
+            None,
+        );
+
+        let hidden_real =
+            std::fs::canonicalize(&hidden_parent).expect("canonicalize hidden parent");
+        let hidden_str = hidden_real.to_string_lossy().into_owned();
+        let prefix_str = prefix.to_string_lossy().into_owned();
+        let exe_str = exe.to_string_lossy().into_owned();
+
+        let mask_idx = args
+            .windows(2)
+            .position(|w| w == ["--tmpfs", hidden_str.as_str()])
+            .expect("hidden parent must be masked with --tmpfs");
+        let bind_idx = args
+            .windows(3)
+            .position(|w| w == ["--bind", prefix_str.as_str(), prefix_str.as_str()])
+            .expect("prefix_dir must be bound with --bind");
+        let exe_idx = args
+            .windows(3)
+            .position(|w| w == ["--ro-bind", exe_str.as_str(), exe_str.as_str()])
+            .expect("exe_path must be bound with --ro-bind");
+
+        assert!(
+            mask_idx < bind_idx,
+            "hidden mask at {mask_idx} must precede --bind prefix at {bind_idx}"
+        );
+        assert!(
+            mask_idx < exe_idx,
+            "hidden mask at {mask_idx} must precede --ro-bind exe at {exe_idx}"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

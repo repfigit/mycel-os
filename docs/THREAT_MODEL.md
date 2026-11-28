@@ -9,23 +9,23 @@ Mycel OS is an AI-native operating system where users interact through natural l
 ## Trust Boundaries
 
 ### 1. User ↔ Runtime
-- **Boundary**: IPC socket (`/run/mycel/runtime.sock` or `/tmp/mycel-dev.sock`)
+- **Boundary**: IPC socket (`$XDG_RUNTIME_DIR/mycel/runtime.sock`, `/run/mycel/runtime.sock`, or `/tmp/mycel-dev.sock`)
 - **Trust Level**: Authenticated local user
 - **Authentication**: Token-based (generated at runtime startup)
 - **Protections**:
-  - Socket permissions set to 0600 (owner only)
+  - Parent directory permissions set to `0700` (`$XDG_RUNTIME_DIR/mycel/`) and socket permissions set to `0600` (owner only)
   - Rate limiting (100 requests/minute)
   - Message size limit (1MB)
 
 ### 2. Runtime ↔ Executor (Sandbox)
-- **Boundary**: Process isolation via firejail/bubblewrap
+- **Boundary**: Process isolation via `bubblewrap` (`bwrap`)
 - **Trust Level**: Untrusted (AI-generated code)
 - **Protections**:
-  - Network isolation (`--net=none`)
-  - Filesystem isolation (`--private`, `--ro-bind`)
-  - Memory limits (`--rlimit-as`)
+  - Network isolation (`--unshare-net`)
+  - Filesystem isolation (`--ro-bind`, `--tmpfs`, `--dev`, `--proc`)
+  - Resource limits (`RLIMIT_AS`, `RLIMIT_NPROC`)
   - Execution timeout (configurable, default 30s)
-  - Pattern validation before execution
+  - Explicit user confirmation for dangerous operations
 
 ### 3. Runtime ↔ Cloud AI (Anthropic)
 - **Boundary**: HTTPS to api.anthropic.com
@@ -58,17 +58,16 @@ Mycel OS is an AI-native operating system where users interact through natural l
 **Description**: AI generates code that escapes sandbox or causes harm.
 
 **Mitigations**:
-- Pattern validation blocks known dangerous patterns
-- Bypass detection (obfuscation attempts blocked)
-- Sandbox isolation (firejail/bubblewrap)
-- No network access in sandbox
+- Substring policy evaluation provides **UX accident-prevention** (catching obvious dangerous commands early), **not** an obfuscation bypass detector
+- The real security boundary is **`bubblewrap` (`bwrap`)** process/namespace isolation combined with **explicit user confirmations**
+- No network access in sandbox (`--unshare-net`)
 - Read-only filesystem bindings
 
 ### T3: IPC Socket Hijacking
 **Description**: Attacker gains access to the IPC socket.
 
 **Mitigations**:
-- Socket permissions 0600
+- Parent directory (`$XDG_RUNTIME_DIR/mycel/`) permissions `0700` and socket permissions `0600`
 - Token authentication required
 - Rate limiting prevents brute force
 - Only runs on localhost
@@ -123,9 +122,10 @@ Mycel OS is an AI-native operating system where users interact through natural l
 
 1. The host operating system is trusted
 2. The Rust runtime is not compromised
-3. The sandbox tool (firejail/bubblewrap) is correctly implemented
+3. The sandbox tool (`bubblewrap` / `bwrap`) is correctly implemented
 4. The user's home directory permissions are correct
 5. Network traffic to external services is encrypted (HTTPS/TLS)
+6. Experimental subsystems (`--features wine`, `--features collective`) are quarantined behind compile-time feature flags and disabled by default
 
 ## Out of Scope
 

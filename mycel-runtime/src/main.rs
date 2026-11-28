@@ -19,6 +19,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod ai;
 mod codegen;
+#[cfg(feature = "collective")]
 mod collective;
 mod commands;
 mod config;
@@ -34,6 +35,7 @@ mod recovery;
 mod selfdev;
 mod sync;
 mod ui;
+#[cfg(feature = "wine")]
 mod wine;
 
 use crate::config::MycelConfig;
@@ -163,8 +165,12 @@ async fn main() -> Result<()> {
         .set_context_manager(context_manager.clone())
         .await;
 
+    #[cfg(feature = "collective")]
     let collective_service =
         collective::CollectiveService::new(&config, args.no_collective).await?;
+    #[cfg(not(feature = "collective"))]
+    let _ = args.no_collective;
+    #[cfg(feature = "wine")]
     let wine_service = wine::WineService::new(&config);
 
     // Create the main runtime
@@ -180,7 +186,9 @@ async fn main() -> Result<()> {
         mcp_manager,
         selfdev,
         command_registry,
+        #[cfg(feature = "collective")]
         collective_service,
+        #[cfg(feature = "wine")]
         wine_service,
         event_bus,
     };
@@ -254,7 +262,9 @@ pub struct MycelRuntime {
     pub mcp_manager: mcp::McpManager,
     pub selfdev: selfdev::SelfDevService,
     pub command_registry: commands::CommandRegistry,
+    #[cfg(feature = "collective")]
     pub collective_service: collective::CollectiveService,
+    #[cfg(feature = "wine")]
     pub wine_service: wine::WineService,
     pub event_bus: tokio::sync::broadcast::Sender<events::SystemEvent>,
 }
@@ -278,98 +288,120 @@ impl MycelRuntime {
     ) -> Result<RuntimeResponse> {
         let context = self.context_manager.get_context(session_id).await?;
 
-        // 1. Handle pending confirmations
-        if let Some(pending_code) = &context.pending_command {
-            let input_lower = input.trim().to_lowercase();
-            let confirmed = matches!(input_lower.as_str(), "yes" | "y" | "confirm" | "ok");
-            let denied = matches!(input_lower.as_str(), "no" | "n" | "cancel");
+        // 1. Handle pending confirmations via unified ConfirmationStore (single-use, TTL-enforced)
+        match self.confirmations.latest_for_session(session_id).await {
+            policy::LatestConfirmation::Expired => {
+                let _ = self.context_manager.clear_pending_command(session_id).await;
+                return Ok(RuntimeResponse::Text("confirmation expired.".to_string()));
+            }
+            policy::LatestConfirmation::Pending(pending) => {
+                let input_lower = input.trim().to_lowercase();
+                let confirmed = matches!(input_lower.as_str(), "yes" | "y" | "confirm" | "ok");
+                let denied = matches!(input_lower.as_str(), "no" | "n" | "cancel");
 
-            // Pending command definition (save a new user command)?
-            if let Some(def_json) = pending_code.strip_prefix("#!defcmd\n") {
-                if confirmed {
-                    self.context_manager
-                        .clear_pending_command(session_id)
-                        .await?;
-                    let def: commands::PendingCommandDef = serde_json::from_str(def_json)?;
-                    let params = def.params.clone();
-                    let script = def.script.clone();
-                    let steps_json = serde_json::to_string(&def.steps)?;
-                    match self
-                        .command_registry
-                        .define_full(
-                            &def.name,
-                            &def.description,
-                            def.steps,
-                            def.params,
-                            def.script,
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            // Propagate the new command across the personal mesh.
-                            let _ = self
-                                .sync_service
-                                .create_event(crate::sync::SyncOperation::DefineCommand {
-                                    name: def.name.clone(),
-                                    description: def.description.clone(),
-                                    steps_json,
-                                    params,
-                                    script,
-                                })
-                                .await;
-                            return Ok(RuntimeResponse::Text(format!(
-                                "'{}' is ready. just say '{}' anytime.",
-                                def.name, def.name
-                            )));
+                if !confirmed && !denied {
+                    let prompt = match &pending.payload {
+                        policy::PendingAction::DefineCommand { .. } => {
+                            "save this command? type 'yes' to save or 'no' to discard.".to_string()
                         }
-                        Err(e) => {
-                            return Ok(RuntimeResponse::Text(format!("couldn't save: {}", e)));
+                        _ => format!(
+                            "you have a pending action. type 'yes' to confirm or 'no' to cancel.\ncode: {}",
+                            pending.code
+                        ),
+                    };
+                    return Ok(RuntimeResponse::Text(prompt));
+                }
+
+                let taken = match self
+                    .confirmations
+                    .take_for_session(&pending.id, session_id)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(policy::ConfirmationLookupError::Expired) => {
+                        let _ = self.context_manager.clear_pending_command(session_id).await;
+                        return Ok(RuntimeResponse::Text("confirmation expired.".to_string()));
+                    }
+                    Err(_) => {
+                        let _ = self.context_manager.clear_pending_command(session_id).await;
+                        return Ok(RuntimeResponse::Text(
+                            "confirmation no longer available.".to_string(),
+                        ));
+                    }
+                };
+                let _ = self.context_manager.clear_pending_command(session_id).await;
+
+                if denied {
+                    let msg = match taken.payload {
+                        policy::PendingAction::DefineCommand { .. } => "command not saved.",
+                        _ => "action cancelled.",
+                    };
+                    return Ok(RuntimeResponse::Text(msg.to_string()));
+                }
+
+                match taken.payload {
+                    policy::PendingAction::DefineCommand { def } => {
+                        let params = def.params.clone();
+                        let script = def.script.clone();
+                        let steps_json = serde_json::to_string(&def.steps)?;
+                        match self
+                            .command_registry
+                            .define_full(
+                                &def.name,
+                                &def.description,
+                                def.steps,
+                                def.params,
+                                def.script,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                let _ = self
+                                    .sync_service
+                                    .create_event(crate::sync::SyncOperation::DefineCommand {
+                                        name: def.name.clone(),
+                                        description: def.description.clone(),
+                                        steps_json,
+                                        params,
+                                        script,
+                                    })
+                                    .await;
+                                return Ok(RuntimeResponse::Text(format!(
+                                    "'{}' is ready. just say '{}' anytime.",
+                                    def.name, def.name
+                                )));
+                            }
+                            Err(e) => {
+                                return Ok(RuntimeResponse::Text(format!("couldn't save: {}", e)));
+                            }
                         }
                     }
-                } else if denied {
-                    self.context_manager
-                        .clear_pending_command(session_id)
-                        .await?;
-                    return Ok(RuntimeResponse::Text("command not saved.".to_string()));
-                } else {
-                    return Ok(RuntimeResponse::Text(
-                        "save this command? type 'yes' to save or 'no' to discard.".to_string(),
-                    ));
+                    policy::PendingAction::ExecuteCode { code } => {
+                        let report = self.executor.run_detailed(&code).await?;
+                        if !report.succeeded() {
+                            let class = recovery::classify_failure(&report);
+                            self.emit_execution_failed(&report, class);
+                        }
+                        return Ok(RuntimeResponse::Text(report.combined_output()));
+                    }
+                    #[cfg(feature = "wine")]
+                    policy::PendingAction::RunWindowsApp {
+                        app_name,
+                        exe_path,
+                        args,
+                    } => {
+                        let res = self
+                            .wine_service
+                            .run_windows_app(&app_name, &exe_path, &args)
+                            .await?;
+                        return Ok(RuntimeResponse::Text(format!(
+                            "wine {} exited (success={}, code={:?}):\n{}",
+                            res.app_name, res.success, res.exit_code, res.stdout
+                        )));
+                    }
                 }
             }
-
-            // Pending code execution?
-            if confirmed {
-                // User confirmed - clear and execute (never auto-repaired, but
-                // failures are still reported on the event bus).
-                self.context_manager
-                    .clear_pending_command(session_id)
-                    .await?;
-                self.confirmations
-                    .clear_matching_code(session_id, pending_code)
-                    .await;
-                let report = self.executor.run_detailed(pending_code).await?;
-                if !report.succeeded() {
-                    let class = recovery::classify_failure(&report);
-                    self.emit_execution_failed(&report, class);
-                }
-                return Ok(RuntimeResponse::Text(report.combined_output()));
-            } else if denied {
-                // User denied - clear and inform
-                self.context_manager
-                    .clear_pending_command(session_id)
-                    .await?;
-                self.confirmations
-                    .clear_matching_code(session_id, pending_code)
-                    .await;
-                return Ok(RuntimeResponse::Text("action cancelled.".to_string()));
-            } else {
-                // User typed something else - inform them they have a pending action
-                return Ok(RuntimeResponse::Text(format!(
-                    "you have a pending action. type 'yes' to confirm or 'no' to cancel.\ncode: {}",
-                    pending_code
-                )));
-            }
+            policy::LatestConfirmation::None => {}
         }
 
         // 2. Command management (conversational create/list/show/forget)
@@ -728,14 +760,29 @@ impl MycelRuntime {
             })
             .await;
 
-        let Some((exact_search_cmd, broad_search_cmd)) = build_missing_command_search(cmd) else {
+        // Detect Void Linux xbps-query first, falling back to apt-cache on Debian/Ubuntu.
+        let pm_probe = self
+            .executor
+            .run("command -v xbps-query >/dev/null 2>&1 && echo xbps || echo apt")
+            .await
+            .unwrap_or_default();
+        let use_xbps = pm_probe.trim() == "xbps";
+
+        let Some((exact_search_cmd, broad_search_cmd)) =
+            build_missing_command_search_for(cmd, use_xbps)
+        else {
             return Ok(RuntimeResponse::Text(format!(
                 "'{}' is not a valid command name. check spelling or install manually.",
                 cmd
             )));
         };
 
-        // Search for package (works on Debian/Ubuntu - devcontainer)
+        let install_cmd = if use_xbps {
+            "sudo xbps-install -S"
+        } else {
+            "sudo apt install"
+        };
+
         let search_result = self.executor.run(&exact_search_cmd).await?;
 
         if search_result.trim().is_empty() {
@@ -750,8 +797,10 @@ impl MycelRuntime {
             }
 
             return Ok(RuntimeResponse::Text(format!(
-                "'{}' not installed. related packages:\n{}\ninstall with: sudo apt install <package>",
-                cmd, broad_search.trim()
+                "'{}' not installed. related packages:\n{}\ninstall with: {} <package>",
+                cmd,
+                broad_search.trim(),
+                install_cmd
             )));
         }
 
@@ -763,9 +812,10 @@ impl MycelRuntime {
             .unwrap_or(cmd);
 
         Ok(RuntimeResponse::Text(format!(
-            "'{}' not installed. found: {}\ninstall? run: sudo apt install {}",
+            "'{}' not installed. found: {}\ninstall? run: {} {}",
             cmd,
             search_result.trim(),
+            install_cmd,
             first_package
         )))
     }
@@ -876,11 +926,14 @@ impl MycelRuntime {
             }
             preview.push_str("save this command? (yes/no)");
 
-            // Stash the pending definition in the session for confirmation.
-            let pending = serde_json::to_string(&def)?;
-            self.context_manager
-                .set_pending_command(session_id, Some(format!("#!defcmd\n{}", pending)))
-                .await?;
+            // Stash the pending definition in the unified ConfirmationStore.
+            self.confirmations
+                .insert_action(
+                    session_id,
+                    policy::PendingAction::DefineCommand { def },
+                    "save custom command",
+                )
+                .await;
             return Ok(Some(preview));
         }
 
@@ -1026,9 +1079,15 @@ Example for 'backup a folder': {{\"params\":[\"folder\"],\"steps\":[\"tar czf ~/
                     Ok(RuntimeResponse::Text(report.combined_output()))
                 }
                 ActionPolicy::RequiresConfirmation { message, .. } => {
-                    self.context_manager
-                        .set_pending_command(session_id, Some(expanded.clone()))
-                        .await?;
+                    self.confirmations
+                        .insert_action(
+                            session_id,
+                            policy::PendingAction::ExecuteCode {
+                                code: expanded.clone(),
+                            },
+                            &message,
+                        )
+                        .await;
                     Ok(RuntimeResponse::Text(format!(
                         "{}\ncode: {}",
                         message, expanded
@@ -1062,9 +1121,15 @@ Example for 'backup a folder': {{\"params\":[\"folder\"],\"steps\":[\"tar czf ~/
                             ));
                         }
                         ActionPolicy::RequiresConfirmation { message, .. } => {
-                            self.context_manager
-                                .set_pending_command(session_id, Some(expanded.clone()))
-                                .await?;
+                            self.confirmations
+                                .insert_action(
+                                    session_id,
+                                    policy::PendingAction::ExecuteCode {
+                                        code: expanded.clone(),
+                                    },
+                                    &message,
+                                )
+                                .await;
                             outputs.push(format!("{}. {} — paused: {}", i + 1, expanded, message));
                             return Ok(RuntimeResponse::Text(outputs.join("\n\n")));
                         }
@@ -1338,19 +1403,33 @@ fn sanitize_missing_command_name(cmd: &str) -> Option<&str> {
     Some(cmd)
 }
 
+#[cfg(test)]
 fn build_missing_command_search(cmd: &str) -> Option<(String, String)> {
+    build_missing_command_search_for(cmd, true)
+}
+
+fn build_missing_command_search_for(cmd: &str, use_xbps: bool) -> Option<(String, String)> {
     let safe = sanitize_missing_command_name(cmd)?;
     let exact_pattern = commands::shell_escape(&format!("^{}$", safe));
     let broad_pattern = commands::shell_escape(safe);
-    let exact = format!(
-        "apt-cache search -- {} 2>/dev/null | head -5 || apt-cache search -- {} 2>/dev/null | head -5",
-        exact_pattern, broad_pattern
-    );
-    let broad = format!(
-        "apt-cache search -- {} 2>/dev/null | head -5",
-        broad_pattern
-    );
-    Some((exact, broad))
+    if use_xbps {
+        let exact = format!(
+            "xbps-query -Rs {} 2>/dev/null | head -5 || xbps-query -Rs {} 2>/dev/null | head -5",
+            exact_pattern, broad_pattern
+        );
+        let broad = format!("xbps-query -Rs {} 2>/dev/null | head -5", broad_pattern);
+        Some((exact, broad))
+    } else {
+        let exact = format!(
+            "apt-cache search -- {} 2>/dev/null | head -5 || apt-cache search -- {} 2>/dev/null | head -5",
+            exact_pattern, broad_pattern
+        );
+        let broad = format!(
+            "apt-cache search -- {} 2>/dev/null | head -5",
+            broad_pattern
+        );
+        Some((exact, broad))
+    }
 }
 
 /// Compact prompt asking the model to repair a failed program. Only the
@@ -1489,9 +1568,11 @@ mod tests {
         let selfdev =
             selfdev::SelfDevService::new(config.selfdev.clone(), dir.join("selfdev.json")).await;
         let command_registry = commands::CommandRegistry::load(dir.join("commands.json")).await;
+        #[cfg(feature = "collective")]
         let collective_service = collective::CollectiveService::new(&config, false)
             .await
             .unwrap();
+        #[cfg(feature = "wine")]
         let wine_service = wine::WineService::new(&config);
 
         MycelRuntime {
@@ -1506,7 +1587,9 @@ mod tests {
             mcp_manager,
             selfdev,
             command_registry,
+            #[cfg(feature = "collective")]
             collective_service,
+            #[cfg(feature = "wine")]
             wine_service,
             event_bus,
         }
@@ -1707,31 +1790,43 @@ mod tests {
 
         // Path 1: process_input — confirm with "y"
         runtime
-            .context_manager
-            .set_pending_command("sess-confirm-1", Some("echo confirmed_default".to_string()))
-            .await
-            .unwrap();
+            .confirmations
+            .insert_action(
+                "sess-confirm-1",
+                policy::PendingAction::ExecuteCode {
+                    code: "echo confirmed_default".to_string(),
+                },
+                "confirm test",
+            )
+            .await;
         let out = unwrap_text(runtime.process_input("y", "sess-confirm-1").await.unwrap());
         assert_eq!(out.trim(), "confirmed_default");
 
         // Path 1: process_input — deny with "n"
         runtime
-            .context_manager
-            .set_pending_command("sess-confirm-1", Some("echo should_not_run".to_string()))
-            .await
-            .unwrap();
+            .confirmations
+            .insert_action(
+                "sess-confirm-1",
+                policy::PendingAction::ExecuteCode {
+                    code: "echo should_not_run".to_string(),
+                },
+                "confirm test",
+            )
+            .await;
         let out = unwrap_text(runtime.process_input("n", "sess-confirm-1").await.unwrap());
         assert_eq!(out, "action cancelled.");
 
         // Path 2: process_input_with_provider (non-Auto) — confirm with "y"
         runtime
-            .context_manager
-            .set_pending_command(
+            .confirmations
+            .insert_action(
                 "sess-confirm-2",
-                Some("echo confirmed_provider".to_string()),
+                policy::PendingAction::ExecuteCode {
+                    code: "echo confirmed_provider".to_string(),
+                },
+                "confirm test",
             )
-            .await
-            .unwrap();
+            .await;
         let out = unwrap_text(
             runtime
                 .process_input_with_provider("y", "sess-confirm-2", ipc::LlmProvider::Cloud)
@@ -1742,10 +1837,15 @@ mod tests {
 
         // Path 2: process_input_with_provider (non-Auto) — deny with "n"
         runtime
-            .context_manager
-            .set_pending_command("sess-confirm-2", Some("echo should_not_run".to_string()))
-            .await
-            .unwrap();
+            .confirmations
+            .insert_action(
+                "sess-confirm-2",
+                policy::PendingAction::ExecuteCode {
+                    code: "echo should_not_run".to_string(),
+                },
+                "confirm test",
+            )
+            .await;
         let out = unwrap_text(
             runtime
                 .process_input_with_provider("n", "sess-confirm-2", ipc::LlmProvider::Cloud)

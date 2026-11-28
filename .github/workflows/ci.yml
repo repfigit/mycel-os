@@ -39,7 +39,9 @@ jobs:
 
       - name: Run clippy
         working-directory: mycel-runtime
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-features --all-targets -- -D warnings
 
       - name: Build
         working-directory: mycel-runtime
@@ -58,6 +60,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --verbose 2>&1 | tee test.log
+          cargo test --all-features --verbose 2>&1 | tee -a test.log
           if grep -q 'skipping sandbox integration test' test.log; then
             echo '::error::sandbox integration tests were skipped (bwrap unavailable)'
             exit 1

@@ -30,6 +30,8 @@ This document captures key decisions made during Mycel OS design. Claude Code sh
 - Compile against musl libc
 - Can't use glibc-only software directly
 
+> **Amendment (2026-11-28):** `mycel-runtime` is packaged as a **distro-agnostic Linux sidecar** across distributions (musl static binary, `.deb`, `.rpm`, Arch, Void). The Void Linux (musl) ISO is maintained as an optional offline-capable reference appliance rather than a prerequisite.
+
 ---
 
 ## ADR-002: Primary Language
@@ -107,6 +109,8 @@ This document captures key decisions made during Mycel OS design. Claude Code sh
 - Implement smart routing (local first, cloud for complex)
 - Handle API errors gracefully
 
+> **Amendment (2026-11-28):** Superseded by multi-provider **tiered routing (`Local -> Cheap -> Frontier`)** across 45+ LLM providers, Venice.ai, and local backends (`llama-cpp` / Ollama), governed by **3-layer spend governance** (per-request cap, daily soft/hard budget, monthly ceiling).
+
 ---
 
 ## ADR-005: IPC Mechanism
@@ -167,6 +171,8 @@ This document captures key decisions made during Mycel OS design. Claude Code sh
 - 512MB memory limit
 - Capture stdout/stderr
 
+> **Amendment (2026-11-28):** **Bubblewrap (`bwrap`) only**; Firejail is not used. `bwrap` provides the real process/namespace isolation boundary (`--unshare-net`, read-only binds, `RLIMIT_AS`/`RLIMIT_NPROC`), paired with explicit user confirmations for dangerous operations.
+
 ---
 
 ## ADR-007: Device Sync Transport
@@ -192,6 +198,8 @@ This document captures key decisions made during Mycel OS design. Claude Code sh
 - Mesh topology (all devices connect to all)
 - mDNS for local discovery
 - Relay nodes for NAT traversal
+
+> **Amendment (2026-11-28):** **Transport-agnostic sync**: Tailscale / LAN direct TCP is the default transport; Mycel kernel WireGuard + STUN + zero-knowledge relay is opt-in.
 
 ---
 
@@ -244,6 +252,8 @@ This document captures key decisions made during Mycel OS design. Claude Code sh
 - ~$0.001 per transaction
 - 1-2 second finality
 
+> **Amendment (2026-11-28):** Quarantined behind compile-time `--features collective`, **off by default**, with a strict **no-coin / no-token-speculation** posture.
+
 ---
 
 ## ADR-010: AI Quality Evaluation
@@ -268,6 +278,8 @@ This document captures key decisions made during Mycel OS design. Claude Code sh
 - Miners evaluate patterns
 - Validators verify evaluations
 - TAO rewards for quality contributions
+
+> **Amendment (2026-11-28):** Quarantined behind compile-time `--features collective`, **off by default**, with a strict **no-coin / no-token-speculation** posture.
 
 ---
 
@@ -318,14 +330,14 @@ This document captures key decisions made during Mycel OS design. Claude Code sh
 
 These are settled. Don't propose alternatives:
 
-1. ✅ Void Linux as base (not Ubuntu, Alpine, etc.)
+1. ✅ Distro-agnostic Linux sidecar (Void Linux musl ISO as optional offline reference appliance)
 2. ✅ Rust as primary language
-3. ✅ Ollama for local AI
-4. ✅ Claude for cloud AI
-5. ✅ Unix socket for IPC
-6. ✅ WireGuard for sync transport
-7. ✅ NEAR for coordination
-8. ✅ Bittensor for AI evaluation
+3. ✅ Local inference (Ollama / native `llama-cpp`)
+4. ✅ Multi-provider tiered Cloud AI (`Local -> Cheap -> Frontier`) + 3-layer spend governance
+5. ✅ Unix socket for IPC (`$XDG_RUNTIME_DIR/mycel/runtime.sock`, `0700` parent dir)
+6. ✅ Bubblewrap (`bwrap`) for code sandbox (Firejail removed)
+7. ✅ Transport-agnostic sync (Tailscale/LAN direct TCP default; WireGuard + STUN + ZK relay opt-in)
+8. ✅ Collective (`--features collective`: NEAR/Bittensor) quarantined off by default; strict no-coin / no-token-speculation posture
 9. ✅ TOML for config
 
 Focus implementation effort on these decisions, not reconsidering them.
