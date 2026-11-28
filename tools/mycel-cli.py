@@ -256,6 +256,58 @@ def cmd_status(args):
         print(f"Unexpected response: {response}")
 
 
+def cmd_providers(args):
+    """List configured/available LLM providers."""
+    response = send_request({"type": "ListProviders"})
+
+    if response.get("type") == "Error":
+        print(f"Error: {response.get('message', 'Unknown error')}", file=sys.stderr)
+        sys.exit(1)
+    elif response.get("type") == "Providers":
+        active_provider = response.get("active_provider")
+        active_model = response.get("active_model")
+        print(f"Active Provider: {active_provider or 'none'}")
+        print(f"Active Model: {active_model or 'none'}")
+        providers = response.get("providers", [])
+        if not providers:
+            print("Providers: none")
+            return
+        print("Providers:")
+        for p in providers:
+            pid = p.get("id", "unknown")
+            tags = []
+            if active_provider and pid == active_provider:
+                tags.append("[active]")
+            if p.get("configured"):
+                tags.append("[configured]")
+            tag_str = f" {' '.join(tags)}" if tags else ""
+            api = p.get("api", "unknown")
+            env_var = p.get("env_var", "")
+            default_model = p.get("default_model", "")
+            print(f"  - {pid}{tag_str} ({api}) env={env_var} default_model={default_model}")
+    else:
+        print(f"Unexpected response: {response}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_provider(args):
+    """Switch active LLM provider and optional model."""
+    response = send_request({
+        "type": "SetProvider",
+        "provider": args.provider,
+        "model": args.model,
+    })
+
+    if response.get("type") == "Error":
+        print(f"Error: {response.get('message', 'Unknown error')}", file=sys.stderr)
+        sys.exit(1)
+    elif response.get("type") == "Ok":
+        print(response.get("message", "Ok"))
+    else:
+        print(f"Unexpected response: {response}", file=sys.stderr)
+        sys.exit(1)
+
+
 def _handle_mesh_error(response: dict) -> None:
     """Exit with code 1 if the runtime returned an Error response."""
     if response.get("type") == "Error":
@@ -352,7 +404,7 @@ def cmd_collective(args):
 
 def main():
     # Check for direct query mode first (most common use case)
-    if len(sys.argv) > 1 and sys.argv[1] not in ('chat', 'run', 'status', 'mesh', 'collective', '-h', '--help', '--version'):
+    if len(sys.argv) > 1 and sys.argv[1] not in ('chat', 'run', 'status', 'providers', 'provider', 'mesh', 'collective', '-h', '--help', '--version'):
         # Direct query: mycel "tell me a joke"
         class Args:
             command = sys.argv[1:]
@@ -369,6 +421,8 @@ Examples:
   mycel "@cloud explain quantum" Force cloud LLM
   mycel "@local what time is it" Force local LLM
   mycel status                  Show runtime status
+  mycel providers               List available LLM providers
+  mycel provider venice llama-3.3-70b  Switch active provider and model
   mycel mesh status             Show mesh sync status
   mycel mesh add-device         Generate a mesh pairing code
   mycel mesh join               Join a mesh using a pairing code
@@ -396,6 +450,16 @@ Environment:
     # Status
     status_parser = subparsers.add_parser('status', help='Show runtime status')
     status_parser.set_defaults(func=cmd_status)
+
+    # Providers
+    providers_parser = subparsers.add_parser('providers', help='List available LLM providers')
+    providers_parser.set_defaults(func=cmd_providers)
+
+    # Provider
+    provider_parser = subparsers.add_parser('provider', help='Switch active LLM provider')
+    provider_parser.add_argument('provider', help='Provider ID (or provider/model)')
+    provider_parser.add_argument('model', nargs='?', default=None, help='Optional model name')
+    provider_parser.set_defaults(func=cmd_provider)
 
     # Mesh
     mesh_parser = subparsers.add_parser('mesh', help='Mesh network commands')

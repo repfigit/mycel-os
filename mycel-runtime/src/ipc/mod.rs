@@ -836,6 +836,33 @@ async fn process_request(
                 }
             }
         },
+        IpcRequest::ListProviders => {
+            let active = runtime.ai_router.active_cloud_selection().await;
+            let (active_provider, active_model) = match active {
+                Some((p, m)) => (Some(p), Some(m)),
+                None => (None, None),
+            };
+            let providers = runtime.ai_router.list_providers();
+            IpcResponse::Providers {
+                active_provider,
+                active_model,
+                providers,
+            }
+        }
+        IpcRequest::SetProvider { provider, model } => {
+            match runtime
+                .ai_router
+                .set_cloud_provider(provider, model.as_deref())
+                .await
+            {
+                Ok((pid, mid)) => IpcResponse::Ok {
+                    message: format!("Active cloud provider set to {pid}/{mid}"),
+                },
+                Err(e) => IpcResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
         IpcRequest::Ping => IpcResponse::Pong,
     }
 }
@@ -902,6 +929,14 @@ pub enum IpcRequest {
     TriggerSync {
         #[serde(default)]
         peer_id: Option<String>,
+    },
+    /// List all known cloud AI providers and the active selection
+    ListProviders,
+    /// Switch the active cloud AI provider (and optional model) at runtime
+    SetProvider {
+        provider: String,
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Ping for health check (allowed without auth)
     Ping,
@@ -971,6 +1006,12 @@ pub enum IpcResponse {
     PeerAdded {
         peer: crate::sync::PeerInfo,
         synced_events: usize,
+    },
+    /// Cloud AI provider catalog and active selection
+    Providers {
+        active_provider: Option<String>,
+        active_model: Option<String>,
+        providers: Vec<crate::ai::providers::ProviderSummary>,
     },
     /// Error response
     Error { message: String },
@@ -1181,6 +1222,9 @@ mod tests {
             r#"{"type":"ConfirmAction","id":"conf-1","approved":true}"#,
             r#"{"type":"Subscribe"}"#,
             r#"{"type":"Subscribe","events":["ConfirmationRequired"]}"#,
+            r#"{"type":"ListProviders"}"#,
+            r#"{"type":"SetProvider","provider":"venice"}"#,
+            r#"{"type":"SetProvider","provider":"venice","model":"llama-3.3-70b"}"#,
             r#"{"type":"Ping"}"#,
         ];
 
@@ -2104,6 +2148,178 @@ mod tests {
             read_ipc_response(&mut reader).await,
             IpcResponse::Error { .. }
         ));
+
+        handle.abort();
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_provider_ipc_list_set_and_auth_gate() {
+        let dir =
+            std::env::temp_dir().join(format!("mycel-ipc-providers-{}", uuid::Uuid::new_v4()));
+        let mut runtime = build_test_runtime(&dir).await;
+        let sock_path = dir.join("mycel.sock");
+        runtime.config.ipc_socket_path = sock_path.to_string_lossy().to_string();
+
+        // Add a configured custom provider with a secret API key and rebuild ai_router.
+        let secret = "super-secret-custom-token-98765";
+        runtime.config.providers.insert(
+            "my-custom-llm".to_string(),
+            crate::config::CustomProviderConfig {
+                api: Some("openai-completions".to_string()),
+                base_url: Some("http://127.0.0.1:9999/v1".to_string()),
+                api_key: Some(secret.to_string()),
+                api_key_env: None,
+                default_model: Some("custom-model-1".to_string()),
+                requires_auth: Some(true),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+        // Add an explicitly unconfigured custom provider so unconfigured rejection is deterministic.
+        runtime.config.providers.insert(
+            "unconfigured-custom".to_string(),
+            crate::config::CustomProviderConfig {
+                api: Some("openai-completions".to_string()),
+                base_url: Some("http://127.0.0.1:9998/v1".to_string()),
+                api_key: None,
+                api_key_env: Some("MYCEL_NONEXISTENT_TEST_KEY_12345".to_string()),
+                default_model: Some("none".to_string()),
+                requires_auth: Some(true),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+        runtime.ai_router = crate::ai::AiRouter::cloud_only(&runtime.config)
+            .await
+            .unwrap();
+
+        let (server, handle) = spawn_test_server(&dir, runtime).await;
+        let token = std::fs::read_to_string(server.token_path()).unwrap();
+
+        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+
+        // 1. Unauthenticated ListProviders and SetProvider must be rejected.
+        for req in [
+            IpcRequest::ListProviders,
+            IpcRequest::SetProvider {
+                provider: "my-custom-llm".to_string(),
+                model: None,
+            },
+        ] {
+            send_ipc_request(&mut w, &req).await;
+            match read_ipc_response(&mut reader).await {
+                IpcResponse::Error { message } => {
+                    assert!(
+                        message.contains("Authentication required"),
+                        "unexpected unauth error: {message}"
+                    );
+                }
+                other => panic!("expected Error before auth, got {other:?}"),
+            }
+        }
+
+        // 2. Authenticate
+        send_ipc_request(&mut w, &IpcRequest::Authenticate { token }).await;
+        assert!(matches!(
+            read_ipc_response(&mut reader).await,
+            IpcResponse::Ok { .. }
+        ));
+
+        // 3. Authenticated ListProviders returns >= 45 providers including venice & openrouter, zero secrets.
+        send_ipc_request(&mut w, &IpcRequest::ListProviders).await;
+        let resp = read_ipc_response(&mut reader).await;
+        let serialized = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !serialized.contains(secret),
+            "ListProviders leaked API key secret!"
+        );
+        match resp {
+            IpcResponse::Providers { providers, .. } => {
+                assert!(
+                    providers.len() >= 45,
+                    "expected >= 45 providers, got {}",
+                    providers.len()
+                );
+                assert!(providers.iter().any(|p| p.id == "venice"));
+                assert!(providers.iter().any(|p| p.id == "openrouter"));
+                assert!(providers
+                    .iter()
+                    .any(|p| p.id == "my-custom-llm" && p.configured));
+            }
+            other => panic!("expected Providers, got {other:?}"),
+        }
+
+        // 4. Reject unknown provider cleanly.
+        send_ipc_request(
+            &mut w,
+            &IpcRequest::SetProvider {
+                provider: "does-not-exist".to_string(),
+                model: None,
+            },
+        )
+        .await;
+        match read_ipc_response(&mut reader).await {
+            IpcResponse::Error { message } => {
+                assert!(
+                    message.contains("Unknown provider"),
+                    "unexpected unknown provider error: {message}"
+                );
+            }
+            other => panic!("expected Error for unknown provider, got {other:?}"),
+        }
+
+        // 5. Reject unconfigured provider cleanly.
+        send_ipc_request(
+            &mut w,
+            &IpcRequest::SetProvider {
+                provider: "unconfigured-custom".to_string(),
+                model: None,
+            },
+        )
+        .await;
+        match read_ipc_response(&mut reader).await {
+            IpcResponse::Error { message } => {
+                assert!(
+                    message.contains("not configured"),
+                    "unexpected unconfigured provider error: {message}"
+                );
+            }
+            other => panic!("expected Error for unconfigured provider, got {other:?}"),
+        }
+
+        // 6. Succeed for configured custom provider and verify via ListProviders.
+        send_ipc_request(
+            &mut w,
+            &IpcRequest::SetProvider {
+                provider: "my-custom-llm".to_string(),
+                model: Some("custom-model-2".to_string()),
+            },
+        )
+        .await;
+        match read_ipc_response(&mut reader).await {
+            IpcResponse::Ok { message } => {
+                assert_eq!(
+                    message,
+                    "Active cloud provider set to my-custom-llm/custom-model-2"
+                );
+            }
+            other => panic!("expected Ok for SetProvider, got {other:?}"),
+        }
+
+        send_ipc_request(&mut w, &IpcRequest::ListProviders).await;
+        match read_ipc_response(&mut reader).await {
+            IpcResponse::Providers {
+                active_provider,
+                active_model,
+                ..
+            } => {
+                assert_eq!(active_provider.as_deref(), Some("my-custom-llm"));
+                assert_eq!(active_model.as_deref(), Some("custom-model-2"));
+            }
+            other => panic!("expected Providers, got {other:?}"),
+        }
 
         handle.abort();
         drop(server);

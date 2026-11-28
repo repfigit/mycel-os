@@ -18,11 +18,24 @@ local_model = "qwen3:8b"  # Native tool-calling + strong code gen; use qwen3:4b 
 local_url = "http://localhost:11434"
 local_timeout_secs = 120
 
-# Cloud AI (via OpenRouter - OpenAI-compatible API)
+# Cloud AI (auto-detects configured provider, or set cloud_provider explicitly)
+# Supported env vars include: VENICE_API_KEY, OPENROUTER_API_KEY, ANTHROPIC_API_KEY,
+# OPENAI_API_KEY, GEMINI_API_KEY, DEEPSEEK_API_KEY, GROQ_API_KEY, CEREBRAS_API_KEY,
+# XAI_API_KEY, MISTRAL_API_KEY, FIREWORKS_API_KEY, TOGETHER_API_KEY, MINIMAX_API_KEY,
+# MOONSHOT_API_KEY, AWS_BEARER_TOKEN_BEDROCK (or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY).
+# Override via MYCEL_CLOUD_PROVIDER and MYCEL_CLOUD_MODEL.
 cloud_enabled = false
-cloud_api_key = ""  # Set via OPENROUTER_API_KEY env var
-cloud_model = "anthropic/claude-3.5-sonnet"  # OpenRouter model format
+# cloud_provider = ""  # Empty = auto-detect (e.g. "venice", "anthropic", "openai", "google", "openrouter")
+cloud_api_key = ""  # Set via OPENROUTER_API_KEY or provider-specific env var
+cloud_model = "anthropic/claude-3.5-sonnet"  # Or provider model, e.g. "llama-3.3-70b" for venice
 cloud_timeout_secs = 60
+
+# Optional custom or overridden provider definitions:
+# [providers.my-local-vllm]
+# api = "openai-completions"
+# base_url = "http://localhost:8000/v1"
+# default_model = "Qwen/Qwen2.5-72B-Instruct"
+# requires_auth = false
 
 # Routing preferences
 prefer_local = true

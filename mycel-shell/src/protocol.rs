@@ -38,8 +38,28 @@ pub enum IpcRequest {
     },
     /// Get mesh sync status.
     SyncStatus,
+    /// List available LLM providers.
+    ListProviders,
+    /// Switch active LLM provider and optional model.
+    SetProvider {
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
     /// Ping for health check (allowed without auth).
     Ping,
+}
+
+/// Summary of an available LLM provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderSummary {
+    pub id: String,
+    pub name: String,
+    pub api: String,
+    pub configured: bool,
+    pub env_var: String,
+    pub default_model: String,
+    pub base_url: String,
 }
 
 /// Peer connection status in mesh sync.
@@ -181,6 +201,12 @@ pub enum IpcResponse {
         event_log_len: usize,
         peers: Vec<PeerInfo>,
     },
+    /// Available LLM providers.
+    Providers {
+        active_provider: Option<String>,
+        active_model: Option<String>,
+        providers: Vec<ProviderSummary>,
+    },
     /// Error response.
     Error { message: String },
     /// Pong response to ping.
@@ -243,6 +269,15 @@ mod tests {
             },
             IpcRequest::Subscribe { events: None },
             IpcRequest::SyncStatus,
+            IpcRequest::ListProviders,
+            IpcRequest::SetProvider {
+                provider: "venice".to_string(),
+                model: Some("llama-3.3-70b".to_string()),
+            },
+            IpcRequest::SetProvider {
+                provider: "ollama".to_string(),
+                model: None,
+            },
             IpcRequest::Ping,
         ];
 
@@ -457,5 +492,59 @@ mod tests {
             assert_eq!(decoded, event);
             assert_eq!(decoded.kind(), expected_kind);
         }
+    }
+
+    #[test]
+    fn provider_protocol_roundtrip() {
+        let list_req = IpcRequest::ListProviders;
+        let list_json = serde_json::to_string(&list_req).unwrap();
+        assert_eq!(list_json, r#"{"type":"ListProviders"}"#);
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&list_json).unwrap(),
+            list_req
+        );
+
+        let set_req = IpcRequest::SetProvider {
+            provider: "venice".to_string(),
+            model: Some("llama-3.3-70b".to_string()),
+        };
+        let set_json = serde_json::to_string(&set_req).unwrap();
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&set_json).unwrap(),
+            set_req
+        );
+
+        let set_no_model = IpcRequest::SetProvider {
+            provider: "ollama".to_string(),
+            model: None,
+        };
+        let set_no_model_json = serde_json::to_string(&set_no_model).unwrap();
+        assert_eq!(
+            set_no_model_json,
+            r#"{"type":"SetProvider","provider":"ollama"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&set_no_model_json).unwrap(),
+            set_no_model
+        );
+
+        let resp = IpcResponse::Providers {
+            active_provider: Some("venice".to_string()),
+            active_model: Some("llama-3.3-70b".to_string()),
+            providers: vec![ProviderSummary {
+                id: "venice".to_string(),
+                name: "Venice AI".to_string(),
+                api: "openai-compatible".to_string(),
+                configured: true,
+                env_var: "VENICE_API_KEY".to_string(),
+                default_model: "llama-3.3-70b".to_string(),
+                base_url: "https://api.venice.ai/api/v1".to_string(),
+            }],
+        };
+        let resp_json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(
+            serde_json::from_str::<IpcResponse>(&resp_json).unwrap(),
+            resp
+        );
     }
 }

@@ -4,6 +4,25 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Configuration for a custom or overridden AI inference provider.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CustomProviderConfig {
+    #[serde(default)]
+    pub api: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub default_model: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub requires_auth: Option<bool>,
+}
+
 /// Main configuration struct
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MycelConfig {
@@ -15,6 +34,10 @@ pub struct MycelConfig {
     #[serde(default = "default_local_model")]
     pub local_model: String,
 
+    /// Cloud provider ID (empty = auto-detect from configured keys)
+    #[serde(default)]
+    pub cloud_provider: String,
+
     /// Cloud model to use (OpenRouter model name, e.g. "anthropic/claude-3.5-sonnet")
     #[serde(default = "default_cloud_model")]
     pub cloud_model: String,
@@ -22,6 +45,10 @@ pub struct MycelConfig {
     /// OpenRouter API key (get one at https://openrouter.ai/keys)
     #[serde(default)]
     pub openrouter_api_key: String,
+
+    /// Custom or overridden AI provider definitions
+    #[serde(default)]
+    pub providers: HashMap<String, CustomProviderConfig>,
 
     /// Prefer cloud over local LLM (useful in low-resource environments)
     #[serde(default)]
@@ -359,8 +386,10 @@ impl Default for MycelConfig {
         Self {
             ollama_url: default_ollama_url(),
             local_model: default_local_model(),
+            cloud_provider: String::new(),
             cloud_model: default_cloud_model(),
             openrouter_api_key: String::new(),
+            providers: HashMap::new(),
             prefer_cloud: false,
             context_path: default_context_path(),
             code_path: default_code_path(),
@@ -402,6 +431,12 @@ impl MycelConfig {
         }
         if let Ok(model) = std::env::var("MYCEL_LOCAL_MODEL") {
             config.local_model = model;
+        }
+        if let Ok(provider) = std::env::var("MYCEL_CLOUD_PROVIDER") {
+            config.cloud_provider = provider;
+        }
+        if let Ok(model) = std::env::var("MYCEL_CLOUD_MODEL") {
+            config.cloud_model = model;
         }
         if std::env::var("MYCEL_PREFER_CLOUD").is_ok() {
             config.prefer_cloud = true;
@@ -499,5 +534,38 @@ wg_address = "10.100.1.2"
             parsed.mesh.peer_endpoints.get("peerA").map(String::as_str),
             Some("203.0.113.5:51820")
         );
+    }
+
+    #[test]
+    fn test_providers_config_backward_compatible_and_custom() {
+        let legacy: MycelConfig = toml::from_str("").unwrap();
+        assert_eq!(legacy.cloud_provider, "");
+        assert!(legacy.providers.is_empty());
+
+        let custom_toml = r#"
+cloud_provider = "venice"
+cloud_model = "llama-3.3-70b"
+
+[providers.my-vllm]
+api = "openai-completions"
+base_url = "http://localhost:8000/v1"
+default_model = "Qwen/Qwen2.5-72B-Instruct"
+requires_auth = false
+
+[providers.my-vllm.headers]
+X-Custom = "val"
+"#;
+        let parsed: MycelConfig = toml::from_str(custom_toml).unwrap();
+        assert_eq!(parsed.cloud_provider, "venice");
+        assert_eq!(parsed.cloud_model, "llama-3.3-70b");
+        let p = parsed.providers.get("my-vllm").unwrap();
+        assert_eq!(p.api.as_deref(), Some("openai-completions"));
+        assert_eq!(p.base_url.as_deref(), Some("http://localhost:8000/v1"));
+        assert_eq!(
+            p.default_model.as_deref(),
+            Some("Qwen/Qwen2.5-72B-Instruct")
+        );
+        assert_eq!(p.requires_auth, Some(false));
+        assert_eq!(p.headers.get("X-Custom").map(String::as_str), Some("val"));
     }
 }

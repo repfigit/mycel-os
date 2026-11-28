@@ -9,12 +9,15 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Command;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::config::MycelConfig;
 use crate::context::Context;
 
+pub mod providers;
 pub mod router;
 pub mod spend;
 use crate::intent::{ActionType, Intent};
@@ -144,6 +147,8 @@ pub struct AiRouter {
     http_client: Client,
     local_available: bool,
     spend_tracker: SpendTracker,
+    provider_registry: Arc<providers::ProviderRegistry>,
+    active_cloud: Arc<RwLock<Option<(String, String)>>>,
 }
 
 use std::pin::Pin;
@@ -182,12 +187,16 @@ impl AiRouter {
         }
 
         let spend_tracker = SpendTracker::load(Self::spend_path(config)).await;
+        let provider_registry = Arc::new(providers::ProviderRegistry::from_config(config));
+        let active_cloud = Arc::new(RwLock::new(provider_registry.auto_select()));
 
         let router = Self {
             config: config.clone(),
             http_client,
             local_available,
             spend_tracker,
+            provider_registry,
+            active_cloud,
         };
 
         // Preload the model in the background so the first user request
@@ -237,11 +246,16 @@ impl AiRouter {
             .connect_timeout(std::time::Duration::from_secs(30))
             .build()?;
 
+        let provider_registry = Arc::new(providers::ProviderRegistry::from_config(config));
+        let active_cloud = Arc::new(RwLock::new(provider_registry.auto_select()));
+
         Ok(Self {
             config: config.clone(),
             http_client,
             local_available: false,
             spend_tracker: SpendTracker::load(Self::spend_path(config)).await,
+            provider_registry,
+            active_cloud,
         })
     }
 
@@ -473,17 +487,16 @@ Provide a helpful response based on these results. Include relevant details, com
     async fn cloud_generate_stream(
         &self,
         prompt: &str,
-    ) -> Result<impl Stream<Item = Result<String>> + Send> {
-        debug!("☁️  Streaming with cloud LLM via OpenRouter");
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        let (provider_id, model) = self
+            .active_cloud_selection()
+            .await
+            .ok_or_else(|| anyhow!("No cloud provider configured"))?;
 
-        if self.config.openrouter_api_key.is_empty() {
-            return Err(anyhow!("OpenRouter API key not configured"));
-        }
-
-        // Mock streaming for cloud by returning the whole thing as one chunk
-        let response = self.cloud_generate(prompt).await?;
-
-        Ok(futures::stream::once(futures::future::ready(Ok(response))))
+        debug!("☁️  Streaming with cloud LLM: {}/{}", provider_id, model);
+        self.provider_registry
+            .generate_stream(&self.http_client, &provider_id, &model, prompt)
+            .await
     }
 
     /// Render recent conversation history for injection into prompts.
@@ -891,13 +904,12 @@ Reply (1-2 sentences max):"#,
         let start = std::time::Instant::now();
 
         // If prefer_cloud is set and we have a cloud API, use cloud first
-        let use_cloud_first = force_cloud || (self.config.prefer_cloud && self.has_cloud_api());
+        let has_cloud = self.has_cloud_api().await;
+        let use_cloud_first = force_cloud || (self.config.prefer_cloud && has_cloud);
 
         info!(
             "AI routing: prefer_cloud={}, has_api={}, using_cloud={}",
-            self.config.prefer_cloud,
-            self.has_cloud_api(),
-            use_cloud_first
+            self.config.prefer_cloud, has_cloud, use_cloud_first
         );
 
         let result = if use_cloud_first {
@@ -949,7 +961,7 @@ Reply (1-2 sentences max):"#,
         let router = AutoRouter::new(
             self.config.router.clone(),
             self.local_available,
-            self.has_cloud_api(),
+            self.has_cloud_api().await,
         );
         let spent_today = self.spend_tracker.spent_today_usd().await;
         let route = router.route(query, context_text, spent_today);
@@ -964,7 +976,7 @@ Reply (1-2 sentences max):"#,
             Route::LocalOnly => self.local_generate(prompt).await,
             Route::LocalWithEscalation => match self.local_generate(prompt).await {
                 Ok(answer) => {
-                    if looks_inadequate(&answer) && self.has_cloud_api() {
+                    if looks_inadequate(&answer) && self.has_cloud_api().await {
                         info!("Local answer inadequate, escalating to cloud");
                         match self.cloud_generate(prompt).await {
                             Ok(cloud_answer) => Ok(cloud_answer),
@@ -978,7 +990,7 @@ Reply (1-2 sentences max):"#,
                     }
                 }
                 Err(e) => {
-                    if self.has_cloud_api() {
+                    if self.has_cloud_api().await {
                         warn!("Local LLM failed, escalating to cloud: {}", e);
                         self.cloud_generate(prompt).await
                     } else {
@@ -1034,71 +1046,62 @@ Reply (1-2 sentences max):"#,
             .ok_or_else(|| anyhow!("Ollama returned empty response"))
     }
 
-    /// Generate using cloud API via OpenRouter
+    /// Generate using the active cloud provider
     async fn cloud_generate(&self, prompt: &str) -> Result<String> {
-        if self.config.openrouter_api_key.is_empty() {
-            return Err(anyhow!(
-                "No cloud API configured. Set OPENROUTER_API_KEY environment variable."
-            ));
-        }
+        let (provider_id, model) = self
+            .active_cloud_selection()
+            .await
+            .ok_or_else(|| {
+                anyhow!(
+                    "No cloud API configured. Set an API key (e.g. VENICE_API_KEY, OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY) or configure [providers.<name>]."
+                )
+            })?;
 
-        self.openrouter_generate(prompt).await
-    }
-
-    /// Generate using OpenRouter API
-    async fn openrouter_generate(&self, prompt: &str) -> Result<String> {
-        info!("☁️  Generating with cloud LLM: {}", self.config.cloud_model);
-
-        let request = OpenRouterRequest {
-            model: self.config.cloud_model.clone(),
-            messages: vec![OpenRouterMessage {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }],
-            max_tokens: Some(4096),
-        };
-
-        let response = self
-            .http_client
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.config.openrouter_api_key),
-            )
-            .header("HTTP-Referer", "https://mycel-os.dev")
-            .header("X-Title", "Mycel OS")
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
+        info!("☁️  Generating with cloud LLM: {}/{}", provider_id, model);
+        let out = self
+            .provider_registry
+            .generate(&self.http_client, &provider_id, &model, prompt)
             .await?;
 
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(anyhow!("OpenRouter API error: {}", error_text));
-        }
-
-        let response: OpenRouterResponse = response.json().await?;
-
         // Record token usage for budget enforcement (best-effort).
-        if let Some(usage) = response.usage {
+        if out.prompt_tokens > 0 || out.completion_tokens > 0 {
             if let Err(e) = self
                 .spend_tracker
-                .record(
-                    &self.config.cloud_model,
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                )
+                .record(&model, out.prompt_tokens, out.completion_tokens)
                 .await
             {
                 debug!("Failed to record cloud spend: {}", e);
             }
         }
 
-        response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.clone())
-            .ok_or_else(|| anyhow!("Empty response from OpenRouter"))
+        Ok(out.text)
+    }
+
+    /// Return the active `(provider_id, model)` cloud selection, if any.
+    pub async fn active_cloud_selection(&self) -> Option<(String, String)> {
+        self.active_cloud.read().await.clone()
+    }
+
+    /// List all known cloud providers without exposing any secrets.
+    pub fn list_providers(&self) -> Vec<providers::ProviderSummary> {
+        self.provider_registry.list_summaries()
+    }
+
+    /// Validate and switch the active cloud provider (and optional model) at runtime.
+    pub async fn set_cloud_provider(
+        &self,
+        provider_or_spec: &str,
+        model_override: Option<&str>,
+    ) -> Result<(String, String)> {
+        let selection = self
+            .provider_registry
+            .validate_selection(provider_or_spec, model_override)?;
+        info!(
+            "Active cloud provider set to {}/{}",
+            selection.0, selection.1
+        );
+        *self.active_cloud.write().await = Some(selection.clone());
+        Ok(selection)
     }
 
     /// Current cloud spend today (USD), for status reporting.
@@ -1132,9 +1135,9 @@ Reply (1-2 sentences max):"#,
                 self.local_generate(prompt).await
             }
             LlmProvider::Cloud => {
-                if !self.has_cloud_api() {
+                if !self.has_cloud_api().await {
                     return Err(anyhow!(
-                        "Cloud LLM is not configured. Set OPENROUTER_API_KEY."
+                        "Cloud LLM is not configured. Set an API key or configure [providers.<name>]."
                     ));
                 }
                 self.cloud_generate(prompt).await
@@ -1246,8 +1249,8 @@ Provide a concise final response based on these tool results."#,
     }
 
     /// Check if cloud API is available
-    fn has_cloud_api(&self) -> bool {
-        !self.config.openrouter_api_key.is_empty()
+    async fn has_cloud_api(&self) -> bool {
+        self.active_cloud.read().await.is_some()
     }
 }
 
@@ -1276,47 +1279,6 @@ struct OllamaResponse {
     response: Option<String>,
     #[serde(default)]
     error: Option<String>,
-}
-
-// Request/Response types for OpenRouter (OpenAI-compatible)
-#[derive(Serialize)]
-struct OpenRouterRequest {
-    model: String,
-    messages: Vec<OpenRouterMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-}
-
-#[derive(Serialize)]
-struct OpenRouterMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct OpenRouterResponse {
-    choices: Vec<OpenRouterChoice>,
-    /// Token usage, present on non-streaming responses.
-    #[serde(default)]
-    usage: Option<OpenRouterUsage>,
-}
-
-#[derive(Deserialize, Debug, Clone, Copy)]
-struct OpenRouterUsage {
-    #[serde(default)]
-    prompt_tokens: u64,
-    #[serde(default)]
-    completion_tokens: u64,
-}
-
-#[derive(Deserialize)]
-struct OpenRouterChoice {
-    message: OpenRouterResponseMessage,
-}
-
-#[derive(Deserialize)]
-struct OpenRouterResponseMessage {
-    content: Option<String>,
 }
 
 // Intent parsing response
