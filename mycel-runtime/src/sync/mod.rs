@@ -20,10 +20,14 @@
 //! - Conversation history is only replicated when `[mesh] sync_ai_context`
 //!   is explicitly enabled.
 
-use crate::config::MycelConfig;
+pub mod log;
+pub mod wireguard;
+
+use crate::config::{MeshTransportMode, MycelConfig};
 use crate::events::SystemEvent;
 use crate::mcp::McpManager;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use base64::Engine;
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305,
@@ -32,9 +36,12 @@ use chrono::{DateTime, Utc};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::net::UdpSocket;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -42,6 +49,18 @@ use x25519_dalek::{PublicKey, StaticSecret};
 /// Upper bound on remembered addresses per peer. Handshakes and mDNS records
 /// are unauthenticated, so this keeps spoofed hints from growing without bound.
 const MAX_PEER_ADDRESSES: usize = 8;
+
+/// Maximum number of events retained in the durable sync log.
+const EVENT_LOG_CAP: usize = 512;
+
+/// Maximum size of a single newline-delimited encrypted TCP sync frame (1 MiB).
+const MAX_SYNC_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Timeout for establishing outbound TCP connections to peers.
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout for reading/writing frames on an established TCP sync stream.
+const TCP_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Vector Clock for tracking causality across devices
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,6 +164,11 @@ pub struct SyncConfig {
     pub trusted_peers: HashSet<String>,
     /// Replicate conversation turns to trusted peers.
     pub sync_ai_context: bool,
+    pub transport: MeshTransportMode,
+    pub interface: String,
+    pub sync_port: u16,
+    pub wg_address: Option<String>,
+    pub peer_endpoints: HashMap<String, String>,
 }
 
 impl Default for SyncConfig {
@@ -158,6 +182,11 @@ impl Default for SyncConfig {
             near_account: None,
             trusted_peers: HashSet::new(),
             sync_ai_context: false,
+            transport: MeshTransportMode::Auto,
+            interface: "mycel0".to_string(),
+            sync_port: 51821,
+            wg_address: None,
+            peer_endpoints: HashMap::new(),
         }
     }
 }
@@ -271,54 +300,267 @@ fn seal_event(own: &StaticSecret, peer: &PublicKey, event: &SyncEvent) -> Result
     })
 }
 
-#[derive(Default)]
 struct SyncState {
     peers: HashMap<String, PeerInfo>,
-    /// Bounded, causally ordered window of recent events (see
-    /// [`EVENT_LOG_CAP`]). Older events are pruned; their clocks are already
-    /// merged into `local_clock`, so pruning does not lose causal state.
-    event_log: Vec<SyncEvent>,
+    trusted_peers: HashSet<String>,
+    log: log::SyncLog,
     local_clock: VectorClock,
+    active_transport: String,
+    wg_interface: Option<String>,
+    wg: Option<wireguard::KernelWireGuard>,
+    tcp_listen_addr: Option<SocketAddr>,
 }
 
-/// Maximum number of events retained in the in-memory log.
-///
-/// The log exists to deduplicate retransmissions and to keep a recent view of
-/// mesh activity, not as history: it must stay bounded so neither dedup nor
-/// the causal sort grows without limit.
-const EVENT_LOG_CAP: usize = 512;
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PersistedPeerMeta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    addresses: Vec<String>,
+}
 
-impl SyncState {
-    /// Insert `event`, keeping the log deduplicated, causally ordered and
-    /// capped. Prunes the oldest entries. Returns `false` when an event with
-    /// the same id is already retained.
-    fn insert_event(&mut self, event: SyncEvent) -> bool {
-        // Bounded linear scan: the log never exceeds EVENT_LOG_CAP.
-        if self.event_log.iter().any(|e| e.id == event.id) {
-            return false;
-        }
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PersistedTrustedPeers {
+    #[serde(default)]
+    trusted_peers: Vec<String>,
+    #[serde(default)]
+    peers: HashMap<String, PersistedPeerMeta>,
+}
 
-        self.event_log.push(event);
-        self.event_log.sort_by(|a, b| {
-            if a.clock.is_ahead_of(&b.clock) {
-                std::cmp::Ordering::Greater
-            } else if b.clock.is_ahead_of(&a.clock) {
-                std::cmp::Ordering::Less
-            } else {
-                a.timestamp.cmp(&b.timestamp)
-            }
-        });
-        if self.event_log.len() > EVENT_LOG_CAP {
-            let excess = self.event_log.len() - EVENT_LOG_CAP;
-            self.event_log.drain(..excess);
-        }
-        true
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum TrustedPeersFile {
+    Structured(PersistedTrustedPeers),
+    LegacyList(Vec<String>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PairingPayload {
+    device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireFrame {
+    sender_id: String,
+    nonce: [u8; 12],
+    encrypted_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum SyncMessage {
+    PushEvent {
+        event: SyncEvent,
+    },
+    PullSince {
+        clock: VectorClock,
+    },
+    EventBatch {
+        events: Vec<SyncEvent>,
+        sender_clock: VectorClock,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshStatusInfo {
+    pub enabled: bool,
+    pub device_id: String,
+    pub transport: String,
+    pub interface: Option<String>,
+    pub listen_addr: Option<String>,
+    pub trusted_peers: usize,
+    pub connected_peers: usize,
+    pub event_log_len: usize,
+    pub peers: Vec<PeerInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingCodeInfo {
+    pub device_id: String,
+    pub code: String,
+    pub endpoint: Option<String>,
+}
+
+fn seal_sync_message(
+    own: &StaticSecret,
+    own_id: &str,
+    peer: &PublicKey,
+    msg: &SyncMessage,
+) -> Result<WireFrame> {
+    use rand::RngCore;
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let plaintext = serde_json::to_vec(msg)?;
+    let encrypted_payload = cipher_for(own, peer)
+        .encrypt(
+            &nonce.into(),
+            Payload {
+                msg: &plaintext,
+                aad: &[],
+            },
+        )
+        .map_err(|e| anyhow!("Sync message encryption error: {}", e))?;
+    Ok(WireFrame {
+        sender_id: own_id.to_string(),
+        nonce,
+        encrypted_payload,
+    })
+}
+
+async fn write_wire_frame(stream: &mut TcpStream, frame: &WireFrame) -> Result<()> {
+    let mut line = serde_json::to_string(frame)?;
+    line.push('\n');
+    tokio::time::timeout(TCP_IO_TIMEOUT, stream.write_all(line.as_bytes()))
+        .await
+        .map_err(|_| anyhow!("Timed out writing sync frame"))??;
+    tokio::time::timeout(TCP_IO_TIMEOUT, stream.flush())
+        .await
+        .map_err(|_| anyhow!("Timed out flushing sync frame"))??;
+    Ok(())
+}
+
+async fn read_wire_frame<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<WireFrame>> {
+    let mut line = String::new();
+    let n = tokio::time::timeout(
+        TCP_IO_TIMEOUT,
+        reader
+            .take((MAX_SYNC_FRAME_BYTES + 1) as u64)
+            .read_line(&mut line),
+    )
+    .await
+    .map_err(|_| anyhow!("Timed out reading sync frame"))??;
+
+    if n == 0 {
+        return Ok(None);
     }
+    if n > MAX_SYNC_FRAME_BYTES {
+        return Err(anyhow!(
+            "Sync frame exceeds MAX_SYNC_FRAME_BYTES ({} bytes)",
+            MAX_SYNC_FRAME_BYTES
+        ));
+    }
+
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let frame: WireFrame =
+        serde_json::from_str(trimmed).context("Failed to deserialize WireFrame")?;
+    Ok(Some(frame))
+}
+
+fn load_persisted_trusted_peers(path: &Path, own_id: &str) -> Result<PersistedTrustedPeers> {
+    if !path.exists() {
+        return Ok(PersistedTrustedPeers::default());
+    }
+    restrict_to_owner(path)?;
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read trusted peers at {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(PersistedTrustedPeers::default());
+    }
+
+    let parsed = match serde_json::from_str::<TrustedPeersFile>(&raw) {
+        Ok(TrustedPeersFile::Structured(s)) => s,
+        Ok(TrustedPeersFile::LegacyList(list)) => PersistedTrustedPeers {
+            trusted_peers: list,
+            peers: HashMap::new(),
+        },
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to parse trusted_peers.json; ignoring corrupt file"
+            );
+            return Ok(PersistedTrustedPeers::default());
+        }
+    };
+
+    let mut clean = PersistedTrustedPeers::default();
+    for raw_id in parsed.trusted_peers {
+        let id = raw_id.trim();
+        if id.is_empty() || id == own_id || decode_id(id).is_none() {
+            continue;
+        }
+        if !clean.trusted_peers.iter().any(|existing| existing == id) {
+            clean.trusted_peers.push(id.to_string());
+        }
+    }
+    for (raw_id, meta) in parsed.peers {
+        let id = raw_id.trim();
+        if id.is_empty() || id == own_id || decode_id(id).is_none() {
+            continue;
+        }
+        clean.peers.insert(id.to_string(), meta);
+    }
+
+    Ok(clean)
+}
+
+fn write_trusted_peers_atomically(path: &Path, data: &PersistedTrustedPeers) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "Failed to create trusted peers directory {}",
+            parent.display()
+        )
+    })?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("trusted_peers.json");
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{}", uuid::Uuid::new_v4()));
+
+    let json =
+        serde_json::to_string_pretty(data).context("Failed to serialize trusted_peers.json")?;
+
+    let write_res = (|| -> Result<()> {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&tmp_path)
+            .with_context(|| format!("Failed to create temp file {}", tmp_path.display()))?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)
+            .with_context(|| format!("Failed to rename temp file to {}", path.display()))?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+fn format_short_peer_name(peer_id: &str) -> String {
+    let short: String = peer_id.chars().take(8).collect();
+    format!("peer-{short}")
 }
 
 #[derive(Clone)]
 pub struct SyncService {
     sync_config: SyncConfig,
+    context_path: PathBuf,
     state: Arc<RwLock<SyncState>>,
     keys: Arc<DeviceKeys>,
     mdns: Option<ServiceDaemon>,
@@ -328,6 +570,10 @@ pub struct SyncService {
     event_bus: broadcast::Sender<SystemEvent>,
     /// Optional command registry for replicating user-defined commands.
     command_registry: Arc<RwLock<Option<crate::commands::CommandRegistry>>>,
+    /// Optional context manager for replicating preferences and conversation turns.
+    context_manager: Arc<RwLock<Option<crate::context::ContextManager>>>,
+    /// Shutdown signal for background listener loops.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -352,6 +598,11 @@ impl SyncService {
         let keys = DeviceKeys::load_or_generate(&config.context_path)?;
         let own_id = keys.id();
         let mesh = &config.mesh;
+        let context_path = PathBuf::from(&config.context_path);
+
+        let log_path = context_path.join("sync_log.jsonl");
+        let sync_log = log::SyncLog::load(log_path, EVENT_LOG_CAP)?;
+        let local_clock = sync_log.reconstructed_clock();
 
         let mut trusted_peers = HashSet::new();
         for raw in &mesh.trusted_peers {
@@ -366,6 +617,44 @@ impl SyncService {
             trusted_peers.insert(id.to_string());
         }
 
+        let persisted_path = context_path.join("trusted_peers.json");
+        let persisted = load_persisted_trusted_peers(&persisted_path, &own_id)?;
+        for id in persisted.trusted_peers {
+            trusted_peers.insert(id);
+        }
+
+        let mut peers: HashMap<String, PeerInfo> = HashMap::new();
+        for peer_id in &trusted_peers {
+            let mut addresses = Vec::new();
+            if let Some(ep) = mesh.peer_endpoints.get(peer_id) {
+                let trimmed = ep.trim();
+                if !trimmed.is_empty() {
+                    addresses.push(trimmed.to_string());
+                }
+            }
+            let mut name = None;
+            if let Some(meta) = persisted.peers.get(peer_id) {
+                if meta.name.is_some() {
+                    name = meta.name.clone();
+                }
+                for addr in &meta.addresses {
+                    if !addresses.iter().any(|a| a == addr) && addresses.len() < MAX_PEER_ADDRESSES
+                    {
+                        addresses.push(addr.clone());
+                    }
+                }
+            }
+            peers.insert(
+                peer_id.clone(),
+                PeerInfo {
+                    id: peer_id.clone(),
+                    name: name.unwrap_or_else(|| format_short_peer_name(peer_id)),
+                    status: PeerStatus::Disconnected,
+                    addresses,
+                },
+            );
+        }
+
         let sync_config = SyncConfig {
             enabled: mesh.enabled,
             mesh_port: mesh.listen_port,
@@ -373,12 +662,17 @@ impl SyncService {
             device_name: "mycel-device".to_string(),
             blockchain_sync: config.blockchain_sync,
             near_account: config.near_account.clone(),
-            trusted_peers,
+            trusted_peers: trusted_peers.clone(),
             sync_ai_context: mesh.sync_ai_context,
+            transport: mesh.transport,
+            interface: mesh.interface.clone(),
+            sync_port: mesh.sync_port,
+            wg_address: mesh.wg_address.clone(),
+            peer_endpoints: mesh.peer_endpoints.clone(),
         };
 
         let socket = if sync_config.enabled {
-            if sync_config.trusted_peers.is_empty() {
+            if trusted_peers.is_empty() {
                 warn!("Mesh enabled but [mesh] trusted_peers is empty; no device will be accepted");
             }
             let bound = match UdpSocket::bind(format!("0.0.0.0:{}", sync_config.mesh_port)).await {
@@ -402,16 +696,58 @@ impl SyncService {
             None
         };
 
+        let initial_transport = if sync_config.enabled {
+            match mesh.transport {
+                MeshTransportMode::Auto => "auto",
+                MeshTransportMode::WireGuard => "wireguard",
+                MeshTransportMode::Direct => "direct",
+            }
+            .to_string()
+        } else {
+            "disabled".to_string()
+        };
+
+        let sync_state = SyncState {
+            peers,
+            trusted_peers,
+            log: sync_log,
+            local_clock,
+            active_transport: initial_transport,
+            wg_interface: None,
+            wg: None,
+            tcp_listen_addr: None,
+        };
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
         Ok(Self {
             sync_config,
-            state: Arc::new(RwLock::new(SyncState::default())),
+            context_path,
+            state: Arc::new(RwLock::new(sync_state)),
             keys: Arc::new(keys),
             mdns,
             mcp_manager: Arc::new(mcp_manager),
             socket,
             event_bus,
             command_registry: Arc::new(RwLock::new(None)),
+            context_manager: Arc::new(RwLock::new(None)),
+            shutdown_tx,
         })
+    }
+
+    /// Signal background listener loops to stop.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    /// Return this device's Mycel ID (base64-encoded x25519 public key).
+    pub fn device_id(&self) -> String {
+        self.keys.id()
+    }
+
+    /// Return the bound TCP sync listener address, if active.
+    pub async fn tcp_listen_addr(&self) -> Option<SocketAddr> {
+        self.state.read().await.tcp_listen_addr
     }
 
     /// Attach the command registry so DefineCommand events can be applied.
@@ -419,35 +755,351 @@ impl SyncService {
         *self.command_registry.write().await = Some(registry);
     }
 
+    /// Attach the context manager so preference and conversation turn events can be applied.
+    pub async fn set_context_manager(&self, cm: crate::context::ContextManager) {
+        *self.context_manager.write().await = Some(cm);
+    }
+
+    pub async fn status(&self) -> MeshStatusInfo {
+        let state = self.state.read().await;
+        let mut peers: Vec<PeerInfo> = state.peers.values().cloned().collect();
+        peers.sort_by(|a, b| a.id.cmp(&b.id));
+        let connected_peers = peers
+            .iter()
+            .filter(|p| matches!(p.status, PeerStatus::Connected))
+            .count();
+
+        MeshStatusInfo {
+            enabled: self.sync_config.enabled,
+            device_id: self.keys.id(),
+            transport: state.active_transport.clone(),
+            interface: state.wg_interface.clone(),
+            listen_addr: state.tcp_listen_addr.map(|a| a.to_string()),
+            trusted_peers: state.trusted_peers.len(),
+            connected_peers,
+            event_log_len: state.log.len(),
+            peers,
+        }
+    }
+
+    pub async fn generate_pairing_code(&self, endpoint: Option<String>) -> PairingCodeInfo {
+        let listen_addr = self.tcp_listen_addr().await;
+        let resolved_endpoint = endpoint
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+            .or_else(|| {
+                listen_addr.map(|a| {
+                    if a.ip().is_unspecified() {
+                        format!("127.0.0.1:{}", a.port())
+                    } else {
+                        a.to_string()
+                    }
+                })
+            });
+
+        let payload = PairingPayload {
+            device_id: self.keys.id(),
+            endpoint: resolved_endpoint.clone(),
+            name: Some(self.sync_config.device_name.clone()),
+        };
+
+        let json = serde_json::to_vec(&payload).unwrap_or_default();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json);
+        let code = format!("mycel-pair-v1:{encoded}");
+
+        PairingCodeInfo {
+            device_id: self.keys.id(),
+            code,
+            endpoint: resolved_endpoint,
+        }
+    }
+
+    pub async fn add_trusted_peer(
+        &self,
+        peer_id: &str,
+        name: Option<String>,
+        endpoint: Option<String>,
+    ) -> Result<(PeerInfo, usize)> {
+        let peer_id = peer_id.trim();
+        if peer_id.is_empty() {
+            return Err(anyhow!("Peer ID cannot be empty"));
+        }
+        if peer_id == self.keys.id() {
+            return Err(anyhow!("Cannot add own device ID as a trusted peer"));
+        }
+        let peer_pk = decode_id(peer_id)
+            .ok_or_else(|| anyhow!("Invalid peer ID: expected base64-encoded 32-byte key"))?;
+
+        let clean_name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+        let clean_endpoint = endpoint
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty());
+
+        let (peer_info, persisted_snapshot, wg_opt, connected_count) = {
+            let mut state = self.state.write().await;
+            state.trusted_peers.insert(peer_id.to_string());
+
+            let entry = state
+                .peers
+                .entry(peer_id.to_string())
+                .or_insert_with(|| PeerInfo {
+                    id: peer_id.to_string(),
+                    name: clean_name
+                        .clone()
+                        .unwrap_or_else(|| format_short_peer_name(peer_id)),
+                    status: PeerStatus::Disconnected,
+                    addresses: Vec::new(),
+                });
+
+            if let Some(new_name) = &clean_name {
+                entry.name = new_name.clone();
+            }
+            if let Some(ep) = &clean_endpoint {
+                if !entry.addresses.iter().any(|a| a == ep) {
+                    if entry.addresses.len() >= MAX_PEER_ADDRESSES {
+                        entry.addresses.remove(0);
+                    }
+                    entry.addresses.push(ep.clone());
+                }
+            }
+
+            let peer_info = entry.clone();
+            let snapshot = Self::build_persisted_peers(&state);
+            let wg_opt = state.wg.clone();
+            let connected_count = state
+                .peers
+                .values()
+                .filter(|p| matches!(p.status, PeerStatus::Connected))
+                .count();
+            (peer_info, snapshot, wg_opt, connected_count)
+        };
+
+        let persisted_path = self.context_path.join("trusted_peers.json");
+        write_trusted_peers_atomically(&persisted_path, &persisted_snapshot)?;
+
+        if let Some(wg) = wg_opt {
+            let mesh_ip = wireguard::derive_mesh_ip(peer_pk.as_bytes());
+            if let Err(e) = wg
+                .set_peer(peer_id, mesh_ip, clean_endpoint.as_deref())
+                .await
+            {
+                warn!(
+                    peer = %peer_id,
+                    error = %e,
+                    "Failed to register peer on WireGuard interface"
+                );
+            }
+        }
+
+        let _ = self.event_bus.send(SystemEvent::SyncStateChanged {
+            peers_connected: connected_count,
+            state: "peer_paired".to_string(),
+        });
+
+        let synced_events = if !peer_info.addresses.is_empty() && self.sync_config.enabled {
+            match self.sync_with_peer(peer_id).await {
+                Ok(n) => n,
+                Err(e) => {
+                    debug!(peer = %peer_id, error = %e, "Initial sync after pairing failed");
+                    0
+                }
+            }
+        } else {
+            0
+        };
+
+        let updated_peer = self
+            .state
+            .read()
+            .await
+            .peers
+            .get(peer_id)
+            .cloned()
+            .unwrap_or(peer_info);
+
+        Ok((updated_peer, synced_events))
+    }
+
+    pub async fn pair_peer(&self, code_or_id: &str) -> Result<(PeerInfo, usize)> {
+        let trimmed = code_or_id.trim();
+        if let Some(encoded) = trimmed.strip_prefix("mycel-pair-v1:") {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(encoded.trim())
+                .context("Invalid base64 in pairing code")?;
+            let payload: PairingPayload =
+                serde_json::from_slice(&raw).context("Invalid JSON in pairing code")?;
+            self.add_trusted_peer(&payload.device_id, payload.name, payload.endpoint)
+                .await
+        } else {
+            self.add_trusted_peer(trimmed, None, None).await
+        }
+    }
+
+    fn build_persisted_peers(state: &SyncState) -> PersistedTrustedPeers {
+        let mut trusted_peers: Vec<String> = state.trusted_peers.iter().cloned().collect();
+        trusted_peers.sort();
+
+        let mut peers = HashMap::new();
+        for (id, info) in &state.peers {
+            if state.trusted_peers.contains(id) {
+                peers.insert(
+                    id.clone(),
+                    PersistedPeerMeta {
+                        name: Some(info.name.clone()),
+                        addresses: info.addresses.clone(),
+                    },
+                );
+            }
+        }
+
+        PersistedTrustedPeers {
+            trusted_peers,
+            peers,
+        }
+    }
+
+    async fn setup_wireguard_dataplane(&self) -> Result<(wireguard::KernelWireGuard, TcpListener)> {
+        let local_ip = match &self.sync_config.wg_address {
+            Some(addr_str) => addr_str
+                .trim()
+                .parse::<Ipv4Addr>()
+                .with_context(|| format!("Invalid [mesh] wg_address '{}'", addr_str))?,
+            None => wireguard::derive_mesh_ip(self.keys.public.as_bytes()),
+        };
+
+        let wg = wireguard::KernelWireGuard::new(self.sync_config.interface.clone(), local_ip)?;
+        let private_b64 = encode_id(&self.keys.private.to_bytes());
+        wg.configure_interface(&private_b64, self.sync_config.mesh_port)
+            .await?;
+
+        let peers_snapshot = {
+            let state = self.state.read().await;
+            state
+                .trusted_peers
+                .iter()
+                .map(|id| {
+                    let ep = state
+                        .peers
+                        .get(id)
+                        .and_then(|p| p.addresses.first().cloned());
+                    (id.clone(), ep)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (peer_id, endpoint) in peers_snapshot {
+            if let Some(pk) = decode_id(&peer_id) {
+                let mesh_ip = wireguard::derive_mesh_ip(pk.as_bytes());
+                if let Err(e) = wg.set_peer(&peer_id, mesh_ip, endpoint.as_deref()).await {
+                    warn!(
+                        peer = %peer_id,
+                        error = %e,
+                        "Failed to configure WireGuard peer"
+                    );
+                }
+            }
+        }
+
+        let listener = TcpListener::bind(("0.0.0.0", self.sync_config.sync_port))
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to bind TCP sync listener on port {}",
+                    self.sync_config.sync_port
+                )
+            })?;
+
+        Ok((wg, listener))
+    }
+
     pub async fn start(&self) -> Result<()> {
-        let Some(socket) = self.socket.clone() else {
+        if !self.sync_config.enabled {
             info!(
                 "Mesh disabled. Mycel ID: {} (add it to [mesh] trusted_peers on your other devices)",
                 self.keys.id()
             );
             return Ok(());
+        }
+
+        let Some(socket) = self.socket.clone() else {
+            return Ok(());
         };
 
-        let port = socket.local_addr()?.port();
+        let (active_transport, wg_opt, tcp_listener) = match self.sync_config.transport {
+            MeshTransportMode::Direct => {
+                let listener = TcpListener::bind(("0.0.0.0", self.sync_config.sync_port))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to bind Direct TCP sync listener on port {}",
+                            self.sync_config.sync_port
+                        )
+                    })?;
+                ("direct".to_string(), None, listener)
+            }
+            MeshTransportMode::WireGuard => {
+                let (wg, listener) = self.setup_wireguard_dataplane().await?;
+                ("wireguard".to_string(), Some(wg), listener)
+            }
+            MeshTransportMode::Auto => match self.setup_wireguard_dataplane().await {
+                Ok((wg, listener)) => ("wireguard".to_string(), Some(wg), listener),
+                Err(e) => {
+                    warn!(
+                        "Kernel WireGuard unavailable ({}); falling back to Direct encrypted TCP",
+                        e
+                    );
+                    let listener = TcpListener::bind(("0.0.0.0", self.sync_config.sync_port))
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to bind fallback Direct TCP sync listener on port {}",
+                                self.sync_config.sync_port
+                            )
+                        })?;
+                    ("direct".to_string(), None, listener)
+                }
+            },
+        };
+
+        let tcp_addr = tcp_listener.local_addr()?;
+        {
+            let mut state = self.state.write().await;
+            state.active_transport = active_transport.clone();
+            state.wg_interface = wg_opt.as_ref().map(|w| w.interface().to_string());
+            state.wg = wg_opt;
+            state.tcp_listen_addr = Some(tcp_addr);
+        }
+
+        let udp_port = socket.local_addr()?.port();
         info!(
-            "Sync service starting on port {}. Mycel ID: {} ({} trusted peers)",
-            port,
-            self.keys.id(),
-            self.sync_config.trusted_peers.len()
+            "Sync service starting (transport={}, tcp={}, udp_port={}). Mycel ID: {}",
+            active_transport,
+            tcp_addr,
+            udp_port,
+            self.keys.id()
         );
 
         if let Some(mdns) = &self.mdns {
-            self.start_discovery(mdns, port).await?;
+            self.start_discovery(mdns, udp_port).await?;
         }
 
         if self.sync_config.blockchain_sync {
             self.start_blockchain_sync().await?;
         }
 
+        // Spawn UDP listener loop
         let service = self.clone();
         tokio::spawn(async move {
             if let Err(e) = service.listen_loop(socket).await {
-                error!("Mesh listener loop error: {}", e);
+                error!("Mesh UDP listener loop error: {}", e);
+            }
+        });
+
+        // Spawn TCP anti-entropy listener loop
+        let service = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = service.tcp_listen_loop(tcp_listener).await {
+                error!("Mesh TCP listener loop error: {}", e);
             }
         });
 
@@ -471,20 +1123,13 @@ impl SyncService {
                             })
                             .await;
                     }
-                    // Tool call events are logged but not synced to mesh
-                    SystemEvent::ToolCalled { .. } => {}
-                    // Server restart events are logged but not synced to mesh
-                    SystemEvent::McpServerRestarted { .. } => {}
-                    // Execution failures are local diagnostics, not synced
-                    SystemEvent::ExecutionFailed { .. } => {}
-                    // Recovery decisions are local diagnostics, not synced
-                    SystemEvent::RecoveryDecided { .. } => {}
-                    // Policy confirmation requests are local to this runtime, not synced
-                    SystemEvent::ConfirmationRequired { .. } => {}
-                    // Provider health changes are local diagnostics, not synced
-                    SystemEvent::ProviderHealthChanged { .. } => {}
-                    // Sync state changes are local diagnostics, not synced
-                    SystemEvent::SyncStateChanged { .. } => {}
+                    SystemEvent::ToolCalled { .. }
+                    | SystemEvent::McpServerRestarted { .. }
+                    | SystemEvent::ExecutionFailed { .. }
+                    | SystemEvent::RecoveryDecided { .. }
+                    | SystemEvent::ConfirmationRequired { .. }
+                    | SystemEvent::ProviderHealthChanged { .. }
+                    | SystemEvent::SyncStateChanged { .. } => {}
                 }
             }
         });
@@ -492,16 +1137,402 @@ impl SyncService {
         Ok(())
     }
 
-    fn is_trusted(&self, peer_id: &str) -> bool {
-        self.sync_config.trusted_peers.contains(peer_id)
+    async fn is_trusted(&self, peer_id: &str) -> bool {
+        self.state.read().await.trusted_peers.contains(peer_id)
+    }
+
+    async fn set_peer_status(&self, peer_id: &str, status: PeerStatus) {
+        let (changed, connected_count, state_label) = {
+            let mut state = self.state.write().await;
+            let Some(peer) = state.peers.get_mut(peer_id) else {
+                return;
+            };
+            let was_connected = matches!(peer.status, PeerStatus::Connected);
+            let now_connected = matches!(status, PeerStatus::Connected);
+            if std::mem::discriminant(&peer.status) == std::mem::discriminant(&status) {
+                return;
+            }
+            peer.status = status;
+            let connected_count = state
+                .peers
+                .values()
+                .filter(|p| matches!(p.status, PeerStatus::Connected))
+                .count();
+            let label = match (was_connected, now_connected) {
+                (false, true) => Some("peer_connected"),
+                (true, false) => Some("peer_disconnected"),
+                _ if !now_connected => Some("peer_disconnected"),
+                _ => None,
+            };
+            (true, connected_count, label)
+        };
+
+        if changed {
+            if let Some(label) = state_label {
+                let _ = self.event_bus.send(SystemEvent::SyncStateChanged {
+                    peers_connected: connected_count,
+                    state: label.to_string(),
+                });
+            }
+        }
+    }
+
+    async fn tcp_listen_loop(&self, listener: TcpListener) -> Result<()> {
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        loop {
+            tokio::select! {
+                res = listener.accept() => {
+                    let (stream, remote_addr) = res?;
+                    let service = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = service.handle_tcp_connection(stream, remote_addr).await {
+                            debug!(remote = %remote_addr, error = %e, "TCP sync connection closed");
+                        }
+                    });
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn decrypt_wire_frame(
+        &self,
+        frame: &WireFrame,
+        trusted_peers: &HashSet<String>,
+    ) -> Result<(String, SyncMessage)> {
+        let own_id = self.keys.id();
+        if frame.sender_id == own_id || !trusted_peers.contains(&frame.sender_id) {
+            return Err(anyhow!(
+                "Rejecting sync frame from untrusted sender {}",
+                frame.sender_id
+            ));
+        }
+
+        let peer_pk = decode_id(&frame.sender_id)
+            .ok_or_else(|| anyhow!("Invalid sender public key {}", frame.sender_id))?;
+
+        let plaintext = cipher_for(&self.keys.private, &peer_pk)
+            .decrypt(
+                &frame.nonce.into(),
+                Payload {
+                    msg: &frame.encrypted_payload,
+                    aad: &[],
+                },
+            )
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to decrypt sync frame from {}: {}",
+                    frame.sender_id,
+                    e
+                )
+            })?;
+
+        let msg: SyncMessage = serde_json::from_slice(&plaintext)
+            .context("Failed to deserialize decrypted SyncMessage")?;
+
+        Ok((frame.sender_id.clone(), msg))
+    }
+
+    fn validate_incoming_message(
+        &self,
+        sender_id: &str,
+        msg: &SyncMessage,
+        trusted_peers: &HashSet<String>,
+    ) -> Result<()> {
+        let own_id = self.keys.id();
+        match msg {
+            SyncMessage::PushEvent { event } => {
+                if event.device_id != sender_id || event.device_id == own_id {
+                    return Err(anyhow!(
+                        "PushEvent device_id '{}' does not match authenticated sender '{}'",
+                        event.device_id,
+                        sender_id
+                    ));
+                }
+            }
+            SyncMessage::EventBatch { events, .. } => {
+                for event in events {
+                    if event.device_id == own_id || !trusted_peers.contains(&event.device_id) {
+                        return Err(anyhow!(
+                            "EventBatch contains event {} from untrusted or self device '{}'",
+                            event.id,
+                            event.device_id
+                        ));
+                    }
+                }
+            }
+            SyncMessage::PullSince { .. } => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_tcp_connection(
+        &self,
+        stream: TcpStream,
+        remote_addr: SocketAddr,
+    ) -> Result<()> {
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        let Some(first_frame) = read_wire_frame(&mut reader).await? else {
+            return Ok(());
+        };
+
+        let trusted_peers = self.state.read().await.trusted_peers.clone();
+        let (sender_id, msg) = self.decrypt_wire_frame(&first_frame, &trusted_peers)?;
+        self.validate_incoming_message(&sender_id, &msg, &trusted_peers)?;
+        self.set_peer_status(&sender_id, PeerStatus::Connected)
+            .await;
+
+        let peer_pk = decode_id(&sender_id)
+            .ok_or_else(|| anyhow!("Invalid peer public key {}", sender_id))?;
+
+        match msg {
+            SyncMessage::PushEvent { event } => {
+                self.apply_event_internal(event).await?;
+            }
+            SyncMessage::PullSince { clock } => {
+                let (missing, sender_clock) = {
+                    let state = self.state.read().await;
+                    (
+                        state.log.events_missing_for(&clock),
+                        state.local_clock.clone(),
+                    )
+                };
+
+                let reply = SyncMessage::EventBatch {
+                    events: missing,
+                    sender_clock,
+                };
+                let reply_frame =
+                    seal_sync_message(&self.keys.private, &self.keys.id(), &peer_pk, &reply)?;
+                let mut line = serde_json::to_string(&reply_frame)?;
+                line.push('\n');
+                tokio::time::timeout(TCP_IO_TIMEOUT, write_half.write_all(line.as_bytes()))
+                    .await
+                    .map_err(|_| anyhow!("Timed out writing EventBatch reply"))??;
+                tokio::time::timeout(TCP_IO_TIMEOUT, write_half.flush())
+                    .await
+                    .map_err(|_| anyhow!("Timed out flushing EventBatch reply"))??;
+
+                // Read optional reverse EventBatch from client before closing.
+                if let Some(reverse_frame) = read_wire_frame(&mut reader).await? {
+                    let trusted_now = self.state.read().await.trusted_peers.clone();
+                    let (rev_sender, rev_msg) =
+                        self.decrypt_wire_frame(&reverse_frame, &trusted_now)?;
+                    if rev_sender != sender_id {
+                        return Err(anyhow!(
+                            "Reverse batch sender {} changed mid-stream (expected {})",
+                            rev_sender,
+                            sender_id
+                        ));
+                    }
+                    self.validate_incoming_message(&rev_sender, &rev_msg, &trusted_now)?;
+                    if let SyncMessage::EventBatch { events, .. } = rev_msg {
+                        for event in events {
+                            self.apply_event_internal(event).await?;
+                        }
+                    }
+                }
+            }
+            SyncMessage::EventBatch { events, .. } => {
+                for event in events {
+                    self.apply_event_internal(event).await?;
+                }
+            }
+        }
+
+        debug!(peer = %sender_id, remote = %remote_addr, "Handled TCP sync session");
+        Ok(())
+    }
+
+    pub async fn sync_with_peer(&self, peer_id: &str) -> Result<usize> {
+        if !self.sync_config.enabled {
+            return Err(anyhow!("Mesh sync is disabled"));
+        }
+
+        let (peer_pk, addresses, local_clock, trusted_peers) = {
+            let state = self.state.read().await;
+            if !state.trusted_peers.contains(peer_id) {
+                return Err(anyhow!("Peer {} is not in trusted_peers", peer_id));
+            }
+            let pk =
+                decode_id(peer_id).ok_or_else(|| anyhow!("Invalid peer public key {}", peer_id))?;
+            let addrs = state
+                .peers
+                .get(peer_id)
+                .map(|p| p.addresses.clone())
+                .unwrap_or_default();
+            (
+                pk,
+                addrs,
+                state.local_clock.clone(),
+                state.trusted_peers.clone(),
+            )
+        };
+
+        if addresses.is_empty() {
+            return Err(anyhow!("No known endpoint address for peer {}", peer_id));
+        }
+
+        let mut connected_stream: Option<TcpStream> = None;
+        let mut last_err: Option<anyhow::Error> = None;
+        for addr_str in &addresses {
+            match tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr_str)).await {
+                Ok(Ok(stream)) => {
+                    connected_stream = Some(stream);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last_err = Some(anyhow!("Failed to connect to {}: {}", addr_str, e));
+                }
+                Err(_) => {
+                    last_err = Some(anyhow!("Timed out connecting to {}", addr_str));
+                }
+            }
+        }
+
+        let mut stream = match connected_stream {
+            Some(s) => s,
+            None => {
+                self.set_peer_status(peer_id, PeerStatus::Disconnected)
+                    .await;
+                return Err(last_err.unwrap_or_else(|| anyhow!("Failed to connect to peer")));
+            }
+        };
+
+        self.set_peer_status(peer_id, PeerStatus::Connected).await;
+
+        let own_id = self.keys.id();
+        let pull_msg = SyncMessage::PullSince {
+            clock: local_clock.clone(),
+        };
+        let pull_frame = seal_sync_message(&self.keys.private, &own_id, &peer_pk, &pull_msg)?;
+        write_wire_frame(&mut stream, &pull_frame).await?;
+
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        let reply_frame = read_wire_frame(&mut reader).await?.ok_or_else(|| {
+            anyhow!(
+                "Peer {} closed connection before sending EventBatch",
+                peer_id
+            )
+        })?;
+
+        let (sender_id, reply_msg) = self.decrypt_wire_frame(&reply_frame, &trusted_peers)?;
+        if sender_id != peer_id {
+            return Err(anyhow!(
+                "Expected reply from peer {}, got {}",
+                peer_id,
+                sender_id
+            ));
+        }
+        self.validate_incoming_message(&sender_id, &reply_msg, &trusted_peers)?;
+
+        let (events, peer_clock) = match reply_msg {
+            SyncMessage::EventBatch {
+                events,
+                sender_clock,
+            } => (events, sender_clock),
+            other => {
+                return Err(anyhow!(
+                    "Unexpected response from peer {}: {:?}",
+                    peer_id,
+                    std::mem::discriminant(&other)
+                ));
+            }
+        };
+
+        let mut applied_count = 0usize;
+        for event in events {
+            if self.apply_event_internal(event).await? {
+                applied_count += 1;
+            }
+        }
+
+        let (missing_for_peer, updated_clock) = {
+            let state = self.state.read().await;
+            (
+                state.log.events_missing_for(&peer_clock),
+                state.local_clock.clone(),
+            )
+        };
+
+        if !missing_for_peer.is_empty() {
+            let push_batch = SyncMessage::EventBatch {
+                events: missing_for_peer,
+                sender_clock: updated_clock,
+            };
+            let batch_frame =
+                seal_sync_message(&self.keys.private, &own_id, &peer_pk, &push_batch)?;
+            let mut line = serde_json::to_string(&batch_frame)?;
+            line.push('\n');
+            tokio::time::timeout(TCP_IO_TIMEOUT, write_half.write_all(line.as_bytes()))
+                .await
+                .map_err(|_| anyhow!("Timed out writing reverse EventBatch"))??;
+            tokio::time::timeout(TCP_IO_TIMEOUT, write_half.flush())
+                .await
+                .map_err(|_| anyhow!("Timed out flushing reverse EventBatch"))??;
+        }
+        let _ = write_half.shutdown().await;
+
+        let connected_count = self
+            .state
+            .read()
+            .await
+            .peers
+            .values()
+            .filter(|p| matches!(p.status, PeerStatus::Connected))
+            .count();
+        let _ = self.event_bus.send(SystemEvent::SyncStateChanged {
+            peers_connected: connected_count,
+            state: "synced".to_string(),
+        });
+
+        Ok(applied_count)
+    }
+
+    pub async fn sync_all_peers(&self) -> usize {
+        let peer_ids: Vec<String> = {
+            let state = self.state.read().await;
+            state.trusted_peers.iter().cloned().collect()
+        };
+
+        let mut total = 0usize;
+        for peer_id in peer_ids {
+            match self.sync_with_peer(&peer_id).await {
+                Ok(n) => total += n,
+                Err(e) => {
+                    debug!(peer = %peer_id, error = %e, "Peer sync skipped or failed");
+                }
+            }
+        }
+        total
     }
 
     async fn listen_loop(&self, socket: Arc<UdpSocket>) -> Result<()> {
         let mut buf = [0u8; 65535];
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         loop {
-            let (len, addr) = socket.recv_from(&mut buf).await?;
-            self.handle_packet(&buf[..len], addr).await;
+            tokio::select! {
+                res = socket.recv_from(&mut buf) => {
+                    let (len, addr) = res?;
+                    self.handle_packet(&buf[..len], addr).await;
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
         }
+        Ok(())
     }
 
     async fn handle_packet(&self, data: &[u8], addr: SocketAddr) {
@@ -516,19 +1547,22 @@ impl SyncService {
             Ok(MeshPacket::Event {
                 nonce,
                 encrypted_data,
-            }) => match self.open_from_trusted(&nonce, &encrypted_data) {
-                Some((peer_id, event)) => {
-                    if event.device_id != peer_id {
-                        warn!(
-                            "Dropping event {} from {}: claims device {} but was sealed by {}",
-                            event.id, addr, event.device_id, peer_id
-                        );
-                        return;
+            }) => {
+                let trusted_peers = self.state.read().await.trusted_peers.clone();
+                match self.open_from_trusted(&nonce, &encrypted_data, &trusted_peers) {
+                    Some((peer_id, event)) => {
+                        if event.device_id != peer_id {
+                            warn!(
+                                "Dropping event {} from {}: claims device {} but was sealed by {}",
+                                event.id, addr, event.device_id, peer_id
+                            );
+                            return;
+                        }
+                        let _ = self.apply_event(event).await;
                     }
-                    let _ = self.apply_event(event).await;
+                    None => debug!("Dropping event from {}: not sealed by a trusted peer", addr),
                 }
-                None => debug!("Dropping event from {}: not sealed by a trusted peer", addr),
-            },
+            }
             Err(e) => {
                 debug!("Received invalid mesh packet from {}: {}", addr, e);
             }
@@ -538,7 +1572,7 @@ impl SyncService {
     /// Record a reachable address for a trusted peer. Returns false (and
     /// records nothing) for untrusted IDs.
     async fn note_peer_address(&self, peer_id: &str, addr: &str, name: Option<&str>) -> bool {
-        if !self.is_trusted(peer_id) {
+        if !self.is_trusted(peer_id).await {
             debug!("Ignoring untrusted device {} at {}", peer_id, addr);
             return false;
         }
@@ -566,8 +1600,13 @@ impl SyncService {
     }
 
     /// Try to open an event packet with each trusted peer's shared secret.
-    fn open_from_trusted(&self, nonce: &[u8; 12], data: &[u8]) -> Option<(String, SyncEvent)> {
-        for peer_id in &self.sync_config.trusted_peers {
+    fn open_from_trusted(
+        &self,
+        nonce: &[u8; 12],
+        data: &[u8],
+        trusted_peers: &HashSet<String>,
+    ) -> Option<(String, SyncEvent)> {
+        for peer_id in trusted_peers {
             let Some(peer_pk) = decode_id(peer_id) else {
                 continue;
             };
@@ -731,36 +1770,80 @@ impl SyncService {
             return Ok(None);
         }
 
-        let mut state = self.state.write().await;
-        let device_id = self.keys.id();
-        state.local_clock.increment(&device_id);
+        let (event, peers) = {
+            let mut state = self.state.write().await;
+            let device_id = self.keys.id();
+            state.local_clock.increment(&device_id);
 
-        let event = SyncEvent {
-            id: uuid::Uuid::new_v4().to_string(),
-            device_id,
-            timestamp: Utc::now(),
-            clock: state.local_clock.clone(),
-            operation,
-            signature: Vec::new(),
+            let event = SyncEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                device_id,
+                timestamp: Utc::now(),
+                clock: state.local_clock.clone(),
+                operation,
+                signature: Vec::new(),
+            };
+
+            state.log.append(event.clone())?;
+            let peers = state.peers.clone();
+            (event, peers)
         };
-
-        state.insert_event(event.clone());
-
-        let peers = state.peers.clone();
-        drop(state);
 
         for peer in peers.values() {
             let _ = self.send_event(peer, &event).await;
+            if !peer.addresses.is_empty() {
+                if let Err(e) = self.push_event_tcp(peer, &event).await {
+                    debug!(peer = %peer.id, error = %e, "TCP push failed; marking peer disconnected");
+                    self.set_peer_status(&peer.id, PeerStatus::Disconnected)
+                        .await;
+                } else {
+                    self.set_peer_status(&peer.id, PeerStatus::Connected).await;
+                }
+            }
         }
 
         Ok(Some(event))
+    }
+
+    async fn push_event_tcp(&self, peer: &PeerInfo, event: &SyncEvent) -> Result<()> {
+        if !self.is_trusted(&peer.id).await {
+            return Err(anyhow!("Refusing to push to untrusted peer {}", peer.id));
+        }
+        let peer_pk = decode_id(&peer.id).ok_or_else(|| anyhow!("Invalid peer public key"))?;
+        let frame = seal_sync_message(
+            &self.keys.private,
+            &self.keys.id(),
+            &peer_pk,
+            &SyncMessage::PushEvent {
+                event: event.clone(),
+            },
+        )?;
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for addr_str in &peer.addresses {
+            match tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr_str)).await {
+                Ok(Ok(mut stream)) => {
+                    write_wire_frame(&mut stream, &frame).await?;
+                    let _ = stream.shutdown().await;
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    last_err = Some(anyhow!("TCP connect to {} failed: {}", addr_str, e));
+                }
+                Err(_) => {
+                    last_err = Some(anyhow!("TCP connect to {} timed out", addr_str));
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow!("No reachable addresses for peer {}", peer.id)))
     }
 
     async fn send_event(&self, peer: &PeerInfo, event: &SyncEvent) -> Result<()> {
         let Some(socket) = &self.socket else {
             return Ok(());
         };
-        if !self.is_trusted(&peer.id) {
+        if !self.is_trusted(&peer.id).await {
             return Err(anyhow!("Refusing to send to untrusted peer {}", peer.id));
         }
         let peer_pk = decode_id(&peer.id).ok_or_else(|| anyhow!("Invalid peer public key"))?;
@@ -780,19 +1863,21 @@ impl SyncService {
     }
 
     pub async fn apply_event(&self, event: SyncEvent) -> Result<()> {
+        self.apply_event_internal(event).await?;
+        Ok(())
+    }
+
+    async fn apply_event_internal(&self, event: SyncEvent) -> Result<bool> {
         debug!(event_id = %event.id, device = %event.device_id, "Applying sync event");
 
-        let mut state = self.state.write().await;
-
-        state.local_clock.merge(&event.clock);
-
-        // Fresh id in the common case, but peers may retransmit; insert_event
-        // deduplicates within the retained window and enforces the cap.
-        if !state.insert_event(event.clone()) {
-            debug!(event_id = %event.id, "Duplicate sync event ignored");
-            return Ok(());
+        {
+            let mut state = self.state.write().await;
+            state.local_clock.merge(&event.clock);
+            if !state.log.append(event.clone())? {
+                debug!(event_id = %event.id, "Duplicate sync event ignored");
+                return Ok(false);
+            }
         }
-        drop(state);
 
         info!(event_id = %event.id, "Event integrated into local mesh log");
 
@@ -832,10 +1917,47 @@ impl SyncService {
                     }
                 }
             }
-            _ => {}
+            SyncOperation::AddConversationTurn {
+                session_id,
+                user,
+                assistant,
+            } => {
+                if self.sync_config.sync_ai_context {
+                    let cm = self.context_manager.read().await.clone();
+                    if let Some(cm) = cm {
+                        if let Err(e) = cm.apply_synced_turn(&session_id, &user, &assistant).await {
+                            warn!(
+                                session_id = %session_id,
+                                error = %e,
+                                "Failed to apply synced conversation turn"
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        session_id = %session_id,
+                        "Ignoring AddConversationTurn because sync_ai_context is false"
+                    );
+                }
+            }
+            SyncOperation::UpdatePreference { key, value } => {
+                let cm = self.context_manager.read().await.clone();
+                if let Some(cm) = cm {
+                    if let Err(e) = cm.set_user_preference(&key, &value).await {
+                        warn!(
+                            key = %key,
+                            error = %e,
+                            "Failed to apply synced preference"
+                        );
+                    }
+                }
+            }
+            SyncOperation::AddLearnedPattern { trigger, .. } => {
+                debug!(trigger = %trigger, "Recorded AddLearnedPattern sync event");
+            }
         }
 
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -887,10 +2009,13 @@ mod tests {
                 mdns_enabled: false,
                 trusted_peers: trusted.to_vec(),
                 sync_ai_context,
+                transport: MeshTransportMode::Direct,
+                sync_port: 0,
+                ..Default::default()
             },
             ..Default::default()
         };
-        let (tx, _) = broadcast::channel(4);
+        let (tx, _) = broadcast::channel(16);
         SyncService::new(&config, None, tx).await.unwrap()
     }
 
@@ -987,7 +2112,7 @@ mod tests {
         assert!(svc.socket.is_none());
         assert!(svc.mdns.is_none());
         assert!(svc.create_event(pref()).await.unwrap().is_none());
-        assert!(svc.state.read().await.event_log.is_empty());
+        assert!(svc.state.read().await.log.is_empty());
     }
 
     #[tokio::test]
@@ -1034,7 +2159,7 @@ mod tests {
         )
         .unwrap();
         deliver(&svc, &packet).await;
-        assert!(svc.state.read().await.event_log.is_empty());
+        assert!(svc.state.read().await.log.is_empty());
     }
 
     #[tokio::test]
@@ -1048,7 +2173,7 @@ mod tests {
         )
         .unwrap();
         deliver(&svc, &packet).await;
-        assert_eq!(svc.state.read().await.event_log.len(), 1);
+        assert_eq!(svc.state.read().await.log.len(), 1);
     }
 
     #[tokio::test]
@@ -1063,7 +2188,7 @@ mod tests {
         )
         .unwrap();
         deliver(&svc, &packet).await;
-        assert!(svc.state.read().await.event_log.is_empty());
+        assert!(svc.state.read().await.log.is_empty());
     }
 
     #[tokio::test]
@@ -1079,7 +2204,7 @@ mod tests {
         let packet =
             seal_event(&friend_secret, &svc.keys.public, &event_from(&friend, op)).unwrap();
         deliver(&svc, &packet).await;
-        assert_eq!(svc.state.read().await.event_log.len(), 1);
+        assert_eq!(svc.state.read().await.log.len(), 1);
         let dynamic = std::env::current_dir()
             .unwrap()
             .join("mcp-servers/dynamic")
@@ -1146,28 +2271,28 @@ mod tests {
 
     #[test]
     fn test_event_log_is_capped_prunes_oldest_and_stays_ordered() {
-        let mut state = SyncState::default();
+        let dir = temp_dir();
+        let log_path = PathBuf::from(&dir).join("sync_log.jsonl");
+        let mut sync_log = log::SyncLog::load(log_path, EVENT_LOG_CAP).unwrap();
         let base = Utc::now();
         for i in 0..(EVENT_LOG_CAP + 25) {
             let mut e = event_from("dev", pref());
             e.timestamp = base + chrono::Duration::milliseconds(i as i64);
-            assert!(state.insert_event(e), "event {i} rejected");
+            assert!(sync_log.append(e).unwrap(), "event {i} rejected");
         }
 
-        assert_eq!(state.event_log.len(), EVENT_LOG_CAP);
+        let events = sync_log.events();
+        assert_eq!(events.len(), EVENT_LOG_CAP);
         // The 25 oldest entries were pruned; the newest is still last.
         assert_eq!(
-            state.event_log[0].timestamp,
+            events[0].timestamp,
             base + chrono::Duration::milliseconds(25)
         );
         assert_eq!(
-            state.event_log.last().unwrap().timestamp,
+            events.last().unwrap().timestamp,
             base + chrono::Duration::milliseconds((EVENT_LOG_CAP + 24) as i64)
         );
-        assert!(state
-            .event_log
-            .windows(2)
-            .all(|w| w[0].timestamp <= w[1].timestamp));
+        assert!(events.windows(2).all(|w| w[0].timestamp <= w[1].timestamp));
     }
 
     #[tokio::test]
@@ -1186,8 +2311,243 @@ mod tests {
         }
 
         let state = svc.state.read().await;
-        assert_eq!(state.event_log.len(), 2, "duplicates were not deduplicated");
-        assert_eq!(state.event_log[0].id, earlier.id);
-        assert_eq!(state.event_log[1].id, later.id);
+        let events = state.log.events();
+        assert_eq!(events.len(), 2, "duplicates were not deduplicated");
+        assert_eq!(events[0].id, earlier.id);
+        assert_eq!(events[1].id, later.id);
+    }
+
+    async fn build_node(
+        context_path: &str,
+        sync_ai_context: bool,
+    ) -> (
+        SyncService,
+        crate::context::ContextManager,
+        crate::commands::CommandRegistry,
+        broadcast::Receiver<SystemEvent>,
+    ) {
+        let config = MycelConfig {
+            context_path: context_path.to_string(),
+            mesh: crate::config::MeshConfig {
+                enabled: true,
+                listen_port: 0,
+                mdns_enabled: false,
+                trusted_peers: Vec::new(),
+                sync_ai_context,
+                transport: MeshTransportMode::Direct,
+                sync_port: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (tx, rx) = broadcast::channel(64);
+        let cm = crate::context::ContextManager::new(&config).await.unwrap();
+        let registry = crate::commands::CommandRegistry::load(
+            PathBuf::from(context_path).join("commands.json"),
+        )
+        .await;
+        let svc = SyncService::new(&config, None, tx).await.unwrap();
+        svc.set_context_manager(cm.clone()).await;
+        svc.set_command_registry(registry.clone()).await;
+        svc.start().await.unwrap();
+        (svc, cm, registry, rx)
+    }
+
+    #[tokio::test]
+    async fn test_two_node_e2e_pairing_propagation_restart_and_security() {
+        let dir_a = temp_dir();
+        let dir_b = temp_dir();
+        let dir_c = temp_dir();
+
+        let (node_a, cm_a, _reg_a, mut rx_a) = build_node(&dir_a, true).await;
+        let (node_b, cm_b, reg_b, mut rx_b) = build_node(&dir_b, true).await;
+        let (node_c, _cm_c, _reg_c, _rx_c) = build_node(&dir_c, true).await;
+
+        let addr_a = node_a.tcp_listen_addr().await.unwrap();
+        let addr_b = node_b.tcp_listen_addr().await.unwrap();
+        let ep_a = format!("127.0.0.1:{}", addr_a.port());
+        let ep_b = format!("127.0.0.1:{}", addr_b.port());
+
+        // 1. Untrusted Node C is rejected over live TCP.
+        let mut c_frame = seal_sync_message(
+            &node_c.keys.private,
+            &node_c.device_id(),
+            &node_a.keys.public,
+            &SyncMessage::PullSince {
+                clock: VectorClock::default(),
+            },
+        )
+        .unwrap();
+        let mut c_stream = TcpStream::connect(&ep_a).await.unwrap();
+        write_wire_frame(&mut c_stream, &c_frame).await.unwrap();
+        let (c_read, _) = c_stream.into_split();
+        let mut c_reader = BufReader::new(c_read);
+        let reply = read_wire_frame(&mut c_reader).await;
+        assert!(
+            matches!(reply, Ok(None) | Err(_)),
+            "Untrusted node C should be rejected without an EventBatch"
+        );
+        // Also ensure spoofed sender_id in WireFrame is rejected.
+        c_frame.sender_id = node_b.device_id();
+        let mut c_stream2 = TcpStream::connect(&ep_a).await.unwrap();
+        write_wire_frame(&mut c_stream2, &c_frame).await.unwrap();
+        let (c_read2, _) = c_stream2.into_split();
+        let mut c_reader2 = BufReader::new(c_read2);
+        assert!(matches!(
+            read_wire_frame(&mut c_reader2).await,
+            Ok(None) | Err(_)
+        ));
+
+        // 2. Pair A <-> B via generate_pairing_code + pair_peer.
+        let code_a = node_a.generate_pairing_code(Some(ep_a.clone())).await;
+        let code_b = node_b.generate_pairing_code(Some(ep_b.clone())).await;
+
+        let (peer_a_on_b, _) = node_b.pair_peer(&code_a.code).await.unwrap();
+        assert_eq!(peer_a_on_b.id, node_a.device_id());
+        let (peer_b_on_a, _) = node_a.pair_peer(&code_b.code).await.unwrap();
+        assert_eq!(peer_b_on_a.id, node_b.device_id());
+
+        // 3. Live propagation of UpdatePreference, DefineCommand, and AddConversationTurn.
+        node_a
+            .create_event(SyncOperation::UpdatePreference {
+                key: "theme".to_string(),
+                value: "solarized".to_string(),
+            })
+            .await
+            .unwrap();
+        node_a
+            .create_event(SyncOperation::DefineCommand {
+                name: "greet".to_string(),
+                description: "say hi".to_string(),
+                steps_json: "[]".to_string(),
+                params: vec!["who".to_string()],
+                script: Some("echo hi".to_string()),
+            })
+            .await
+            .unwrap();
+        node_a
+            .create_event(SyncOperation::AddConversationTurn {
+                session_id: "sess-1".to_string(),
+                user: "hello mesh".to_string(),
+                assistant: "hi from node a".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // Give async TCP push a brief moment, or trigger sync if needed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = node_b.sync_with_peer(&node_a.device_id()).await.unwrap();
+
+        let b_ctx = cm_b.get_context("sess-1").await.unwrap();
+        assert_eq!(
+            b_ctx.user_preferences.get("theme").map(String::as_str),
+            Some("solarized")
+        );
+        assert_eq!(b_ctx.conversation_history.len(), 1);
+        assert_eq!(b_ctx.conversation_history[0].user, "hello mesh");
+        assert!(reg_b.contains("greet").await);
+
+        let b_log_path = PathBuf::from(&dir_b).join("sync_log.jsonl");
+        assert!(b_log_path.exists());
+        let b_log_reloaded = log::SyncLog::load(b_log_path, EVENT_LOG_CAP).unwrap();
+        assert_eq!(b_log_reloaded.len(), 3);
+
+        // 4. Offline gap + restart + reconnect catch-up.
+        node_b.shutdown();
+        drop(node_b);
+        drop(cm_b);
+        drop(reg_b);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        node_a
+            .create_event(SyncOperation::UpdatePreference {
+                key: "editor".to_string(),
+                value: "nvim".to_string(),
+            })
+            .await
+            .unwrap();
+        node_a
+            .create_event(SyncOperation::UpdatePreference {
+                key: "shell".to_string(),
+                value: "zsh".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let (node_b2, cm_b2, _reg_b2, mut rx_b2) = build_node(&dir_b, true).await;
+        assert_eq!(node_b2.status().await.trusted_peers, 1);
+        assert_eq!(node_b2.status().await.event_log_len, 3);
+
+        let synced = node_b2.sync_with_peer(&node_a.device_id()).await.unwrap();
+        assert_eq!(synced, 2, "only the 2 missing events should be applied");
+        assert_eq!(node_b2.status().await.event_log_len, 5);
+
+        let b2_ctx = cm_b2.get_context("sess-1").await.unwrap();
+        assert_eq!(
+            b2_ctx.user_preferences.get("theme").map(String::as_str),
+            Some("solarized")
+        );
+        assert_eq!(
+            b2_ctx.user_preferences.get("editor").map(String::as_str),
+            Some("nvim")
+        );
+        assert_eq!(
+            b2_ctx.user_preferences.get("shell").map(String::as_str),
+            Some("zsh")
+        );
+        // Zero duplicates in persisted log
+        let turn_count = node_b2
+            .state
+            .read()
+            .await
+            .log
+            .events()
+            .iter()
+            .filter(|e| matches!(e.operation, SyncOperation::AddConversationTurn { .. }))
+            .count();
+        assert_eq!(turn_count, 1);
+
+        // Verify SyncStateChanged events were emitted.
+        let mut saw_a_state = false;
+        while let Ok(ev) = rx_a.try_recv() {
+            if matches!(ev, SystemEvent::SyncStateChanged { .. }) {
+                saw_a_state = true;
+            }
+        }
+        assert!(saw_a_state, "Node A should emit SyncStateChanged");
+
+        let mut saw_b_state = false;
+        while let Ok(ev) = rx_b.try_recv() {
+            if matches!(ev, SystemEvent::SyncStateChanged { .. }) {
+                saw_b_state = true;
+            }
+        }
+        while let Ok(ev) = rx_b2.try_recv() {
+            if matches!(ev, SystemEvent::SyncStateChanged { .. }) {
+                saw_b_state = true;
+            }
+        }
+        assert!(saw_b_state, "Node B should emit SyncStateChanged");
+
+        // 5. sync_ai_context = false blocks incoming AddConversationTurn even from trusted peer.
+        let dir_d = temp_dir();
+        let (node_d, cm_d, _reg_d, _rx_d) = build_node(&dir_d, false).await;
+        node_a
+            .add_trusted_peer(&node_d.device_id(), Some("node-d".to_string()), None)
+            .await
+            .unwrap();
+        let (_peer_d, synced_d) = node_d.pair_peer(&code_a.code).await.unwrap();
+        assert_eq!(synced_d, 5);
+        assert_eq!(node_d.sync_with_peer(&node_a.device_id()).await.unwrap(), 0);
+        let d_ctx = cm_d.get_context("sess-1").await.unwrap();
+        assert!(
+            d_ctx.conversation_history.is_empty(),
+            "AddConversationTurn must not be applied when sync_ai_context is false"
+        );
+        assert_eq!(
+            d_ctx.user_preferences.get("theme").map(String::as_str),
+            Some("solarized")
+        );
+        let _ = cm_a;
     }
 }

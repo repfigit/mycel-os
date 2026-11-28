@@ -767,6 +767,75 @@ async fn process_request(
         IpcRequest::Subscribe { .. } => IpcResponse::Error {
             message: "Internal error: Subscribe should be handled by connection loop".to_string(),
         },
+        IpcRequest::SyncStatus => {
+            let status = runtime.sync_service.status().await;
+            IpcResponse::SyncStatus {
+                enabled: status.enabled,
+                device_id: status.device_id,
+                transport: status.transport,
+                interface: status.interface,
+                listen_addr: status.listen_addr,
+                trusted_peers: status.trusted_peers,
+                connected_peers: status.connected_peers,
+                event_log_len: status.event_log_len,
+                peers: status.peers,
+            }
+        }
+        IpcRequest::GeneratePairingCode { endpoint } => {
+            let info = runtime
+                .sync_service
+                .generate_pairing_code(endpoint.clone())
+                .await;
+            IpcResponse::PairingCode {
+                device_id: info.device_id,
+                code: info.code,
+                endpoint: info.endpoint,
+            }
+        }
+        IpcRequest::AddTrustedPeer {
+            peer_id,
+            name,
+            endpoint,
+        } => {
+            match runtime
+                .sync_service
+                .add_trusted_peer(peer_id, name.clone(), endpoint.clone())
+                .await
+            {
+                Ok((peer, synced_events)) => IpcResponse::PeerAdded {
+                    peer,
+                    synced_events,
+                },
+                Err(e) => IpcResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        IpcRequest::PairPeer { code } => match runtime.sync_service.pair_peer(code).await {
+            Ok((peer, synced_events)) => IpcResponse::PeerAdded {
+                peer,
+                synced_events,
+            },
+            Err(e) => IpcResponse::Error {
+                message: e.to_string(),
+            },
+        },
+        IpcRequest::TriggerSync { peer_id } => match peer_id {
+            Some(pid) => match runtime.sync_service.sync_with_peer(pid).await {
+                Ok(n) => IpcResponse::Ok {
+                    message: format!("Synced {} event(s) with {}", n, pid),
+                },
+                Err(e) => IpcResponse::Error {
+                    message: e.to_string(),
+                },
+            },
+            None => {
+                let n = runtime.sync_service.sync_all_peers().await;
+                IpcResponse::Ok {
+                    message: format!("Synced {} event(s) across mesh", n),
+                }
+            }
+        },
         IpcRequest::Ping => IpcResponse::Pong,
     }
 }
@@ -811,6 +880,28 @@ pub enum IpcRequest {
     Subscribe {
         #[serde(default)]
         events: Option<Vec<String>>,
+    },
+    /// Get mesh sync status
+    SyncStatus,
+    /// Generate a pairing code for this device
+    GeneratePairingCode {
+        #[serde(default)]
+        endpoint: Option<String>,
+    },
+    /// Add a trusted peer by ID (and optional name/endpoint)
+    AddTrustedPeer {
+        peer_id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        endpoint: Option<String>,
+    },
+    /// Pair a peer using a pairing code or device ID
+    PairPeer { code: String },
+    /// Trigger an immediate mesh sync with one or all peers
+    TriggerSync {
+        #[serde(default)]
+        peer_id: Option<String>,
     },
     /// Ping for health check (allowed without auth)
     Ping,
@@ -858,6 +949,29 @@ pub enum IpcResponse {
     },
     /// Generic OK response
     Ok { message: String },
+    /// Mesh sync status
+    SyncStatus {
+        enabled: bool,
+        device_id: String,
+        transport: String,
+        interface: Option<String>,
+        listen_addr: Option<String>,
+        trusted_peers: usize,
+        connected_peers: usize,
+        event_log_len: usize,
+        peers: Vec<crate::sync::PeerInfo>,
+    },
+    /// Generated pairing code
+    PairingCode {
+        device_id: String,
+        code: String,
+        endpoint: Option<String>,
+    },
+    /// Trusted peer added/paired
+    PeerAdded {
+        peer: crate::sync::PeerInfo,
+        synced_events: usize,
+    },
     /// Error response
     Error { message: String },
     /// Pong response to ping
@@ -1825,6 +1939,174 @@ mod tests {
             "chat 'no' must clear ConfirmationStore"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_mesh_ipc_endpoints_and_auth_gate() {
+        let dir = std::env::temp_dir().join(format!("mycel-ipc-mesh-{}", uuid::Uuid::new_v4()));
+        let mut runtime = build_test_runtime(&dir).await;
+        let sock_path = dir.join("mycel.sock");
+        runtime.config.ipc_socket_path = sock_path.to_string_lossy().to_string();
+
+        let (server, handle) = spawn_test_server(&dir, runtime).await;
+        let token = std::fs::read_to_string(server.token_path()).unwrap();
+
+        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+
+        // 1. All 5 mesh requests must be rejected before authentication.
+        let dummy_key = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(
+                rand::thread_rng(),
+            ))
+            .as_bytes(),
+        );
+        let unauth_reqs = vec![
+            IpcRequest::SyncStatus,
+            IpcRequest::GeneratePairingCode { endpoint: None },
+            IpcRequest::AddTrustedPeer {
+                peer_id: dummy_key.clone(),
+                name: None,
+                endpoint: None,
+            },
+            IpcRequest::PairPeer {
+                code: dummy_key.clone(),
+            },
+            IpcRequest::TriggerSync { peer_id: None },
+        ];
+        for req in &unauth_reqs {
+            send_ipc_request(&mut w, req).await;
+            match read_ipc_response(&mut reader).await {
+                IpcResponse::Error { message } => {
+                    assert!(
+                        message.contains("Authentication required"),
+                        "unexpected unauth error: {message}"
+                    );
+                }
+                other => panic!("expected Error before auth, got {other:?}"),
+            }
+        }
+
+        // 2. Authenticate
+        send_ipc_request(&mut w, &IpcRequest::Authenticate { token }).await;
+        assert!(matches!(
+            read_ipc_response(&mut reader).await,
+            IpcResponse::Ok { .. }
+        ));
+
+        // 3. SyncStatus
+        send_ipc_request(&mut w, &IpcRequest::SyncStatus).await;
+        let own_id = match read_ipc_response(&mut reader).await {
+            IpcResponse::SyncStatus {
+                enabled,
+                device_id,
+                trusted_peers,
+                ..
+            } => {
+                assert!(!enabled);
+                assert_eq!(trusted_peers, 0);
+                device_id
+            }
+            other => panic!("expected SyncStatus, got {other:?}"),
+        };
+
+        // 4. GeneratePairingCode
+        send_ipc_request(
+            &mut w,
+            &IpcRequest::GeneratePairingCode {
+                endpoint: Some("127.0.0.1:51821".to_string()),
+            },
+        )
+        .await;
+        match read_ipc_response(&mut reader).await {
+            IpcResponse::PairingCode {
+                device_id,
+                code,
+                endpoint,
+            } => {
+                assert_eq!(device_id, own_id);
+                assert!(code.starts_with("mycel-pair-v1:"));
+                assert_eq!(endpoint.as_deref(), Some("127.0.0.1:51821"));
+            }
+            other => panic!("expected PairingCode, got {other:?}"),
+        }
+
+        // 5. AddTrustedPeer
+        send_ipc_request(
+            &mut w,
+            &IpcRequest::AddTrustedPeer {
+                peer_id: dummy_key.clone(),
+                name: Some("laptop".to_string()),
+                endpoint: Some("127.0.0.1:51999".to_string()),
+            },
+        )
+        .await;
+        match read_ipc_response(&mut reader).await {
+            IpcResponse::PeerAdded {
+                peer,
+                synced_events,
+            } => {
+                assert_eq!(peer.id, dummy_key);
+                assert_eq!(peer.name, "laptop");
+                assert_eq!(synced_events, 0);
+            }
+            other => panic!("expected PeerAdded, got {other:?}"),
+        }
+
+        // 6. PairPeer with mycel-pair-v1 code for another peer
+        let peer2_key = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(
+                rand::thread_rng(),
+            ))
+            .as_bytes(),
+        );
+        let payload = serde_json::json!({
+            "device_id": peer2_key,
+            "endpoint": "127.0.0.1:52000",
+            "name": "desktop"
+        });
+        let code2 = format!(
+            "mycel-pair-v1:{}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                payload.to_string().as_bytes()
+            )
+        );
+        send_ipc_request(&mut w, &IpcRequest::PairPeer { code: code2 }).await;
+        match read_ipc_response(&mut reader).await {
+            IpcResponse::PeerAdded { peer, .. } => {
+                assert_eq!(peer.id, peer2_key);
+                assert_eq!(peer.name, "desktop");
+            }
+            other => panic!("expected PeerAdded from PairPeer, got {other:?}"),
+        }
+
+        // 7. TriggerSync (all peers when mesh disabled -> Ok with 0 synced)
+        send_ipc_request(&mut w, &IpcRequest::TriggerSync { peer_id: None }).await;
+        match read_ipc_response(&mut reader).await {
+            IpcResponse::Ok { message } => assert!(message.contains("Synced")),
+            other => panic!("expected Ok from TriggerSync, got {other:?}"),
+        }
+
+        // TriggerSync for specific peer when mesh disabled -> Error
+        send_ipc_request(
+            &mut w,
+            &IpcRequest::TriggerSync {
+                peer_id: Some(dummy_key),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_ipc_response(&mut reader).await,
+            IpcResponse::Error { .. }
+        ));
+
+        handle.abort();
+        drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

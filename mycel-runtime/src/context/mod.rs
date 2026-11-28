@@ -121,6 +121,33 @@ impl ContextManager {
         }
     }
 
+    /// Apply a conversation turn synced from a trusted mesh peer, creating the
+    /// session if it does not yet exist and capping history at 50 entries.
+    pub async fn apply_synced_turn(
+        &self,
+        session_id: &str,
+        user_input: &str,
+        ai_response: &str,
+    ) -> Result<()> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| SessionContext::new(session_id));
+
+        session.touch();
+        session.conversation_history.push(ConversationTurn {
+            timestamp: Utc::now(),
+            user: user_input.to_string(),
+            assistant: ai_response.to_string(),
+        });
+
+        if session.conversation_history.len() > 50 {
+            session.conversation_history.remove(0);
+        }
+
+        Ok(())
+    }
+
     /// Record that a file was accessed
     pub async fn record_file_access(&self, session_id: &str, file_path: &str) -> Result<()> {
         let mut sessions = self.sessions.write().await;
@@ -305,5 +332,34 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         session.touch();
         assert!(session.last_accessed > start);
+    }
+
+    #[tokio::test]
+    async fn test_apply_synced_turn_creates_session_and_caps_at_50() {
+        let mut cfg = MycelConfig::default();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("mycel-context-test-{}", uuid::Uuid::new_v4()));
+        cfg.context_path = tmp_dir.to_string_lossy().to_string();
+
+        let mgr = ContextManager::new(&cfg).await.unwrap();
+        assert_eq!(mgr.session_count().await, 0);
+
+        for i in 0..55 {
+            mgr.apply_synced_turn(
+                "synced-session",
+                &format!("user-{i}"),
+                &format!("assistant-{i}"),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(mgr.session_count().await, 1);
+        let ctx = mgr.get_context("synced-session").await.unwrap();
+        assert_eq!(ctx.conversation_history.len(), 50);
+        assert_eq!(ctx.conversation_history[0].user, "user-5");
+        assert_eq!(ctx.conversation_history[49].user, "user-54");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
