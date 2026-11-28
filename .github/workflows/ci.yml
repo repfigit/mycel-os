@@ -168,7 +168,7 @@ jobs:
       - name: Validate shell scripts and Python tools
         run: |
           bash -n scripts/build-iso.sh scripts/void-build-iso.sh scripts/build-mycel-iso.sh scripts/test-iso.sh
-          PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile tools/mycel-cli.py scripts/smoke-test-iso.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile tools/mycel-cli.py scripts/smoke-test-iso.py scripts/smoke-test-desktop-iso.py scripts/test-mesh-vms.py
 
       - name: Verify Void musl ISO builder Dockerfile builds
         run: docker build -t mycel-iso-builder-ci -f docker/Dockerfile.void-builder scripts

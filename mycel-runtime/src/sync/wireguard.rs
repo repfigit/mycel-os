@@ -89,20 +89,55 @@ pub fn build_set_peer_args(
     Ok(args)
 }
 
+/// Parse a WireGuard IPv4 CIDR string (`"10.77.0.1/24"`) or bare IPv4 address
+/// (`"10.77.0.1"`, defaulting to `/16`), validating that the prefix length is
+/// in `1..=32`.
+pub fn parse_wg_cidr(input: &str) -> Result<(Ipv4Addr, u8)> {
+    let trimmed = input.trim();
+    if let Some((ip_str, prefix_str)) = trimmed.split_once('/') {
+        let ip: Ipv4Addr = ip_str
+            .trim()
+            .parse()
+            .with_context(|| format!("Invalid WireGuard IPv4 address in '{trimmed}'"))?;
+        let prefix: u8 = prefix_str
+            .trim()
+            .parse()
+            .with_context(|| format!("Invalid WireGuard CIDR prefix in '{trimmed}'"))?;
+        if !(1..=32).contains(&prefix) {
+            return Err(anyhow!(
+                "Invalid WireGuard CIDR prefix '/{prefix}' in '{trimmed}': expected 1..=32"
+            ));
+        }
+        Ok((ip, prefix))
+    } else {
+        let ip: Ipv4Addr = trimmed
+            .parse()
+            .with_context(|| format!("Invalid WireGuard IPv4 address '{trimmed}'"))?;
+        Ok((ip, 16))
+    }
+}
+
 /// Kernel WireGuard interface manager.
 #[derive(Debug, Clone)]
 pub struct KernelWireGuard {
     interface: String,
     local_ip: Ipv4Addr,
+    prefix_len: u8,
 }
 
 impl KernelWireGuard {
-    /// Create a new `KernelWireGuard` manager after validating `interface`.
-    pub fn new(interface: String, local_ip: Ipv4Addr) -> Result<Self> {
+    /// Create a new `KernelWireGuard` manager after validating `interface` and `prefix_len`.
+    pub fn new(interface: String, local_ip: Ipv4Addr, prefix_len: u8) -> Result<Self> {
         validate_interface_name(&interface)?;
+        if !(1..=32).contains(&prefix_len) {
+            return Err(anyhow!(
+                "Invalid WireGuard CIDR prefix '/{prefix_len}': expected 1..=32"
+            ));
+        }
         Ok(Self {
             interface,
             local_ip,
+            prefix_len,
         })
     }
 
@@ -110,9 +145,13 @@ impl KernelWireGuard {
         &self.interface
     }
 
-    #[allow(dead_code)]
     pub fn local_ip(&self) -> Ipv4Addr {
         self.local_ip
+    }
+
+    #[allow(dead_code)]
+    pub fn prefix_len(&self) -> u8 {
+        self.prefix_len
     }
 
     /// Ensure required `ip` and `wg` binaries are runnable.
@@ -164,7 +203,7 @@ impl KernelWireGuard {
         }
 
         // Assign mesh IPv4 address.
-        let cidr = format!("{}/16", self.local_ip);
+        let cidr = format!("{}/{}", self.local_ip, self.prefix_len);
         let addr_out = Command::new("ip")
             .args(["address", "replace", &cidr, "dev", &self.interface])
             .output()
@@ -402,5 +441,31 @@ mod tests {
         assert!(build_set_peer_args("mycel0", &short_pk, ip, None).is_err());
         // Bad endpoint
         assert!(build_set_peer_args("mycel0", &valid_pk, ip, Some("not-a-socket-addr")).is_err());
+    }
+
+    #[test]
+    fn test_parse_wg_cidr() {
+        assert_eq!(
+            parse_wg_cidr("10.77.0.1/24").unwrap(),
+            (Ipv4Addr::new(10, 77, 0, 1), 24)
+        );
+        assert_eq!(
+            parse_wg_cidr(" 10.77.0.2 ").unwrap(),
+            (Ipv4Addr::new(10, 77, 0, 2), 16)
+        );
+        assert_eq!(
+            parse_wg_cidr("10.0.0.1/32").unwrap(),
+            (Ipv4Addr::new(10, 0, 0, 1), 32)
+        );
+        assert_eq!(
+            parse_wg_cidr("10.0.0.1/1").unwrap(),
+            (Ipv4Addr::new(10, 0, 0, 1), 1)
+        );
+
+        assert!(parse_wg_cidr("10.77.0.1/0").is_err());
+        assert!(parse_wg_cidr("10.77.0.1/33").is_err());
+        assert!(parse_wg_cidr("10.77.0.1/abc").is_err());
+        assert!(parse_wg_cidr("not-an-ip/24").is_err());
+        assert!(parse_wg_cidr("").is_err());
     }
 }
