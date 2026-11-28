@@ -6,11 +6,194 @@
 
 #![allow(dead_code)]
 
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use crate::context::Context;
 use crate::intent::{ActionType, Intent};
+
+/// Default TTL for pending confirmations (5 minutes).
+pub const DEFAULT_CONFIRMATION_TTL: Duration = Duration::from_secs(300);
+/// Default global cap on pending confirmations.
+pub const DEFAULT_MAX_PENDING_CONFIRMATIONS: usize = 64;
+/// Default per-session cap on pending confirmations.
+pub const DEFAULT_MAX_PENDING_PER_SESSION: usize = 8;
+
+/// A pending confirmation awaiting user approval.
+#[derive(Debug, Clone)]
+pub struct PendingConfirmation {
+    pub id: String,
+    pub session_id: String,
+    pub action: String,
+    pub code: String,
+    pub reason: String,
+    pub created_at: Instant,
+}
+
+/// Errors returned when looking up or consuming a pending confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmationLookupError {
+    NotFound,
+    Expired,
+    WrongSession,
+}
+
+#[derive(Debug, Default)]
+struct ConfirmationStoreInner {
+    entries: VecDeque<PendingConfirmation>,
+}
+
+/// Bounded, session-scoped, TTL-enforcing store for pending confirmations.
+#[derive(Clone)]
+pub struct ConfirmationStore {
+    inner: Arc<Mutex<ConfirmationStoreInner>>,
+    max_total: usize,
+    max_per_session: usize,
+    ttl: Duration,
+}
+
+impl Default for ConfirmationStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConfirmationStore {
+    /// Create a store with default limits and TTL.
+    pub fn new() -> Self {
+        Self::with_limits(
+            DEFAULT_MAX_PENDING_CONFIRMATIONS,
+            DEFAULT_MAX_PENDING_PER_SESSION,
+            DEFAULT_CONFIRMATION_TTL,
+        )
+    }
+
+    /// Create a store with explicit capacity limits and TTL.
+    pub fn with_limits(max_total: usize, max_per_session: usize, ttl: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ConfirmationStoreInner::default())),
+            max_total: max_total.max(1),
+            max_per_session: max_per_session.max(1),
+            ttl,
+        }
+    }
+
+    /// Insert a new pending confirmation, pruning expired entries and enforcing
+    /// per-session and global FIFO eviction caps.
+    pub async fn insert(
+        &self,
+        session_id: &str,
+        action: &str,
+        code: &str,
+        reason: &str,
+    ) -> PendingConfirmation {
+        let mut inner = self.inner.lock().await;
+        let now = Instant::now();
+
+        // Prune expired entries first.
+        inner
+            .entries
+            .retain(|entry| now.duration_since(entry.created_at) < self.ttl);
+
+        // Enforce per-session cap, evicting the oldest entry in this session.
+        let mut session_count = inner
+            .entries
+            .iter()
+            .filter(|entry| entry.session_id == session_id)
+            .count();
+        while session_count >= self.max_per_session {
+            if let Some(pos) = inner
+                .entries
+                .iter()
+                .position(|entry| entry.session_id == session_id)
+            {
+                inner.entries.remove(pos);
+                session_count -= 1;
+            } else {
+                break;
+            }
+        }
+
+        // Enforce global cap, evicting the oldest entry overall.
+        while inner.entries.len() >= self.max_total {
+            inner.entries.pop_front();
+        }
+
+        let confirmation = PendingConfirmation {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            action: action.to_string(),
+            code: code.to_string(),
+            reason: reason.to_string(),
+            created_at: now,
+        };
+        inner.entries.push_back(confirmation.clone());
+        confirmation
+    }
+
+    /// Look up and consume a pending confirmation for `session_id`.
+    ///
+    /// Checks session ownership before TTL or removal so another session cannot
+    /// probe or cancel a confirmation it does not own.
+    pub async fn take_for_session(
+        &self,
+        id: &str,
+        session_id: &str,
+    ) -> Result<PendingConfirmation, ConfirmationLookupError> {
+        let mut inner = self.inner.lock().await;
+        let Some(pos) = inner.entries.iter().position(|entry| entry.id == id) else {
+            return Err(ConfirmationLookupError::NotFound);
+        };
+
+        if inner.entries[pos].session_id != session_id {
+            return Err(ConfirmationLookupError::WrongSession);
+        }
+
+        if inner.entries[pos].created_at.elapsed() >= self.ttl {
+            inner.entries.remove(pos);
+            return Err(ConfirmationLookupError::Expired);
+        }
+
+        inner
+            .entries
+            .remove(pos)
+            .ok_or(ConfirmationLookupError::NotFound)
+    }
+
+    /// Remove all pending confirmations in `session_id` matching `code`.
+    pub async fn clear_matching_code(&self, session_id: &str, code: &str) -> usize {
+        let mut inner = self.inner.lock().await;
+        let before = inner.entries.len();
+        inner
+            .entries
+            .retain(|entry| !(entry.session_id == session_id && entry.code == code));
+        before - inner.entries.len()
+    }
+
+    /// Remove all pending confirmations belonging to `session_id`.
+    pub async fn clear_session(&self, session_id: &str) -> usize {
+        let mut inner = self.inner.lock().await;
+        let before = inner.entries.len();
+        inner.entries.retain(|entry| entry.session_id != session_id);
+        before - inner.entries.len()
+    }
+
+    /// Return the number of currently stored pending confirmations.
+    pub async fn len(&self) -> usize {
+        self.inner.lock().await.entries.len()
+    }
+
+    /// Return whether the store currently has no pending confirmations.
+    pub async fn is_empty(&self) -> bool {
+        self.inner.lock().await.entries.is_empty()
+    }
+}
 
 /// Result of policy evaluation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,5 +590,151 @@ mod tests {
             ActionPolicy::Allow => {}
             _ => panic!("Expected Allow for ls -la"),
         }
+    }
+
+    #[tokio::test]
+    async fn confirmation_store_insert_and_take_happy_path() {
+        let store = ConfirmationStore::new();
+        assert!(store.is_empty().await);
+
+        let inserted = store
+            .insert("sess-1", "delete", "rm -rf /tmp/x", "dangerous")
+            .await;
+        assert!(!inserted.id.is_empty());
+        assert_eq!(inserted.session_id, "sess-1");
+        assert_eq!(inserted.action, "delete");
+        assert_eq!(inserted.code, "rm -rf /tmp/x");
+        assert_eq!(inserted.reason, "dangerous");
+        assert_eq!(store.len().await, 1);
+        assert!(!store.is_empty().await);
+
+        let taken = store
+            .take_for_session(&inserted.id, "sess-1")
+            .await
+            .unwrap();
+        assert_eq!(taken.id, inserted.id);
+        assert_eq!(taken.code, "rm -rf /tmp/x");
+        assert!(store.is_empty().await);
+
+        let second_take = store.take_for_session(&inserted.id, "sess-1").await;
+        assert_eq!(second_take.unwrap_err(), ConfirmationLookupError::NotFound);
+    }
+
+    #[tokio::test]
+    async fn confirmation_store_wrong_session_preserves_entry() {
+        let store = ConfirmationStore::new();
+        let inserted = store
+            .insert("owner-sess", "delete", "rm -rf /tmp/x", "dangerous")
+            .await;
+
+        let wrong = store.take_for_session(&inserted.id, "other-sess").await;
+        assert_eq!(wrong.unwrap_err(), ConfirmationLookupError::WrongSession);
+        assert_eq!(store.len().await, 1);
+
+        let taken = store
+            .take_for_session(&inserted.id, "owner-sess")
+            .await
+            .unwrap();
+        assert_eq!(taken.id, inserted.id);
+        assert!(store.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn confirmation_store_ttl_expiry() {
+        let store = ConfirmationStore::with_limits(10, 5, Duration::from_millis(20));
+        let inserted = store
+            .insert("sess-1", "delete", "rm -rf /tmp/x", "dangerous")
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        let expired = store.take_for_session(&inserted.id, "sess-1").await;
+        assert_eq!(expired.unwrap_err(), ConfirmationLookupError::Expired);
+        assert!(store.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn confirmation_store_per_session_cap_evicts_oldest_in_session() {
+        let store = ConfirmationStore::with_limits(10, 2, Duration::from_secs(60));
+        let s1_first = store.insert("sess-1", "a1", "code-1", "r1").await;
+        let s2_first = store.insert("sess-2", "b1", "code-b1", "rb1").await;
+        let s1_second = store.insert("sess-1", "a2", "code-2", "r2").await;
+        let s1_third = store.insert("sess-1", "a3", "code-3", "r3").await;
+
+        // sess-1 cap is 2, so s1_first was evicted while s2_first remains.
+        assert_eq!(store.len().await, 3);
+        assert_eq!(
+            store
+                .take_for_session(&s1_first.id, "sess-1")
+                .await
+                .unwrap_err(),
+            ConfirmationLookupError::NotFound
+        );
+        assert!(store.take_for_session(&s2_first.id, "sess-2").await.is_ok());
+        assert!(store
+            .take_for_session(&s1_second.id, "sess-1")
+            .await
+            .is_ok());
+        assert!(store.take_for_session(&s1_third.id, "sess-1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn confirmation_store_global_cap_evicts_oldest_globally() {
+        let store = ConfirmationStore::with_limits(3, 3, Duration::from_secs(60));
+        let first = store.insert("sess-1", "a1", "c1", "r1").await;
+        let second = store.insert("sess-2", "a2", "c2", "r2").await;
+        let third = store.insert("sess-3", "a3", "c3", "r3").await;
+        let fourth = store.insert("sess-4", "a4", "c4", "r4").await;
+
+        assert_eq!(store.len().await, 3);
+        assert_eq!(
+            store
+                .take_for_session(&first.id, "sess-1")
+                .await
+                .unwrap_err(),
+            ConfirmationLookupError::NotFound
+        );
+        assert!(store.take_for_session(&second.id, "sess-2").await.is_ok());
+        assert!(store.take_for_session(&third.id, "sess-3").await.is_ok());
+        assert!(store.take_for_session(&fourth.id, "sess-4").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn confirmation_store_clear_matching_code_and_clear_session() {
+        let store = ConfirmationStore::new();
+        let s1_a = store.insert("sess-1", "act", "rm -rf /tmp/a", "r").await;
+        let s1_a_dup = store.insert("sess-1", "act", "rm -rf /tmp/a", "r").await;
+        let s1_b = store.insert("sess-1", "act", "rm -rf /tmp/b", "r").await;
+        let s2_a = store.insert("sess-2", "act", "rm -rf /tmp/a", "r").await;
+
+        let cleared_code = store.clear_matching_code("sess-1", "rm -rf /tmp/a").await;
+        assert_eq!(cleared_code, 2);
+        assert_eq!(store.len().await, 2);
+        assert_eq!(
+            store
+                .take_for_session(&s1_a.id, "sess-1")
+                .await
+                .unwrap_err(),
+            ConfirmationLookupError::NotFound
+        );
+        assert_eq!(
+            store
+                .take_for_session(&s1_a_dup.id, "sess-1")
+                .await
+                .unwrap_err(),
+            ConfirmationLookupError::NotFound
+        );
+
+        let cleared_sess = store.clear_session("sess-1").await;
+        assert_eq!(cleared_sess, 1);
+        assert_eq!(store.len().await, 1);
+        assert_eq!(
+            store
+                .take_for_session(&s1_b.id, "sess-1")
+                .await
+                .unwrap_err(),
+            ConfirmationLookupError::NotFound
+        );
+        assert!(store.take_for_session(&s2_a.id, "sess-2").await.is_ok());
     }
 }
