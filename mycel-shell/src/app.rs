@@ -10,10 +10,10 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::ipc_client::{
-    spawn_event_subscriber, IpcClientConfig, IpcRequestClient, StatusSnapshot, SubscriberEvent,
-    SyncSnapshot,
+    spawn_event_subscriber, IpcClientConfig, IpcRequestClient, PairingCodeSnapshot,
+    PeerAddedSnapshot, ProvidersSnapshot, StatusSnapshot, SubscriberEvent, SyncSnapshot,
 };
-use crate::protocol::{IpcResponse, LlmProvider, SystemEvent};
+use crate::protocol::{IpcResponse, LlmProvider, PeerStatus, ProviderSummary, SystemEvent};
 
 const MAX_RECENT_EVENTS: usize = 20;
 
@@ -76,6 +76,13 @@ pub enum ChatEntry {
     },
 }
 
+/// Active side drawer in the shell UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveDrawer {
+    Providers,
+    Mesh,
+}
+
 /// Interactive confirmation card for policy-gated actions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingConfirmationCard {
@@ -92,8 +99,22 @@ pub enum Message {
     SubscriberUpdate(SubscriberEvent),
     StatusFetched(Result<StatusSnapshot, String>),
     SyncStatusFetched(Result<SyncSnapshot, String>),
+    ProvidersFetched(Result<ProvidersSnapshot, String>),
     RefreshStatus,
     CycleProvider,
+    ToggleDrawer(ActiveDrawer),
+    SelectProvider(String),
+    ProviderModelInputChanged(String),
+    ApplyProvider,
+    SetProviderCompleted(Result<String, String>),
+    MeshEndpointInputChanged(String),
+    GeneratePairingCode,
+    PairingCodeGenerated(Result<PairingCodeSnapshot, String>),
+    MeshPairInputChanged(String),
+    PairPeer,
+    PairPeerCompleted(Result<PeerAddedSnapshot, String>),
+    TriggerSync,
+    TriggerSyncCompleted(Result<String, String>),
     InputChanged(String),
     SendPrompt,
     ChatChunk(String),
@@ -122,6 +143,18 @@ pub struct MycelShellApp {
     pub mesh_connected_peers: usize,
     pub mesh_trusted_peers: usize,
     pub mesh_transport: Option<String>,
+    pub active_drawer: Option<ActiveDrawer>,
+    pub providers_snapshot: Option<ProvidersSnapshot>,
+    pub selected_provider_id: Option<String>,
+    pub provider_model_input: String,
+    pub provider_busy: bool,
+    pub provider_feedback: Option<(String, bool)>,
+    pub sync_snapshot: Option<SyncSnapshot>,
+    pub mesh_endpoint_input: String,
+    pub generated_pairing_code: Option<PairingCodeSnapshot>,
+    pub mesh_pair_input: String,
+    pub mesh_busy: bool,
+    pub mesh_feedback: Option<(String, bool)>,
     pub messages: Vec<ChatEntry>,
     pub streaming_buffer: Option<String>,
     pub in_flight: bool,
@@ -152,6 +185,18 @@ impl MycelShellApp {
             mesh_connected_peers: 0,
             mesh_trusted_peers: 0,
             mesh_transport: None,
+            active_drawer: None,
+            providers_snapshot: None,
+            selected_provider_id: None,
+            provider_model_input: String::new(),
+            provider_busy: false,
+            provider_feedback: None,
+            sync_snapshot: None,
+            mesh_endpoint_input: String::new(),
+            generated_pairing_code: None,
+            mesh_pair_input: String::new(),
+            mesh_busy: false,
+            mesh_feedback: None,
             messages: Vec::new(),
             streaming_buffer: None,
             in_flight: false,
@@ -204,10 +249,20 @@ impl MycelShellApp {
                 self.mesh_enabled = sync.enabled;
                 self.mesh_connected_peers = sync.connected_peers;
                 self.mesh_trusted_peers = sync.trusted_peers;
-                self.mesh_transport = Some(sync.transport);
+                self.mesh_transport = Some(sync.transport.clone());
+                self.sync_snapshot = Some(sync);
             }
             Message::SyncStatusFetched(Err(_err)) => {
                 // Mesh sync may be disabled or unavailable during startup; keep header clean.
+            }
+            Message::ProvidersFetched(Ok(providers)) => {
+                if self.selected_provider_id.is_none() {
+                    self.selected_provider_id = providers.active_provider.clone();
+                }
+                self.providers_snapshot = Some(providers);
+            }
+            Message::ProvidersFetched(Err(_err)) => {
+                // Runtime may still be starting up; keep header clean.
             }
             Message::RefreshStatus => {
                 return self.fetch_all_status_tasks();
@@ -218,6 +273,175 @@ impl MycelShellApp {
                     LlmProvider::Local => LlmProvider::Cloud,
                     LlmProvider::Cloud => LlmProvider::Auto,
                 };
+            }
+            Message::ToggleDrawer(drawer) => {
+                if self.active_drawer == Some(drawer) {
+                    self.active_drawer = None;
+                } else {
+                    self.active_drawer = Some(drawer);
+                    return match drawer {
+                        ActiveDrawer::Providers => self.fetch_providers_task(),
+                        ActiveDrawer::Mesh => self.fetch_sync_status_task(),
+                    };
+                }
+            }
+            Message::SelectProvider(id) => {
+                if self.selected_provider_id.as_deref() != Some(id.as_str()) {
+                    self.provider_model_input.clear();
+                }
+                self.selected_provider_id = Some(id);
+                self.provider_feedback = None;
+            }
+            Message::ProviderModelInputChanged(value) => {
+                self.provider_model_input = value;
+            }
+            Message::ApplyProvider => {
+                if self.provider_busy {
+                    return Task::none();
+                }
+                let Some(provider_id) = self.selected_provider_id.clone() else {
+                    return Task::none();
+                };
+                let model = {
+                    let trimmed = self.provider_model_input.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                };
+                self.provider_busy = true;
+                self.provider_feedback = None;
+                let client = self.client.clone();
+                return Task::perform(
+                    async move {
+                        client
+                            .set_provider(provider_id, model)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::SetProviderCompleted,
+                );
+            }
+            Message::SetProviderCompleted(result) => {
+                self.provider_busy = false;
+                match result {
+                    Ok(msg) => {
+                        self.provider_feedback = Some((msg, false));
+                        return Task::batch([
+                            self.fetch_providers_task(),
+                            self.fetch_status_task(),
+                        ]);
+                    }
+                    Err(err) => {
+                        self.provider_feedback = Some((err, true));
+                    }
+                }
+            }
+            Message::MeshEndpointInputChanged(value) => {
+                self.mesh_endpoint_input = value;
+            }
+            Message::GeneratePairingCode => {
+                if self.mesh_busy {
+                    return Task::none();
+                }
+                let endpoint = {
+                    let trimmed = self.mesh_endpoint_input.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                };
+                self.mesh_busy = true;
+                self.mesh_feedback = None;
+                let client = self.client.clone();
+                return Task::perform(
+                    async move {
+                        client
+                            .generate_pairing_code(endpoint)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::PairingCodeGenerated,
+                );
+            }
+            Message::PairingCodeGenerated(result) => {
+                self.mesh_busy = false;
+                match result {
+                    Ok(snapshot) => {
+                        self.mesh_feedback = Some((
+                            format!("Generated pairing code for {}", snapshot.device_id),
+                            false,
+                        ));
+                        self.generated_pairing_code = Some(snapshot);
+                    }
+                    Err(err) => {
+                        self.mesh_feedback = Some((err, true));
+                    }
+                }
+            }
+            Message::MeshPairInputChanged(value) => {
+                self.mesh_pair_input = value;
+            }
+            Message::PairPeer => {
+                if self.mesh_busy {
+                    return Task::none();
+                }
+                let code = self.mesh_pair_input.trim().to_string();
+                if code.is_empty() {
+                    return Task::none();
+                }
+                self.mesh_busy = true;
+                self.mesh_feedback = None;
+                let client = self.client.clone();
+                return Task::perform(
+                    async move { client.pair_peer(code).await.map_err(|e| e.to_string()) },
+                    Message::PairPeerCompleted,
+                );
+            }
+            Message::PairPeerCompleted(result) => {
+                self.mesh_busy = false;
+                match result {
+                    Ok(added) => {
+                        self.mesh_pair_input.clear();
+                        self.mesh_feedback = Some((
+                            format!(
+                                "Paired {} ({}) — {} synced event(s)",
+                                added.peer.name, added.peer.id, added.synced_events
+                            ),
+                            false,
+                        ));
+                        return self.fetch_sync_status_task();
+                    }
+                    Err(err) => {
+                        self.mesh_feedback = Some((err, true));
+                    }
+                }
+            }
+            Message::TriggerSync => {
+                if self.mesh_busy {
+                    return Task::none();
+                }
+                self.mesh_busy = true;
+                self.mesh_feedback = None;
+                let client = self.client.clone();
+                return Task::perform(
+                    async move { client.trigger_sync(None).await.map_err(|e| e.to_string()) },
+                    Message::TriggerSyncCompleted,
+                );
+            }
+            Message::TriggerSyncCompleted(result) => {
+                self.mesh_busy = false;
+                match result {
+                    Ok(msg) => {
+                        self.mesh_feedback = Some((msg, false));
+                        return self.fetch_sync_status_task();
+                    }
+                    Err(err) => {
+                        self.mesh_feedback = Some((err, true));
+                    }
+                }
             }
             Message::InputChanged(value) => {
                 self.input_value = value;
@@ -414,7 +638,22 @@ impl MycelShellApp {
         if let Some(banner_el) = banner {
             root_col = root_col.push(banner_el);
         }
-        root_col = root_col.push(conversation);
+        if let Some(drawer_el) = self.view_drawer() {
+            let body = row![
+                container(conversation)
+                    .width(Length::FillPortion(3))
+                    .height(Length::Fill),
+                container(drawer_el)
+                    .width(Length::Fixed(460.0))
+                    .height(Length::Fill),
+            ]
+            .spacing(10)
+            .width(Length::Fill)
+            .height(Length::Fill);
+            root_col = root_col.push(body);
+        } else {
+            root_col = root_col.push(conversation);
+        }
         if let Some(conf_el) = confirmations {
             root_col = root_col.push(conf_el);
         }
@@ -427,11 +666,9 @@ impl MycelShellApp {
             .into()
     }
 
-    fn fetch_all_status_tasks(&self) -> Task<Message> {
+    fn fetch_status_task(&self) -> Task<Message> {
         let status_client = self.client.clone();
-        let sync_client = self.client.clone();
-
-        let status_task = Task::perform(
+        Task::perform(
             async move {
                 status_client
                     .fetch_status()
@@ -439,8 +676,12 @@ impl MycelShellApp {
                     .map_err(|e| e.to_string())
             },
             Message::StatusFetched,
-        );
-        let sync_task = Task::perform(
+        )
+    }
+
+    fn fetch_sync_status_task(&self) -> Task<Message> {
+        let sync_client = self.client.clone();
+        Task::perform(
             async move {
                 sync_client
                     .fetch_sync_status()
@@ -448,9 +689,28 @@ impl MycelShellApp {
                     .map_err(|e| e.to_string())
             },
             Message::SyncStatusFetched,
-        );
+        )
+    }
 
-        Task::batch([status_task, sync_task])
+    fn fetch_providers_task(&self) -> Task<Message> {
+        let providers_client = self.client.clone();
+        Task::perform(
+            async move {
+                providers_client
+                    .fetch_providers()
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            Message::ProvidersFetched,
+        )
+    }
+
+    fn fetch_all_status_tasks(&self) -> Task<Message> {
+        Task::batch([
+            self.fetch_status_task(),
+            self.fetch_sync_status_task(),
+            self.fetch_providers_task(),
+        ])
     }
 
     fn handle_system_event(&mut self, event: SystemEvent) {
@@ -649,6 +909,24 @@ impl MycelShellApp {
             .style(secondary_button_style)
             .on_press(Message::CycleProvider);
 
+        let providers_drawer_btn = button(text("Providers").size(12))
+            .padding([5, 10])
+            .style(if self.active_drawer == Some(ActiveDrawer::Providers) {
+                active_drawer_button_style
+            } else {
+                secondary_button_style
+            })
+            .on_press(Message::ToggleDrawer(ActiveDrawer::Providers));
+
+        let mesh_drawer_btn = button(text("Mesh").size(12))
+            .padding([5, 10])
+            .style(if self.active_drawer == Some(ActiveDrawer::Mesh) {
+                active_drawer_button_style
+            } else {
+                secondary_button_style
+            })
+            .on_press(Message::ToggleDrawer(ActiveDrawer::Mesh));
+
         let refresh_btn = button(text("Refresh").size(12))
             .padding([5, 10])
             .style(secondary_button_style)
@@ -659,9 +937,11 @@ impl MycelShellApp {
             text(model_label).size(12).color(TEXT_PRIMARY),
             text(peers_label).size(12).color(TEXT_MUTED),
             provider_btn,
+            providers_drawer_btn,
+            mesh_drawer_btn,
             refresh_btn,
         ]
-        .spacing(12)
+        .spacing(8)
         .align_y(Alignment::Center);
 
         let header_row = row![
@@ -954,6 +1234,458 @@ impl MycelShellApp {
             .width(Length::Fill)
             .into()
     }
+
+    fn view_drawer(&self) -> Option<Element<'_, Message>> {
+        match self.active_drawer? {
+            ActiveDrawer::Providers => Some(self.view_providers_drawer()),
+            ActiveDrawer::Mesh => Some(self.view_mesh_drawer()),
+        }
+    }
+
+    fn view_providers_drawer(&self) -> Element<'_, Message> {
+        let title_row = row![
+            text("Cloud Providers")
+                .size(15)
+                .font(Font::MONOSPACE)
+                .color(ACCENT_CYAN),
+            Space::new().width(Length::Fill),
+            button(text("×").size(14))
+                .padding([2, 8])
+                .style(secondary_button_style)
+                .on_press(Message::ToggleDrawer(ActiveDrawer::Providers)),
+        ]
+        .align_y(Alignment::Center);
+
+        let (active_label, counts_label, sorted_providers) =
+            if let Some(snap) = &self.providers_snapshot {
+                let active_p = snap.active_provider.as_deref().unwrap_or("none");
+                let active_m = snap.active_model.as_deref().unwrap_or("—");
+                let configured_count = snap.providers.iter().filter(|p| p.configured).count();
+                let total_count = snap.providers.len();
+                let mut ordered: Vec<&ProviderSummary> = snap.providers.iter().collect();
+                ordered.sort_by_key(|p| std::cmp::Reverse(p.configured));
+                (
+                    format!("Active: {active_p} ({active_m})"),
+                    format!("Configured: {configured_count} / {total_count}"),
+                    ordered,
+                )
+            } else {
+                (
+                    "Active: —".to_string(),
+                    "Configured: 0 / 0".to_string(),
+                    Vec::new(),
+                )
+            };
+
+        let summary_card = container(
+            column![
+                text(active_label).size(13).color(TEXT_PRIMARY),
+                text(counts_label).size(12).color(TEXT_MUTED),
+            ]
+            .spacing(4),
+        )
+        .padding(10)
+        .width(Length::Fill)
+        .style(elevated_card_style);
+
+        let mut list_col = Column::new().spacing(8).width(Length::Fill);
+        if sorted_providers.is_empty() {
+            list_col = list_col.push(
+                text("No provider catalog loaded yet.")
+                    .size(12)
+                    .color(TEXT_MUTED),
+            );
+        } else {
+            let active_provider_id = self
+                .providers_snapshot
+                .as_ref()
+                .and_then(|s| s.active_provider.as_deref());
+
+            for p in sorted_providers {
+                let is_selected = self.selected_provider_id.as_deref() == Some(p.id.as_str());
+                let is_active = active_provider_id == Some(p.id.as_str());
+
+                let badge_text = if p.configured {
+                    "configured"
+                } else {
+                    "unconfigured"
+                };
+                let badge_color = if p.configured {
+                    ACCENT_EMERALD
+                } else {
+                    TEXT_MUTED
+                };
+
+                let mut header_bits = row![
+                    text(&p.name).size(13).color(TEXT_PRIMARY),
+                    text(format!("({})", p.id))
+                        .size(12)
+                        .font(Font::MONOSPACE)
+                        .color(TEXT_MUTED),
+                    Space::new().width(Length::Fill),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center);
+
+                if is_active {
+                    header_bits = header_bits.push(text("active").size(11).color(ACCENT_CYAN));
+                }
+                header_bits = header_bits.push(text(badge_text).size(11).color(badge_color));
+
+                let details = column![
+                    header_bits,
+                    text(format!("api: {}  |  env: {}", p.api, p.env_var))
+                        .size(11)
+                        .font(Font::MONOSPACE)
+                        .color(TEXT_MUTED),
+                    text(format!("default_model: {}", p.default_model))
+                        .size(11)
+                        .font(Font::MONOSPACE)
+                        .color(TEXT_MUTED),
+                ]
+                .spacing(4);
+
+                let row_btn = button(details)
+                    .padding(10)
+                    .width(Length::Fill)
+                    .style(move |_theme, status| {
+                        let bg = if is_selected {
+                            Color::from_rgb(0.16, 0.21, 0.29)
+                        } else if matches!(
+                            status,
+                            button::Status::Hovered | button::Status::Pressed
+                        ) {
+                            Color::from_rgb(0.16, 0.19, 0.25)
+                        } else {
+                            BG_ELEVATED
+                        };
+                        let border_color = if is_selected {
+                            ACCENT_CYAN
+                        } else {
+                            BORDER_SUBTLE
+                        };
+                        button::Style {
+                            background: Some(Background::Color(bg)),
+                            text_color: TEXT_PRIMARY,
+                            border: Border {
+                                color: border_color,
+                                width: if is_selected { 1.5 } else { 1.0 },
+                                radius: 6.0.into(),
+                            },
+                            ..Default::default()
+                        }
+                    })
+                    .on_press(Message::SelectProvider(p.id.clone()));
+
+                list_col = list_col.push(row_btn);
+            }
+        }
+
+        let selected_label = match &self.selected_provider_id {
+            Some(id) => format!("Selected provider: {id}"),
+            None => "Select a provider above to configure".to_string(),
+        };
+
+        let model_input = text_input(
+            "Optional model override (uses default if empty)",
+            &self.provider_model_input,
+        )
+        .on_input(Message::ProviderModelInputChanged)
+        .on_submit(Message::ApplyProvider)
+        .padding(8)
+        .size(12)
+        .width(Length::Fill);
+
+        let can_apply = self.selected_provider_id.is_some() && !self.provider_busy;
+        let mut apply_btn = button(
+            text(if self.provider_busy {
+                "Applying..."
+            } else {
+                "Apply Provider"
+            })
+            .size(12),
+        )
+        .padding([8, 14])
+        .style(primary_button_style);
+
+        if can_apply {
+            apply_btn = apply_btn.on_press(Message::ApplyProvider);
+        }
+
+        let mut controls_col = column![
+            text(selected_label).size(12).color(TEXT_PRIMARY),
+            model_input,
+            row![apply_btn].align_y(Alignment::Center),
+        ]
+        .spacing(8);
+
+        if let Some((msg, is_err)) = &self.provider_feedback {
+            controls_col = controls_col.push(text(msg).size(12).color(if *is_err {
+                ACCENT_ROSE
+            } else {
+                ACCENT_EMERALD
+            }));
+        }
+
+        let body = column![
+            title_row,
+            summary_card,
+            scrollable(list_col)
+                .width(Length::Fill)
+                .height(Length::Fill),
+            container(controls_col)
+                .padding(10)
+                .width(Length::Fill)
+                .style(elevated_card_style),
+        ]
+        .spacing(10)
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        container(body)
+            .padding(12)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(surface_card_style)
+            .into()
+    }
+
+    fn view_mesh_drawer(&self) -> Element<'_, Message> {
+        let title_row = row![
+            text("Mesh Sync")
+                .size(15)
+                .font(Font::MONOSPACE)
+                .color(ACCENT_CYAN),
+            Space::new().width(Length::Fill),
+            button(text("×").size(14))
+                .padding([2, 8])
+                .style(secondary_button_style)
+                .on_press(Message::ToggleDrawer(ActiveDrawer::Mesh)),
+        ]
+        .align_y(Alignment::Center);
+
+        let mut status_lines = Column::new().spacing(4).width(Length::Fill);
+        if let Some(sync) = &self.sync_snapshot {
+            let enabled_text = if sync.enabled { "enabled" } else { "disabled" };
+            let enabled_color = if sync.enabled {
+                ACCENT_EMERALD
+            } else {
+                ACCENT_AMBER
+            };
+            let iface = sync.interface.as_deref().unwrap_or("—");
+            let listen = sync.listen_addr.as_deref().unwrap_or("—");
+
+            status_lines = status_lines
+                .push(
+                    row![
+                        text("Status: ").size(12).color(TEXT_MUTED),
+                        text(enabled_text).size(12).color(enabled_color),
+                        Space::new().width(Length::Fill),
+                        text(format!(
+                            "peers: {}/{}",
+                            sync.connected_peers, sync.trusted_peers
+                        ))
+                        .size(12)
+                        .color(TEXT_PRIMARY),
+                    ]
+                    .align_y(Alignment::Center),
+                )
+                .push(
+                    text(format!("device_id: {}", sync.device_id))
+                        .size(11)
+                        .font(Font::MONOSPACE)
+                        .color(TEXT_PRIMARY),
+                )
+                .push(
+                    text(format!(
+                        "transport: {}  |  iface: {}",
+                        sync.transport, iface
+                    ))
+                    .size(11)
+                    .font(Font::MONOSPACE)
+                    .color(TEXT_MUTED),
+                )
+                .push(
+                    text(format!(
+                        "listen: {}  |  events: {}",
+                        listen, sync.event_log_len
+                    ))
+                    .size(11)
+                    .font(Font::MONOSPACE)
+                    .color(TEXT_MUTED),
+                );
+        } else {
+            status_lines = status_lines.push(
+                text("Mesh status not loaded yet.")
+                    .size(12)
+                    .color(TEXT_MUTED),
+            );
+        }
+
+        let status_card = container(status_lines)
+            .padding(10)
+            .width(Length::Fill)
+            .style(elevated_card_style);
+
+        let mut peers_col = Column::new().spacing(6).width(Length::Fill);
+        peers_col = peers_col.push(text("Trusted Peers").size(12).color(TEXT_PRIMARY));
+        match self.sync_snapshot.as_ref() {
+            Some(sync) if !sync.peers.is_empty() => {
+                for peer in &sync.peers {
+                    let (status_str, status_color) = match peer.status {
+                        PeerStatus::Connected => ("Connected", ACCENT_EMERALD),
+                        PeerStatus::Disconnected => ("Disconnected", TEXT_MUTED),
+                        PeerStatus::Pairing => ("Pairing", ACCENT_AMBER),
+                    };
+                    let addrs = if peer.addresses.is_empty() {
+                        "—".to_string()
+                    } else {
+                        peer.addresses.join(", ")
+                    };
+                    peers_col = peers_col.push(
+                        container(
+                            column![
+                                row![
+                                    text(&peer.name).size(12).color(TEXT_PRIMARY),
+                                    Space::new().width(Length::Fill),
+                                    text(status_str).size(11).color(status_color),
+                                ]
+                                .align_y(Alignment::Center),
+                                text(format!("id: {}", peer.id))
+                                    .size(11)
+                                    .font(Font::MONOSPACE)
+                                    .color(TEXT_MUTED),
+                                text(format!("addr: {addrs}"))
+                                    .size(11)
+                                    .font(Font::MONOSPACE)
+                                    .color(TEXT_MUTED),
+                            ]
+                            .spacing(3),
+                        )
+                        .padding(8)
+                        .width(Length::Fill)
+                        .style(elevated_card_style),
+                    );
+                }
+            }
+            _ => {
+                peers_col = peers_col.push(
+                    text("No trusted peers configured.")
+                        .size(12)
+                        .color(TEXT_MUTED),
+                );
+            }
+        }
+
+        let endpoint_input = text_input(
+            "Optional endpoint (e.g. 10.42.0.1:51820)",
+            &self.mesh_endpoint_input,
+        )
+        .on_input(Message::MeshEndpointInputChanged)
+        .on_submit(Message::GeneratePairingCode)
+        .padding(8)
+        .size(12)
+        .width(Length::Fill);
+
+        let mut gen_btn = button(text("Generate Pairing Code").size(12))
+            .padding([7, 12])
+            .style(secondary_button_style);
+        if !self.mesh_busy {
+            gen_btn = gen_btn.on_press(Message::GeneratePairingCode);
+        }
+
+        let mut sync_btn = button(text("Sync Now").size(12))
+            .padding([7, 12])
+            .style(primary_button_style);
+        if !self.mesh_busy {
+            sync_btn = sync_btn.on_press(Message::TriggerSync);
+        }
+
+        let mut pairing_section = column![
+            endpoint_input,
+            row![gen_btn, sync_btn]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        ]
+        .spacing(8);
+
+        if let Some(code_snap) = &self.generated_pairing_code {
+            let endpoint_info = code_snap.endpoint.as_deref().unwrap_or("auto");
+            pairing_section = pairing_section.push(
+                container(
+                    column![
+                        text(format!(
+                            "Pairing Code (device: {}, endpoint: {})",
+                            code_snap.device_id, endpoint_info
+                        ))
+                        .size(11)
+                        .color(ACCENT_CYAN),
+                        text(&code_snap.code)
+                            .size(12)
+                            .font(Font::MONOSPACE)
+                            .color(TEXT_PRIMARY),
+                    ]
+                    .spacing(4),
+                )
+                .padding(8)
+                .width(Length::Fill)
+                .style(code_block_style),
+            );
+        }
+
+        let pair_input = text_input("Paste mycel-pair-v1:... or peer ID", &self.mesh_pair_input)
+            .on_input(Message::MeshPairInputChanged)
+            .on_submit(Message::PairPeer)
+            .padding(8)
+            .size(12)
+            .width(Length::Fill);
+
+        let can_pair = !self.mesh_busy && !self.mesh_pair_input.trim().is_empty();
+        let mut pair_btn = button(text("Pair").size(12))
+            .padding([8, 14])
+            .style(primary_button_style);
+        if can_pair {
+            pair_btn = pair_btn.on_press(Message::PairPeer);
+        }
+
+        let mut actions_col = column![
+            pairing_section,
+            row![pair_input, pair_btn]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        ]
+        .spacing(10);
+
+        if let Some((msg, is_err)) = &self.mesh_feedback {
+            actions_col = actions_col.push(text(msg).size(12).color(if *is_err {
+                ACCENT_ROSE
+            } else {
+                ACCENT_EMERALD
+            }));
+        }
+
+        let body = column![
+            title_row,
+            status_card,
+            scrollable(peers_col)
+                .width(Length::Fill)
+                .height(Length::Fill),
+            container(actions_col)
+                .padding(10)
+                .width(Length::Fill)
+                .style(elevated_card_style),
+        ]
+        .spacing(10)
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        container(body)
+            .padding(12)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(surface_card_style)
+            .into()
+    }
 }
 
 struct AbortOnDrop(JoinHandle<()>);
@@ -1066,6 +1798,23 @@ fn secondary_button_style(_theme: &iced::Theme, status: button::Status) -> butto
         text_color: TEXT_PRIMARY,
         border: Border {
             color: BORDER_SUBTLE,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+fn active_drawer_button_style(_theme: &iced::Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered | button::Status::Pressed => Color::from_rgb(0.18, 0.30, 0.40),
+        _ => Color::from_rgb(0.13, 0.24, 0.34),
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: ACCENT_CYAN,
+        border: Border {
+            color: ACCENT_CYAN,
             width: 1.0,
             radius: 6.0.into(),
         },
@@ -1295,6 +2044,153 @@ mod tests {
             }
             other => panic!("unexpected entry: {other:?}"),
         }
+        let _ = app.view();
+    }
+
+    #[test]
+    fn drawer_toggling_and_provider_state_transitions() {
+        let mut app = test_app();
+        assert_eq!(app.active_drawer, None);
+
+        let _ = app.update(Message::ToggleDrawer(ActiveDrawer::Providers));
+        assert_eq!(app.active_drawer, Some(ActiveDrawer::Providers));
+
+        // Toggle same drawer closes it.
+        let _ = app.update(Message::ToggleDrawer(ActiveDrawer::Providers));
+        assert_eq!(app.active_drawer, None);
+
+        // Switch from Providers to Mesh directly.
+        let _ = app.update(Message::ToggleDrawer(ActiveDrawer::Providers));
+        let _ = app.update(Message::ToggleDrawer(ActiveDrawer::Mesh));
+        assert_eq!(app.active_drawer, Some(ActiveDrawer::Mesh));
+
+        // ProvidersFetched populates catalog and pre-selects active provider.
+        let _ = app.update(Message::ProvidersFetched(Ok(ProvidersSnapshot {
+            active_provider: Some("venice".to_string()),
+            active_model: Some("llama-3.3-70b".to_string()),
+            providers: vec![
+                ProviderSummary {
+                    id: "openrouter".to_string(),
+                    name: "OpenRouter".to_string(),
+                    api: "openai-compatible".to_string(),
+                    configured: false,
+                    env_var: "OPENROUTER_API_KEY".to_string(),
+                    default_model: "anthropic/claude-sonnet-4".to_string(),
+                    base_url: "https://openrouter.ai/api/v1".to_string(),
+                },
+                ProviderSummary {
+                    id: "venice".to_string(),
+                    name: "Venice AI".to_string(),
+                    api: "openai-compatible".to_string(),
+                    configured: true,
+                    env_var: "VENICE_API_KEY".to_string(),
+                    default_model: "llama-3.3-70b".to_string(),
+                    base_url: "https://api.venice.ai/api/v1".to_string(),
+                },
+            ],
+        })));
+        assert_eq!(app.selected_provider_id.as_deref(), Some("venice"));
+
+        // Selecting another provider clears model override and feedback.
+        let _ = app.update(Message::ProviderModelInputChanged("custom-m".to_string()));
+        let _ = app.update(Message::SelectProvider("openrouter".to_string()));
+        assert_eq!(app.selected_provider_id.as_deref(), Some("openrouter"));
+        assert!(app.provider_model_input.is_empty());
+
+        let _ = app.update(Message::ToggleDrawer(ActiveDrawer::Providers));
+        let _ = app.view();
+
+        app.provider_busy = true;
+        let _ = app.update(Message::SetProviderCompleted(Ok(
+            "Active cloud provider set to openrouter/anthropic/claude-sonnet-4".to_string(),
+        )));
+        assert!(!app.provider_busy);
+        assert_eq!(
+            app.provider_feedback
+                .as_ref()
+                .map(|(m, err)| (m.as_str(), *err)),
+            Some((
+                "Active cloud provider set to openrouter/anthropic/claude-sonnet-4",
+                false
+            ))
+        );
+        let _ = app.view();
+    }
+
+    #[test]
+    fn mesh_drawer_state_transitions_and_view_rendering() {
+        use crate::protocol::PeerInfo;
+
+        let mut app = test_app();
+        let _ = app.update(Message::ToggleDrawer(ActiveDrawer::Mesh));
+        assert_eq!(app.active_drawer, Some(ActiveDrawer::Mesh));
+
+        let _ = app.update(Message::SyncStatusFetched(Ok(SyncSnapshot {
+            enabled: true,
+            device_id: "node-1".to_string(),
+            transport: "wireguard".to_string(),
+            interface: Some("mycel0".to_string()),
+            listen_addr: Some("0.0.0.0:51820".to_string()),
+            trusted_peers: 1,
+            connected_peers: 1,
+            event_log_len: 10,
+            peers: vec![PeerInfo {
+                id: "node-2".to_string(),
+                name: "desktop".to_string(),
+                status: PeerStatus::Connected,
+                addresses: vec!["10.42.0.2:51820".to_string()],
+            }],
+        })));
+        assert!(app.mesh_enabled);
+        assert_eq!(app.mesh_connected_peers, 1);
+        assert_eq!(app.sync_snapshot.as_ref().unwrap().device_id, "node-1");
+
+        app.mesh_busy = true;
+        let _ = app.update(Message::PairingCodeGenerated(Ok(PairingCodeSnapshot {
+            device_id: "node-1".to_string(),
+            code: "mycel-pair-v1:node-1@10.42.0.1:51820".to_string(),
+            endpoint: Some("10.42.0.1:51820".to_string()),
+        })));
+        assert!(!app.mesh_busy);
+        assert_eq!(
+            app.generated_pairing_code.as_ref().map(|c| c.code.as_str()),
+            Some("mycel-pair-v1:node-1@10.42.0.1:51820")
+        );
+        let _ = app.view();
+
+        let _ = app.update(Message::MeshPairInputChanged(
+            "mycel-pair-v1:node-3@10.42.0.3:51820".to_string(),
+        ));
+        app.mesh_busy = true;
+        let _ = app.update(Message::PairPeerCompleted(Ok(PeerAddedSnapshot {
+            peer: PeerInfo {
+                id: "node-3".to_string(),
+                name: "laptop".to_string(),
+                status: PeerStatus::Connected,
+                addresses: vec!["10.42.0.3:51820".to_string()],
+            },
+            synced_events: 4,
+        })));
+        assert!(!app.mesh_busy);
+        assert!(app.mesh_pair_input.is_empty());
+        assert!(app
+            .mesh_feedback
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("Paired laptop"));
+
+        app.mesh_busy = true;
+        let _ = app.update(Message::TriggerSyncCompleted(Ok(
+            "Synced 2 event(s) across mesh".to_string(),
+        )));
+        assert!(!app.mesh_busy);
+        assert_eq!(
+            app.mesh_feedback
+                .as_ref()
+                .map(|(m, err)| (m.as_str(), *err)),
+            Some(("Synced 2 event(s) across mesh", false))
+        );
         let _ = app.view();
     }
 }
