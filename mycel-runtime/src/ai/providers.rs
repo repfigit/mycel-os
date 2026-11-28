@@ -1707,11 +1707,12 @@ fn truncate_error(s: &str) -> String {
 
 fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     let hex = sha256::digest(data);
+    let bytes = hex.as_bytes();
     let mut out = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate().take(32) {
-        let hi = hex_nibble(chunk[0]);
-        let lo = hex_nibble(chunk[1]);
-        out[i] = (hi << 4) | lo;
+    for (i, slot) in out.iter_mut().enumerate() {
+        if let (Some(&hi), Some(&lo)) = (bytes.get(2 * i), bytes.get(2 * i + 1)) {
+            *slot = (hex_nibble(hi) << 4) | hex_nibble(lo);
+        }
     }
     out
 }
