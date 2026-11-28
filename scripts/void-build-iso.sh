@@ -28,12 +28,16 @@ case "$PROFILE" in
         PACKAGES="base-system linux grub-x86_64-efi grub dhcpcd iproute2 iputils curl ca-certificates bubblewrap python3 wireguard-tools"
         SERVICES="agetty-ttyS0 dhcpcd"
         ;;
+    desktop)
+        PACKAGES="base-system linux grub-x86_64-efi grub dhcpcd iproute2 iputils curl ca-certificates bubblewrap python3 wireguard-tools seatd eudev mesa-dri libdrm libxkbcommon libinput pixman wayland dejavu-fonts-ttf"
+        SERVICES="agetty-ttyS0 dhcpcd udevd seatd"
+        ;;
     full)
         PACKAGES="base-system linux linux-firmware grub-x86_64-efi grub NetworkManager iwd bluez pipewire wireplumber elogind dbus polkit xorg-minimal xorg-fonts mesa-dri sway foot bemenu mako grim slurp wl-clipboard firefox curl wget git vim neovim htop tmux zsh python3 bubblewrap wireguard-tools"
         SERVICES="agetty-ttyS0 dbus NetworkManager elogind polkit"
         ;;
     *)
-        echo "ERROR: Unknown profile '$PROFILE' (expected: smoke | full)" >&2
+        echo "ERROR: Unknown profile '$PROFILE' (expected: smoke | desktop | full)" >&2
         exit 1
         ;;
 esac
@@ -66,6 +70,32 @@ mkdir -p \
 
 # Real static musl mycel-runtime binary
 install -m 0755 "$RUNTIME_BIN" "$INCLUDEDIR/usr/local/bin/mycel-runtime"
+
+if [ "$PROFILE" = "desktop" ] || [ "$PROFILE" = "full" ]; then
+    for bin in mycel-compositor mycel-shell; do
+        BIN_PATH="$WORKSPACE/$bin/target/x86_64-unknown-linux-musl/release/$bin"
+        if [ ! -f "$BIN_PATH" ]; then
+            BIN_PATH="$WORKSPACE/$bin/target/release/$bin"
+        fi
+        if [ ! -f "$BIN_PATH" ]; then
+            echo "ERROR: $bin binary not found (checked target/x86_64-unknown-linux-musl/release/$bin and target/release/$bin)" >&2
+            exit 1
+        fi
+        install -m 0755 "$BIN_PATH" "$INCLUDEDIR/usr/local/bin/$bin"
+    done
+
+    cat > "$INCLUDEDIR/usr/local/bin/mycel-session" << 'EOF'
+#!/bin/sh
+set -e
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 0700 "$XDG_RUNTIME_DIR"
+export MYCEL_SOCKET="${MYCEL_SOCKET:-/run/mycel/runtime.sock}"
+export LIBSEAT_BACKEND="${LIBSEAT_BACKEND:-seatd}"
+exec /usr/local/bin/mycel-compositor --shell /usr/local/bin/mycel-shell "$@"
+EOF
+    chmod 0755 "$INCLUDEDIR/usr/local/bin/mycel-session"
+fi
 
 # Real Python CLI + thin wrapper
 install -m 0755 "$CLI_SCRIPT" "$INCLUDEDIR/usr/local/lib/mycel/mycel-cli.py"
@@ -118,7 +148,22 @@ VERSION_ID="0.1.0"
 PRETTY_NAME="Mycel OS 0.1.0 (Void musl)"
 HOME_URL="https://mycel-os.org"
 EOF
-cat > "$INCLUDEDIR/etc/motd" << 'EOF'
+if [ "$PROFILE" = "desktop" ]; then
+    cat > "$INCLUDEDIR/etc/motd" << 'EOF'
+
+    ███╗   ███╗██╗   ██╗ ██████╗███████╗██╗
+    ████╗ ████║╚██╗ ██╔╝██╔════╝██╔════╝██║
+    ██╔████╔██║ ╚████╔╝ ██║     █████╗  ██║
+    ██║╚██╔╝██║  ╚██╔╝  ██║     ██╔══╝  ██║
+    ██║ ╚═╝ ██║   ██║   ╚██████╗███████╗███████╗
+    ╚═╝     ╚═╝   ╚═╝    ╚═════╝╚══════╝╚══════╝
+
+    Welcome to Mycel OS (x86_64-musl)
+    Run 'mycel-session' to launch the desktop, 'mycel --help', or 'sv status mycel-runtime'.
+
+EOF
+else
+    cat > "$INCLUDEDIR/etc/motd" << 'EOF'
 
     ███╗   ███╗██╗   ██╗ ██████╗███████╗██╗
     ████╗ ████║╚██╗ ██╔╝██╔════╝██╔════╝██║
@@ -131,6 +176,7 @@ cat > "$INCLUDEDIR/etc/motd" << 'EOF'
     Run 'mycel --help' or 'sv status mycel-runtime' to get started.
 
 EOF
+fi
 
 echo "[3/4] Setting up void-mklive..."
 MKLIVE_DIR="/opt/void-mklive"

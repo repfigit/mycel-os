@@ -14,12 +14,13 @@ case "$PROFILE" in
     smoke|quick|minimal)
         PROFILE="smoke"
         ;;
-    full)
+    desktop|full)
         ;;
     *)
-        echo "Usage: $0 [smoke|full]"
-        echo "  smoke - Headless x86_64-musl smoke ISO (default)"
-        echo "  full  - Full desktop x86_64-musl ISO"
+        echo "Usage: $0 [smoke|desktop|full]"
+        echo "  smoke   - Headless x86_64-musl smoke ISO (default)"
+        echo "  desktop - Mycel compositor + shell desktop x86_64-musl ISO"
+        echo "  full    - Full desktop x86_64-musl ISO"
         exit 1
         ;;
 esac
@@ -74,6 +75,39 @@ if command -v ldd &> /dev/null; then
         echo "ERROR: Binary is dynamically linked against glibc!" >&2
         exit 1
     fi
+fi
+
+if [ "$PROFILE" = "desktop" ] || [ "$PROFILE" = "full" ]; then
+    echo "[2b/3] Building mycel-shell and mycel-compositor inside mycel-iso-builder..."
+    docker run --rm \
+        -u "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -e CARGO_HOME=/tmp/.cargo \
+        -v "$PROJECT_DIR:/workspace" \
+        -w /workspace/mycel-shell \
+        mycel-iso-builder \
+        cargo build --release
+
+    COMPOSITOR_CARGO_ARGS=(build --release)
+    if [ "$PROFILE" = "desktop" ]; then
+        COMPOSITOR_CARGO_ARGS+=(--features drm)
+    fi
+    docker run --rm \
+        -u "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -e CARGO_HOME=/tmp/.cargo \
+        -v "$PROJECT_DIR:/workspace" \
+        -w /workspace/mycel-compositor \
+        mycel-iso-builder \
+        cargo "${COMPOSITOR_CARGO_ARGS[@]}"
+
+    for bin in mycel-shell mycel-compositor; do
+        if [ ! -f "$PROJECT_DIR/$bin/target/x86_64-unknown-linux-musl/release/$bin" ] && \
+           [ ! -f "$PROJECT_DIR/$bin/target/release/$bin" ]; then
+            echo "ERROR: Expected $bin binary not found in $PROJECT_DIR/$bin/target/" >&2
+            exit 1
+        fi
+    done
 fi
 
 echo "[3/3] Running void-mklive ISO build (profile=$PROFILE)..."
