@@ -27,23 +27,62 @@ impl ModelPricing {
     }
 }
 
-/// Look up pricing for an OpenRouter model id. Falls back to a conservative
-/// mid-tier estimate for unknown models so budgets still bind.
+/// Look up pricing for a cloud model id (across OpenRouter, Venice, Anthropic,
+/// OpenAI, Google, DeepSeek, xAI, MiniMax, Kimi, Bedrock, Llama, etc.). Falls
+/// back to a conservative mid-tier estimate for unknown models so budgets still bind.
 pub fn pricing_for(model: &str) -> ModelPricing {
-    // Prices are approximate OpenRouter list prices (USD / 1M tokens).
+    // Prices are approximate list prices (USD / 1M tokens).
     // Update periodically; the fallback keeps unknown models bounded.
-    let (input, output) = match model {
-        m if m.contains("claude-3.5-sonnet") || m.contains("claude-sonnet-4") => (3.0, 15.0),
-        m if m.contains("claude-3.5-haiku") || m.contains("claude-haiku") => (0.8, 4.0),
-        m if m.contains("claude-opus") => (15.0, 75.0),
-        m if m.contains("gpt-4o-mini") => (0.15, 0.60),
-        m if m.contains("gpt-4o") => (2.50, 10.0),
-        m if m.contains("gpt-4-turbo") => (10.0, 30.0),
-        m if m.contains("llama-3.1-70b") => (0.35, 0.40),
-        m if m.contains("llama-3.1-405b") => (2.70, 2.70),
-        m if m.contains("qwen") => (0.30, 0.60),
-        m if m.contains("deepseek") => (0.14, 0.28),
-        m if m.contains("mistral-large") => (2.0, 6.0),
+    let m = model.to_ascii_lowercase();
+    let (input, output) = match m.as_str() {
+        // Anthropic Claude
+        s if s.contains("claude-opus-4") || s.contains("claude-opus") => (15.0, 75.0),
+        s if s.contains("claude-3.5-sonnet")
+            || s.contains("claude-3-5-sonnet")
+            || s.contains("claude-sonnet-4") =>
+        {
+            (3.0, 15.0)
+        }
+        s if s.contains("claude-3.5-haiku")
+            || s.contains("claude-3-5-haiku")
+            || s.contains("claude-haiku") =>
+        {
+            (0.8, 4.0)
+        }
+        // OpenAI
+        s if s.contains("gpt-4o-mini") => (0.15, 0.60),
+        s if s.contains("gpt-4o") => (2.50, 10.0),
+        s if s.contains("gpt-4.1-nano") => (0.10, 0.40),
+        s if s.contains("gpt-4.1-mini") => (0.40, 1.60),
+        s if s.contains("gpt-4.1") => (2.00, 8.00),
+        s if s.contains("gpt-4-turbo") => (10.0, 30.0),
+        s if s.contains("o3-mini") || s.contains("o4-mini") => (1.10, 4.40),
+        s if s.contains("gpt-5") => (1.25, 10.0),
+        s if s.contains("gpt-oss-120b") => (0.15, 0.60),
+        // Google Gemini
+        s if s.contains("gemini-2.5-pro") || s.contains("gemini-1.5-pro") => (1.25, 10.0),
+        s if s.contains("gemini-2.5-flash") || s.contains("gemini-2.0-flash") => (0.15, 0.60),
+        s if s.contains("gemini") => (0.30, 1.20),
+        // xAI Grok
+        s if s.contains("grok-4") || s.contains("grok-3-mini") => (0.30, 0.50),
+        s if s.contains("grok-3") || s.contains("grok") => (3.00, 15.0),
+        // DeepSeek
+        s if s.contains("deepseek-r1") || s.contains("deepseek-reasoner") => (0.55, 2.19),
+        s if s.contains("deepseek") => (0.14, 0.28),
+        // MiniMax & Kimi / Moonshot
+        s if s.contains("minimax") => (0.30, 1.20),
+        s if s.contains("kimi") || s.contains("moonshot") => (0.60, 2.50),
+        // Amazon Bedrock Nova
+        s if s.contains("nova-pro") => (0.80, 3.20),
+        s if s.contains("nova-lite") => (0.06, 0.24),
+        s if s.contains("nova-micro") => (0.035, 0.14),
+        // Venice / Llama / Qwen / Mistral
+        s if s.contains("venice-uncensored") => (0.20, 0.90),
+        s if s.contains("llama-3.1-405b") || s.contains("llama-4") => (2.70, 2.70),
+        s if s.contains("llama-3.3-70b") || s.contains("llama-3.1-70b") => (0.35, 0.40),
+        s if s.contains("llama") => (0.20, 0.40),
+        s if s.contains("qwen") => (0.30, 0.60),
+        s if s.contains("mistral-large") => (2.0, 6.0),
         // Conservative default: assume a mid-tier paid model.
         _ => (1.0, 4.0),
     };
@@ -212,5 +251,34 @@ mod tests {
         assert_eq!(p.input_per_million, 3.0);
         let cheap = pricing_for("gpt-4o-mini");
         assert!(cheap.input_per_million < 1.0);
+    }
+
+    #[test]
+    fn test_pricing_new_model_families() {
+        let gemini = pricing_for("gemini-2.5-flash");
+        assert_eq!(gemini.input_per_million, 0.15);
+        let gemini_pro = pricing_for("gemini-2.5-pro");
+        assert_eq!(gemini_pro.input_per_million, 1.25);
+
+        let grok = pricing_for("grok-3");
+        assert_eq!(grok.input_per_million, 3.0);
+
+        let deepseek_r1 = pricing_for("deepseek-r1");
+        assert_eq!(deepseek_r1.input_per_million, 0.55);
+
+        let minimax = pricing_for("MiniMax-M2.5");
+        assert_eq!(minimax.input_per_million, 0.30);
+
+        let kimi = pricing_for("kimi-k2.5");
+        assert_eq!(kimi.input_per_million, 0.60);
+
+        let nova = pricing_for("amazon.nova-pro-v1:0");
+        assert_eq!(nova.input_per_million, 0.80);
+
+        let venice = pricing_for("venice-uncensored");
+        assert_eq!(venice.input_per_million, 0.20);
+
+        let llama33 = pricing_for("llama-3.3-70b");
+        assert_eq!(llama33.input_per_million, 0.35);
     }
 }
