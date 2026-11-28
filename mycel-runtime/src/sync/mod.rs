@@ -36,7 +36,7 @@ use chrono::{DateTime, Utc};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -300,8 +300,15 @@ fn seal_event(own: &StaticSecret, peer: &PublicKey, event: &SyncEvent) -> Result
     })
 }
 
+#[derive(Debug, Clone, Default)]
+struct PeerWireGuardMeta {
+    wg_ip: Option<String>,
+    wg_endpoint: Option<String>,
+}
+
 struct SyncState {
     peers: HashMap<String, PeerInfo>,
+    peer_wg: HashMap<String, PeerWireGuardMeta>,
     trusted_peers: HashSet<String>,
     log: log::SyncLog,
     local_clock: VectorClock,
@@ -317,6 +324,10 @@ struct PersistedPeerMeta {
     name: Option<String>,
     #[serde(default)]
     addresses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wg_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wg_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -341,6 +352,10 @@ struct PairingPayload {
     endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wg_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sync_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -565,8 +580,8 @@ pub struct SyncService {
     keys: Arc<DeviceKeys>,
     mdns: Option<ServiceDaemon>,
     mcp_manager: Arc<Option<McpManager>>,
-    /// Bound only when the mesh is enabled.
-    socket: Option<Arc<UdpSocket>>,
+    /// Bound only when the mesh is enabled in Direct mode.
+    socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
     event_bus: broadcast::Sender<SystemEvent>,
     /// Optional command registry for replicating user-defined commands.
     command_registry: Arc<RwLock<Option<crate::commands::CommandRegistry>>>,
@@ -624,6 +639,7 @@ impl SyncService {
         }
 
         let mut peers: HashMap<String, PeerInfo> = HashMap::new();
+        let mut peer_wg: HashMap<String, PeerWireGuardMeta> = HashMap::new();
         for peer_id in &trusted_peers {
             let mut addresses = Vec::new();
             if let Some(ep) = mesh.peer_endpoints.get(peer_id) {
@@ -642,6 +658,15 @@ impl SyncService {
                     {
                         addresses.push(addr.clone());
                     }
+                }
+                if meta.wg_ip.is_some() || meta.wg_endpoint.is_some() {
+                    peer_wg.insert(
+                        peer_id.clone(),
+                        PeerWireGuardMeta {
+                            wg_ip: meta.wg_ip.clone(),
+                            wg_endpoint: meta.wg_endpoint.clone(),
+                        },
+                    );
                 }
             }
             peers.insert(
@@ -671,21 +696,18 @@ impl SyncService {
             peer_endpoints: mesh.peer_endpoints.clone(),
         };
 
+        // Do NOT bind UDP mesh_port here when transport is WireGuard or Auto,
+        // because kernel WireGuard needs to bind `listen-port` on mesh_port.
         let socket = if sync_config.enabled {
             if trusted_peers.is_empty() {
                 warn!("Mesh enabled but [mesh] trusted_peers is empty; no device will be accepted");
             }
-            let bound = match UdpSocket::bind(format!("0.0.0.0:{}", sync_config.mesh_port)).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        "Failed to bind to port {}: {}, falling back to random",
-                        sync_config.mesh_port, e
-                    );
-                    UdpSocket::bind("0.0.0.0:0").await?
-                }
-            };
-            Some(Arc::new(bound))
+            if matches!(mesh.transport, MeshTransportMode::Direct) {
+                let bound = Self::bind_direct_udp_socket(sync_config.mesh_port).await?;
+                Some(bound)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -709,6 +731,7 @@ impl SyncService {
 
         let sync_state = SyncState {
             peers,
+            peer_wg,
             trusted_peers,
             log: sync_log,
             local_clock,
@@ -727,12 +750,26 @@ impl SyncService {
             keys: Arc::new(keys),
             mdns,
             mcp_manager: Arc::new(mcp_manager),
-            socket,
+            socket: Arc::new(RwLock::new(socket)),
             event_bus,
             command_registry: Arc::new(RwLock::new(None)),
             context_manager: Arc::new(RwLock::new(None)),
             shutdown_tx,
         })
+    }
+
+    async fn bind_direct_udp_socket(mesh_port: u16) -> Result<Arc<UdpSocket>> {
+        let bound = match UdpSocket::bind(format!("0.0.0.0:{}", mesh_port)).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Failed to bind to port {}: {}, falling back to random",
+                    mesh_port, e
+                );
+                UdpSocket::bind("0.0.0.0:0").await?
+            }
+        };
+        Ok(Arc::new(bound))
     }
 
     /// Signal background listener loops to stop.
@@ -782,25 +819,71 @@ impl SyncService {
         }
     }
 
+    fn ensure_endpoint_port(ep: &str, default_port: u16) -> String {
+        let trimmed = ep.trim();
+        if trimmed.parse::<SocketAddr>().is_ok() {
+            return trimmed.to_string();
+        }
+        if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+            return SocketAddr::new(ip, default_port).to_string();
+        }
+        if trimmed.contains(':') {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}:{default_port}")
+        }
+    }
+
     pub async fn generate_pairing_code(&self, endpoint: Option<String>) -> PairingCodeInfo {
-        let listen_addr = self.tcp_listen_addr().await;
-        let resolved_endpoint = endpoint
-            .map(|e| e.trim().to_string())
-            .filter(|e| !e.is_empty())
-            .or_else(|| {
-                listen_addr.map(|a| {
-                    if a.ip().is_unspecified() {
-                        format!("127.0.0.1:{}", a.port())
-                    } else {
-                        a.to_string()
-                    }
-                })
-            });
+        let (wg_local_ip, tcp_listen_addr) = {
+            let state = self.state.read().await;
+            (
+                state.wg.as_ref().map(|w| w.local_ip().to_string()),
+                state.tcp_listen_addr,
+            )
+        };
+
+        let (resolved_endpoint, wg_ip, sync_port) = if let Some(local_ip) = wg_local_ip {
+            let ep = endpoint
+                .map(|e| e.trim().to_string())
+                .filter(|e| !e.is_empty())
+                .map(|e| Self::ensure_endpoint_port(&e, self.sync_config.mesh_port))
+                .or_else(|| {
+                    tcp_listen_addr.map(|a| {
+                        let host = if a.ip().is_unspecified() {
+                            "127.0.0.1".to_string()
+                        } else {
+                            a.ip().to_string()
+                        };
+                        format!("{host}:{}", self.sync_config.mesh_port)
+                    })
+                });
+            let sp = tcp_listen_addr
+                .map(|a| a.port())
+                .or(Some(self.sync_config.sync_port));
+            (ep, Some(local_ip), sp)
+        } else {
+            let ep = endpoint
+                .map(|e| e.trim().to_string())
+                .filter(|e| !e.is_empty())
+                .or_else(|| {
+                    tcp_listen_addr.map(|a| {
+                        if a.ip().is_unspecified() {
+                            format!("127.0.0.1:{}", a.port())
+                        } else {
+                            a.to_string()
+                        }
+                    })
+                });
+            (ep, None, None)
+        };
 
         let payload = PairingPayload {
             device_id: self.keys.id(),
             endpoint: resolved_endpoint.clone(),
             name: Some(self.sync_config.device_name.clone()),
+            wg_ip,
+            sync_port,
         };
 
         let json = serde_json::to_vec(&payload).unwrap_or_default();
@@ -820,6 +903,18 @@ impl SyncService {
         name: Option<String>,
         endpoint: Option<String>,
     ) -> Result<(PeerInfo, usize)> {
+        self.add_trusted_peer_with_wg(peer_id, name, endpoint, None, None)
+            .await
+    }
+
+    async fn add_trusted_peer_with_wg(
+        &self,
+        peer_id: &str,
+        name: Option<String>,
+        endpoint: Option<String>,
+        wg_ip: Option<String>,
+        sync_port: Option<u16>,
+    ) -> Result<(PeerInfo, usize)> {
         let peer_id = peer_id.trim();
         if peer_id.is_empty() {
             return Err(anyhow!("Peer ID cannot be empty"));
@@ -834,53 +929,108 @@ impl SyncService {
         let clean_endpoint = endpoint
             .map(|e| e.trim().to_string())
             .filter(|e| !e.is_empty());
+        let clean_wg_ip = wg_ip
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty());
 
-        let (peer_info, persisted_snapshot, wg_opt, connected_count) = {
+        let (peer_info, persisted_snapshot, wg_registration, connected_count) = {
             let mut state = self.state.write().await;
             state.trusted_peers.insert(peer_id.to_string());
 
-            let entry = state
-                .peers
-                .entry(peer_id.to_string())
-                .or_insert_with(|| PeerInfo {
-                    id: peer_id.to_string(),
-                    name: clean_name
-                        .clone()
-                        .unwrap_or_else(|| format_short_peer_name(peer_id)),
-                    status: PeerStatus::Disconnected,
-                    addresses: Vec::new(),
-                });
-
-            if let Some(new_name) = &clean_name {
-                entry.name = new_name.clone();
-            }
-            if let Some(ep) = &clean_endpoint {
-                if !entry.addresses.iter().any(|a| a == ep) {
-                    if entry.addresses.len() >= MAX_PEER_ADDRESSES {
-                        entry.addresses.remove(0);
-                    }
-                    entry.addresses.push(ep.clone());
-                }
-            }
-
-            let peer_info = entry.clone();
-            let snapshot = Self::build_persisted_peers(&state);
             let wg_opt = state.wg.clone();
+            let wg_registration = if let Some(wg) = wg_opt {
+                let allowed_ip = match &clean_wg_ip {
+                    Some(ip_str) => wireguard::parse_wg_cidr(ip_str)
+                        .map(|(ip, _)| ip)
+                        .with_context(|| format!("Invalid peer wg_ip '{ip_str}'"))?,
+                    None => wireguard::derive_mesh_ip(peer_pk.as_bytes()),
+                };
+                let wg_endpoint = clean_endpoint
+                    .as_deref()
+                    .map(|ep| Self::ensure_endpoint_port(ep, self.sync_config.mesh_port));
+                let peer_sync_port = sync_port.unwrap_or(self.sync_config.sync_port);
+                let overlay_tcp_addr = format!("{allowed_ip}:{peer_sync_port}");
+
+                state.peer_wg.insert(
+                    peer_id.to_string(),
+                    PeerWireGuardMeta {
+                        wg_ip: Some(allowed_ip.to_string()),
+                        wg_endpoint: wg_endpoint.clone(),
+                    },
+                );
+
+                let entry = state
+                    .peers
+                    .entry(peer_id.to_string())
+                    .or_insert_with(|| PeerInfo {
+                        id: peer_id.to_string(),
+                        name: clean_name
+                            .clone()
+                            .unwrap_or_else(|| format_short_peer_name(peer_id)),
+                        status: PeerStatus::Disconnected,
+                        addresses: Vec::new(),
+                    });
+
+                if let Some(new_name) = &clean_name {
+                    entry.name = new_name.clone();
+                }
+
+                // Store overlay TCP address FIRST so anti-entropy traffic routes through mycel0.
+                entry.addresses.retain(|a| a != &overlay_tcp_addr);
+                entry.addresses.insert(0, overlay_tcp_addr);
+                if entry.addresses.len() > MAX_PEER_ADDRESSES {
+                    entry.addresses.truncate(MAX_PEER_ADDRESSES);
+                }
+
+                Some((wg, allowed_ip, wg_endpoint))
+            } else {
+                let entry = state
+                    .peers
+                    .entry(peer_id.to_string())
+                    .or_insert_with(|| PeerInfo {
+                        id: peer_id.to_string(),
+                        name: clean_name
+                            .clone()
+                            .unwrap_or_else(|| format_short_peer_name(peer_id)),
+                        status: PeerStatus::Disconnected,
+                        addresses: Vec::new(),
+                    });
+
+                if let Some(new_name) = &clean_name {
+                    entry.name = new_name.clone();
+                }
+                if let Some(ep) = &clean_endpoint {
+                    if !entry.addresses.iter().any(|a| a == ep) {
+                        if entry.addresses.len() >= MAX_PEER_ADDRESSES {
+                            entry.addresses.remove(0);
+                        }
+                        entry.addresses.push(ep.clone());
+                    }
+                }
+
+                None
+            };
+
+            let peer_info = state
+                .peers
+                .get(peer_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("Peer missing from state after insert"))?;
+            let snapshot = Self::build_persisted_peers(&state);
             let connected_count = state
                 .peers
                 .values()
                 .filter(|p| matches!(p.status, PeerStatus::Connected))
                 .count();
-            (peer_info, snapshot, wg_opt, connected_count)
+            (peer_info, snapshot, wg_registration, connected_count)
         };
 
         let persisted_path = self.context_path.join("trusted_peers.json");
         write_trusted_peers_atomically(&persisted_path, &persisted_snapshot)?;
 
-        if let Some(wg) = wg_opt {
-            let mesh_ip = wireguard::derive_mesh_ip(peer_pk.as_bytes());
+        if let Some((wg, allowed_ip, wg_endpoint)) = wg_registration {
             if let Err(e) = wg
-                .set_peer(peer_id, mesh_ip, clean_endpoint.as_deref())
+                .set_peer(peer_id, allowed_ip, wg_endpoint.as_deref())
                 .await
             {
                 warn!(
@@ -928,8 +1078,14 @@ impl SyncService {
                 .context("Invalid base64 in pairing code")?;
             let payload: PairingPayload =
                 serde_json::from_slice(&raw).context("Invalid JSON in pairing code")?;
-            self.add_trusted_peer(&payload.device_id, payload.name, payload.endpoint)
-                .await
+            self.add_trusted_peer_with_wg(
+                &payload.device_id,
+                payload.name,
+                payload.endpoint,
+                payload.wg_ip,
+                payload.sync_port,
+            )
+            .await
         } else {
             self.add_trusted_peer(trimmed, None, None).await
         }
@@ -942,11 +1098,14 @@ impl SyncService {
         let mut peers = HashMap::new();
         for (id, info) in &state.peers {
             if state.trusted_peers.contains(id) {
+                let wg_meta = state.peer_wg.get(id);
                 peers.insert(
                     id.clone(),
                     PersistedPeerMeta {
                         name: Some(info.name.clone()),
                         addresses: info.addresses.clone(),
+                        wg_ip: wg_meta.and_then(|m| m.wg_ip.clone()),
+                        wg_endpoint: wg_meta.and_then(|m| m.wg_endpoint.clone()),
                     },
                 );
             }
@@ -959,15 +1118,17 @@ impl SyncService {
     }
 
     async fn setup_wireguard_dataplane(&self) -> Result<(wireguard::KernelWireGuard, TcpListener)> {
-        let local_ip = match &self.sync_config.wg_address {
-            Some(addr_str) => addr_str
-                .trim()
-                .parse::<Ipv4Addr>()
+        let (local_ip, prefix_len) = match &self.sync_config.wg_address {
+            Some(addr_str) => wireguard::parse_wg_cidr(addr_str)
                 .with_context(|| format!("Invalid [mesh] wg_address '{}'", addr_str))?,
-            None => wireguard::derive_mesh_ip(self.keys.public.as_bytes()),
+            None => (wireguard::derive_mesh_ip(self.keys.public.as_bytes()), 16),
         };
 
-        let wg = wireguard::KernelWireGuard::new(self.sync_config.interface.clone(), local_ip)?;
+        let wg = wireguard::KernelWireGuard::new(
+            self.sync_config.interface.clone(),
+            local_ip,
+            prefix_len,
+        )?;
         let private_b64 = encode_id(&self.keys.private.to_bytes());
         wg.configure_interface(&private_b64, self.sync_config.mesh_port)
             .await?;
@@ -978,19 +1139,37 @@ impl SyncService {
                 .trusted_peers
                 .iter()
                 .map(|id| {
-                    let ep = state
-                        .peers
-                        .get(id)
-                        .and_then(|p| p.addresses.first().cloned());
-                    (id.clone(), ep)
+                    let wg_meta = state.peer_wg.get(id);
+                    let wg_ip = wg_meta.and_then(|m| m.wg_ip.clone());
+                    let ep = wg_meta.and_then(|m| m.wg_endpoint.clone()).or_else(|| {
+                        state
+                            .peers
+                            .get(id)
+                            .and_then(|p| p.addresses.first().cloned())
+                    });
+                    (id.clone(), wg_ip, ep)
                 })
                 .collect::<Vec<_>>()
         };
 
-        for (peer_id, endpoint) in peers_snapshot {
+        for (peer_id, wg_ip_opt, endpoint) in peers_snapshot {
             if let Some(pk) = decode_id(&peer_id) {
-                let mesh_ip = wireguard::derive_mesh_ip(pk.as_bytes());
-                if let Err(e) = wg.set_peer(&peer_id, mesh_ip, endpoint.as_deref()).await {
+                let allowed_ip = match wg_ip_opt {
+                    Some(ip_str) => match wireguard::parse_wg_cidr(&ip_str) {
+                        Ok((ip, _)) => ip,
+                        Err(e) => {
+                            warn!(peer = %peer_id, error = %e, "Invalid persisted wg_ip; deriving fallback");
+                            wireguard::derive_mesh_ip(pk.as_bytes())
+                        }
+                    },
+                    None => wireguard::derive_mesh_ip(pk.as_bytes()),
+                };
+                // Avoid passing the overlay TCP address itself as the WireGuard UDP endpoint.
+                let wg_endpoint = endpoint.filter(|ep| !ep.starts_with(&format!("{allowed_ip}:")));
+                if let Err(e) = wg
+                    .set_peer(&peer_id, allowed_ip, wg_endpoint.as_deref())
+                    .await
+                {
                     warn!(
                         peer = %peer_id,
                         error = %e,
@@ -1021,45 +1200,60 @@ impl SyncService {
             return Ok(());
         }
 
-        let Some(socket) = self.socket.clone() else {
-            return Ok(());
-        };
-
-        let (active_transport, wg_opt, tcp_listener) = match self.sync_config.transport {
-            MeshTransportMode::Direct => {
-                let listener = TcpListener::bind(("0.0.0.0", self.sync_config.sync_port))
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to bind Direct TCP sync listener on port {}",
-                            self.sync_config.sync_port
-                        )
-                    })?;
-                ("direct".to_string(), None, listener)
-            }
-            MeshTransportMode::WireGuard => {
-                let (wg, listener) = self.setup_wireguard_dataplane().await?;
-                ("wireguard".to_string(), Some(wg), listener)
-            }
-            MeshTransportMode::Auto => match self.setup_wireguard_dataplane().await {
-                Ok((wg, listener)) => ("wireguard".to_string(), Some(wg), listener),
-                Err(e) => {
-                    warn!(
-                        "Kernel WireGuard unavailable ({}); falling back to Direct encrypted TCP",
-                        e
-                    );
+        let (active_transport, wg_opt, tcp_listener, udp_socket_opt) =
+            match self.sync_config.transport {
+                MeshTransportMode::Direct => {
+                    let socket = match self.socket.read().await.clone() {
+                        Some(s) => s,
+                        None => {
+                            let s =
+                                Self::bind_direct_udp_socket(self.sync_config.mesh_port).await?;
+                            *self.socket.write().await = Some(s.clone());
+                            s
+                        }
+                    };
                     let listener = TcpListener::bind(("0.0.0.0", self.sync_config.sync_port))
                         .await
                         .with_context(|| {
                             format!(
-                                "Failed to bind fallback Direct TCP sync listener on port {}",
+                                "Failed to bind Direct TCP sync listener on port {}",
                                 self.sync_config.sync_port
                             )
                         })?;
-                    ("direct".to_string(), None, listener)
+                    ("direct".to_string(), None, listener, Some(socket))
                 }
-            },
-        };
+                MeshTransportMode::WireGuard => {
+                    let (wg, listener) = self.setup_wireguard_dataplane().await?;
+                    ("wireguard".to_string(), Some(wg), listener, None)
+                }
+                MeshTransportMode::Auto => match self.setup_wireguard_dataplane().await {
+                    Ok((wg, listener)) => ("wireguard".to_string(), Some(wg), listener, None),
+                    Err(e) => {
+                        warn!(
+                        "Kernel WireGuard unavailable ({}); falling back to Direct encrypted TCP",
+                        e
+                    );
+                        let socket = match self.socket.read().await.clone() {
+                            Some(s) => s,
+                            None => {
+                                let s = Self::bind_direct_udp_socket(self.sync_config.mesh_port)
+                                    .await?;
+                                *self.socket.write().await = Some(s.clone());
+                                s
+                            }
+                        };
+                        let listener = TcpListener::bind(("0.0.0.0", self.sync_config.sync_port))
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to bind fallback Direct TCP sync listener on port {}",
+                                    self.sync_config.sync_port
+                                )
+                            })?;
+                        ("direct".to_string(), None, listener, Some(socket))
+                    }
+                },
+            };
 
         let tcp_addr = tcp_listener.local_addr()?;
         {
@@ -1070,7 +1264,11 @@ impl SyncService {
             state.tcp_listen_addr = Some(tcp_addr);
         }
 
-        let udp_port = socket.local_addr()?.port();
+        let udp_port = udp_socket_opt
+            .as_ref()
+            .and_then(|s| s.local_addr().ok())
+            .map(|a| a.port())
+            .unwrap_or(self.sync_config.mesh_port);
         info!(
             "Sync service starting (transport={}, tcp={}, udp_port={}). Mycel ID: {}",
             active_transport,
@@ -1087,19 +1285,52 @@ impl SyncService {
             self.start_blockchain_sync().await?;
         }
 
-        // Spawn UDP listener loop
-        let service = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = service.listen_loop(socket).await {
-                error!("Mesh UDP listener loop error: {}", e);
-            }
-        });
+        // Spawn UDP listener loop only in Direct mode
+        if let Some(socket) = udp_socket_opt {
+            let service = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = service.listen_loop(socket).await {
+                    error!("Mesh UDP listener loop error: {}", e);
+                }
+            });
+        }
 
         // Spawn TCP anti-entropy listener loop
         let service = self.clone();
         tokio::spawn(async move {
             if let Err(e) = service.tcp_listen_loop(tcp_listener).await {
                 error!("Mesh TCP listener loop error: {}", e);
+            }
+        });
+
+        // Spawn periodic anti-entropy catch-up loop on startup/reconnect
+        let service = self.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+            }
+            service.sync_all_peers().await;
+
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        service.sync_all_peers().await;
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
             }
         });
 
@@ -1681,7 +1912,7 @@ impl SyncService {
     }
 
     async fn send_handshake(&self, addr: SocketAddr) -> Result<()> {
-        let Some(socket) = &self.socket else {
+        let Some(socket) = self.socket.read().await.clone() else {
             return Ok(());
         };
         let packet = MeshPacket::Handshake {
@@ -1840,7 +2071,7 @@ impl SyncService {
     }
 
     async fn send_event(&self, peer: &PeerInfo, event: &SyncEvent) -> Result<()> {
-        let Some(socket) = &self.socket else {
+        let Some(socket) = self.socket.read().await.clone() else {
             return Ok(());
         };
         if !self.is_trusted(&peer.id).await {
@@ -2109,7 +2340,7 @@ mod tests {
     #[tokio::test]
     async fn test_disabled_mesh_binds_nothing_and_emits_nothing() {
         let svc = service(&[], false, true).await;
-        assert!(svc.socket.is_none());
+        assert!(svc.socket.read().await.is_none());
         assert!(svc.mdns.is_none());
         assert!(svc.create_event(pref()).await.unwrap().is_none());
         assert!(svc.state.read().await.log.is_empty());
@@ -2549,5 +2780,130 @@ mod tests {
             Some("solarized")
         );
         let _ = cm_a;
+    }
+
+    #[tokio::test]
+    async fn test_wg_mode_new_does_not_bind_udp_mesh_port() {
+        let dir = temp_dir();
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let mesh_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let config = MycelConfig {
+            context_path: dir,
+            mesh: crate::config::MeshConfig {
+                enabled: true,
+                listen_port: mesh_port,
+                mdns_enabled: false,
+                transport: MeshTransportMode::WireGuard,
+                sync_port: 0,
+                wg_address: Some("10.77.0.1/24".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (tx, _) = broadcast::channel(16);
+        let svc = SyncService::new(&config, None, tx).await.unwrap();
+        assert!(svc.socket.read().await.is_none());
+
+        // Kernel WireGuard should be free to bind the same UDP port.
+        let rebound = std::net::UdpSocket::bind(("0.0.0.0", mesh_port));
+        assert!(
+            rebound.is_ok(),
+            "WireGuard mode SyncService::new must not bind UDP mesh_port"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wg_pairing_payload_and_persisted_meta_roundtrip() {
+        let dir_a = temp_dir();
+        let config_a = MycelConfig {
+            context_path: dir_a,
+            mesh: crate::config::MeshConfig {
+                enabled: true,
+                listen_port: 51820,
+                mdns_enabled: false,
+                transport: MeshTransportMode::WireGuard,
+                sync_port: 51821,
+                wg_address: Some("10.77.0.1/24".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (tx_a, _) = broadcast::channel(16);
+        let svc_a = SyncService::new(&config_a, None, tx_a).await.unwrap();
+        {
+            let mut state = svc_a.state.write().await;
+            state.wg = Some(
+                wireguard::KernelWireGuard::new(
+                    "mycel0".to_string(),
+                    std::net::Ipv4Addr::new(10, 77, 0, 1),
+                    24,
+                )
+                .unwrap(),
+            );
+            state.tcp_listen_addr = Some("0.0.0.0:51821".parse().unwrap());
+        }
+
+        let code_info = svc_a
+            .generate_pairing_code(Some("192.168.100.10".to_string()))
+            .await;
+        assert_eq!(code_info.endpoint.as_deref(), Some("192.168.100.10:51820"));
+        let encoded = code_info.code.strip_prefix("mycel-pair-v1:").unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let payload: PairingPayload = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(payload.wg_ip.as_deref(), Some("10.77.0.1"));
+        assert_eq!(payload.sync_port, Some(51821));
+        assert_eq!(payload.endpoint.as_deref(), Some("192.168.100.10:51820"));
+
+        // Node B pairs with Node A's code in WireGuard mode (without invoking real `wg` binary
+        // by testing state & persistence; `set_peer` failure is logged and tolerated).
+        let dir_b = temp_dir();
+        let config_b = MycelConfig {
+            context_path: dir_b,
+            mesh: crate::config::MeshConfig {
+                enabled: true,
+                listen_port: 51820,
+                mdns_enabled: false,
+                transport: MeshTransportMode::WireGuard,
+                sync_port: 51821,
+                wg_address: Some("10.77.0.2/24".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (tx_b, _) = broadcast::channel(16);
+        let svc_b = SyncService::new(&config_b, None, tx_b).await.unwrap();
+        {
+            let mut state = svc_b.state.write().await;
+            state.wg = Some(
+                wireguard::KernelWireGuard::new(
+                    "mycel0".to_string(),
+                    std::net::Ipv4Addr::new(10, 77, 0, 2),
+                    24,
+                )
+                .unwrap(),
+            );
+        }
+
+        let (peer_a, _) = svc_b.pair_peer(&code_info.code).await.unwrap();
+        assert_eq!(
+            peer_a.addresses.first().map(String::as_str),
+            Some("10.77.0.1:51821"),
+            "Overlay TCP sync address must be stored first"
+        );
+
+        // Reload from trusted_peers.json and verify wg_ip & wg_endpoint are restored.
+        let (tx_b2, _) = broadcast::channel(16);
+        let svc_b_reloaded = SyncService::new(&config_b, None, tx_b2).await.unwrap();
+        let state_b2 = svc_b_reloaded.state.read().await;
+        let restored_meta = state_b2.peer_wg.get(&svc_a.device_id()).unwrap();
+        assert_eq!(restored_meta.wg_ip.as_deref(), Some("10.77.0.1"));
+        assert_eq!(
+            restored_meta.wg_endpoint.as_deref(),
+            Some("192.168.100.10:51820")
+        );
     }
 }
