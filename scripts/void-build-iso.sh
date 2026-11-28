@@ -33,6 +33,11 @@ case "$PROFILE" in
         SERVICES="agetty-ttyS0 dhcpcd udevd seatd"
         ;;
     full)
+        # Optional Wine compatibility on Void musl:
+        # Native `wine` in Void Linux requires glibc/multilib, which is incompatible with
+        # x86_64-musl (`xbps-install` will fail if glibc/multilib packages are added here).
+        # For Windows `.exe` support on Void musl, use Flatpak/Bottles, a glibc
+        # container/chroot, or `box64` rather than adding glibc/multilib packages.
         PACKAGES="base-system linux linux-firmware grub-x86_64-efi grub NetworkManager iwd bluez pipewire wireplumber elogind dbus polkit xorg-minimal xorg-fonts mesa-dri sway foot bemenu mako grim slurp wl-clipboard firefox curl wget git vim neovim htop tmux zsh python3 bubblewrap wireguard-tools"
         SERVICES="agetty-ttyS0 dbus NetworkManager elogind polkit"
         ;;

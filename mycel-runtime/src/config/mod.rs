@@ -156,6 +156,14 @@ pub struct MycelConfig {
     /// Execution-recovery policy for failed sandboxed runs
     #[serde(default)]
     pub recovery: crate::recovery::RecoveryConfig,
+
+    /// Collective intelligence network (NEAR, IPFS, Bittensor)
+    #[serde(default)]
+    pub collective: crate::collective::CollectiveConfig,
+
+    /// Windows application compatibility via Wine
+    #[serde(default)]
+    pub wine: crate::wine::WineConfig,
 }
 
 /// How AI-generated code is isolated from the host.
@@ -489,6 +497,8 @@ impl Default for MycelConfig {
             mesh: MeshConfig::default(),
             sandbox: SandboxConfig::default(),
             recovery: crate::recovery::RecoveryConfig::default(),
+            collective: crate::collective::CollectiveConfig::default(),
+            wine: crate::wine::WineConfig::default(),
         }
     }
 }
@@ -769,5 +779,83 @@ local_model = "qwen3:8b"
             Some(LocalBackend::LlamaCpp)
         );
         assert_eq!(LocalBackend::from_str_loose("vllm"), None);
+    }
+
+    #[test]
+    fn test_collective_and_wine_defaults() {
+        let config = MycelConfig::default();
+        assert!(!config.collective.enabled);
+        assert!(!config.collective.share_patterns);
+        assert!(!config.collective.ipfs_enabled);
+        assert!(!config.collective.bittensor_enabled);
+        assert_eq!(config.collective.ipfs_api, "http://127.0.0.1:5001");
+        assert!(!config.wine.enabled);
+        assert!(config.wine.sandbox_with_bwrap);
+        assert!(!config.wine.allow_network);
+        assert_eq!(config.wine.wine_binary, "wine");
+    }
+
+    #[test]
+    fn test_collective_and_wine_toml_parsing() {
+        let empty: MycelConfig = toml::from_str("").unwrap();
+        assert!(!empty.collective.enabled);
+        assert!(!empty.wine.enabled);
+        assert!(empty.wine.sandbox_with_bwrap);
+        assert!(!empty.wine.allow_network);
+
+        let full_toml = r#"
+[collective]
+enabled = true
+near_network = "mainnet"
+near_rpc_url = "https://rpc.mainnet.near.org"
+near_account = "alice.near"
+near_contract = "patterns.mycel.near"
+ipfs_enabled = true
+ipfs_api = "http://127.0.0.1:5002"
+bittensor_enabled = true
+bittensor_api_url = "http://127.0.0.1:8090"
+bittensor_network = "test"
+bittensor_subnet = 42
+share_patterns = true
+differential_privacy_epsilon = 0.5
+
+[wine]
+enabled = true
+wine_binary = "/usr/bin/wine64"
+prefix_root = "/tmp/wine-prefixes"
+sandbox_with_bwrap = false
+allow_network = true
+timeout_secs = 120
+"#;
+        let parsed: MycelConfig = toml::from_str(full_toml).unwrap();
+        assert!(parsed.collective.enabled);
+        assert_eq!(parsed.collective.near_network, "mainnet");
+        assert_eq!(
+            parsed.collective.near_rpc_url,
+            "https://rpc.mainnet.near.org"
+        );
+        assert_eq!(parsed.collective.near_account, "alice.near");
+        assert_eq!(parsed.collective.near_contract, "patterns.mycel.near");
+        assert!(parsed.collective.ipfs_enabled);
+        assert_eq!(parsed.collective.ipfs_api, "http://127.0.0.1:5002");
+        assert!(parsed.collective.bittensor_enabled);
+        assert_eq!(
+            parsed.collective.bittensor_api_url.as_deref(),
+            Some("http://127.0.0.1:8090")
+        );
+        assert_eq!(parsed.collective.bittensor_network, "test");
+        assert_eq!(parsed.collective.bittensor_subnet, 42);
+        assert!(parsed.collective.share_patterns);
+        assert_eq!(parsed.collective.differential_privacy_epsilon, 0.5);
+
+        assert!(parsed.wine.enabled);
+        assert_eq!(parsed.wine.wine_binary, "/usr/bin/wine64");
+        assert_eq!(
+            parsed.wine.prefix_root.as_deref(),
+            Some("/tmp/wine-prefixes")
+        );
+        assert!(!parsed.wine.sandbox_with_bwrap);
+        assert!(parsed.wine.allow_network);
+        assert_eq!(parsed.wine.timeout_secs, 120);
     }
 }
