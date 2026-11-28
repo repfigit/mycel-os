@@ -62,6 +62,7 @@ pub fn build_set_peer_args(
     peer_pubkey_b64: &str,
     allowed_ip: Ipv4Addr,
     endpoint: Option<&str>,
+    persistent_keepalive_secs: u16,
 ) -> Result<Vec<String>> {
     validate_interface_name(interface)?;
     validate_key_b64(peer_pubkey_b64, "peer public key")?;
@@ -84,7 +85,7 @@ pub fn build_set_peer_args(
     }
 
     args.push("persistent-keepalive".to_string());
-    args.push("25".to_string());
+    args.push(persistent_keepalive_secs.to_string());
 
     Ok(args)
 }
@@ -289,8 +290,15 @@ impl KernelWireGuard {
         peer_pubkey_b64: &str,
         allowed_ip: Ipv4Addr,
         endpoint: Option<&str>,
+        persistent_keepalive_secs: u16,
     ) -> Result<()> {
-        let args = build_set_peer_args(&self.interface, peer_pubkey_b64, allowed_ip, endpoint)?;
+        let args = build_set_peer_args(
+            &self.interface,
+            peer_pubkey_b64,
+            allowed_ip,
+            endpoint,
+            persistent_keepalive_secs,
+        )?;
         let out = Command::new("wg")
             .args(&args)
             .output()
@@ -393,7 +401,7 @@ mod tests {
         let pubkey = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
         let ip = Ipv4Addr::new(10, 100, 8, 8);
 
-        let args_no_ep = build_set_peer_args("mycel0", &pubkey, ip, None).unwrap();
+        let args_no_ep = build_set_peer_args("mycel0", &pubkey, ip, None, 25).unwrap();
         assert_eq!(
             args_no_ep,
             vec![
@@ -409,7 +417,7 @@ mod tests {
         );
 
         let args_with_ep =
-            build_set_peer_args("mycel0", &pubkey, ip, Some("192.168.1.10:51820")).unwrap();
+            build_set_peer_args("mycel0", &pubkey, ip, Some("192.168.1.10:51820"), 25).unwrap();
         assert_eq!(
             args_with_ep,
             vec![
@@ -428,19 +436,44 @@ mod tests {
     }
 
     #[test]
+    fn test_build_set_peer_args_custom_keepalive() {
+        let pubkey = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        let ip = Ipv4Addr::new(10, 100, 4, 5);
+
+        for secs in [25u16, 15u16, 0u16] {
+            let args = build_set_peer_args("mycel0", &pubkey, ip, None, secs).unwrap();
+            assert_eq!(
+                args,
+                vec![
+                    "set",
+                    "mycel0",
+                    "peer",
+                    &pubkey,
+                    "allowed-ips",
+                    "10.100.4.5/32",
+                    "persistent-keepalive",
+                    &secs.to_string(),
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn test_build_set_peer_args_rejects_invalid_inputs() {
         let ip = Ipv4Addr::new(10, 100, 2, 3);
         let valid_pk = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
 
         // Bad interface
-        assert!(build_set_peer_args("bad iface", &valid_pk, ip, None).is_err());
+        assert!(build_set_peer_args("bad iface", &valid_pk, ip, None, 25).is_err());
         // Bad base64
-        assert!(build_set_peer_args("mycel0", "not-valid-base64!!!", ip, None).is_err());
+        assert!(build_set_peer_args("mycel0", "not-valid-base64!!!", ip, None, 25).is_err());
         // Wrong decoded length
         let short_pk = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
-        assert!(build_set_peer_args("mycel0", &short_pk, ip, None).is_err());
+        assert!(build_set_peer_args("mycel0", &short_pk, ip, None, 25).is_err());
         // Bad endpoint
-        assert!(build_set_peer_args("mycel0", &valid_pk, ip, Some("not-a-socket-addr")).is_err());
+        assert!(
+            build_set_peer_args("mycel0", &valid_pk, ip, Some("not-a-socket-addr"), 25).is_err()
+        );
     }
 
     #[test]

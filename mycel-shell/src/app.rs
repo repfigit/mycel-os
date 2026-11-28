@@ -1513,7 +1513,32 @@ impl MycelShellApp {
                     .size(11)
                     .font(Font::MONOSPACE)
                     .color(TEXT_MUTED),
+                )
+                .push(
+                    text(format!(
+                        "Relay: {}",
+                        if sync.relay_connected {
+                            "Connected"
+                        } else {
+                            "Disconnected"
+                        }
+                    ))
+                    .size(11)
+                    .font(Font::MONOSPACE)
+                    .color(if sync.relay_connected {
+                        ACCENT_EMERALD
+                    } else {
+                        TEXT_MUTED
+                    }),
                 );
+            if let Some(ep) = &sync.public_endpoint {
+                status_lines = status_lines.push(
+                    text(format!("Public Endpoint: {ep}"))
+                        .size(11)
+                        .font(Font::MONOSPACE)
+                        .color(TEXT_MUTED),
+                );
+            }
         } else {
             status_lines = status_lines.push(
                 text("Mesh status not loaded yet.")
@@ -2131,6 +2156,8 @@ mod tests {
             transport: "wireguard".to_string(),
             interface: Some("mycel0".to_string()),
             listen_addr: Some("0.0.0.0:51820".to_string()),
+            public_endpoint: Some("203.0.113.5:51820".to_string()),
+            relay_connected: true,
             trusted_peers: 1,
             connected_peers: 1,
             event_log_len: 10,
@@ -2143,7 +2170,11 @@ mod tests {
         })));
         assert!(app.mesh_enabled);
         assert_eq!(app.mesh_connected_peers, 1);
-        assert_eq!(app.sync_snapshot.as_ref().unwrap().device_id, "node-1");
+        let snap = app.sync_snapshot.as_ref().unwrap();
+        assert_eq!(snap.device_id, "node-1");
+        assert_eq!(snap.public_endpoint.as_deref(), Some("203.0.113.5:51820"));
+        assert!(snap.relay_connected);
+        let _ = app.view();
 
         app.mesh_busy = true;
         let _ = app.update(Message::PairingCodeGenerated(Ok(PairingCodeSnapshot {

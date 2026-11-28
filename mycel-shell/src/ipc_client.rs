@@ -106,6 +106,8 @@ pub struct SyncSnapshot {
     pub transport: String,
     pub interface: Option<String>,
     pub listen_addr: Option<String>,
+    pub public_endpoint: Option<String>,
+    pub relay_connected: bool,
     pub trusted_peers: usize,
     pub connected_peers: usize,
     pub event_log_len: usize,
@@ -217,6 +219,8 @@ impl IpcRequestClient {
                 transport,
                 interface,
                 listen_addr,
+                public_endpoint,
+                relay_connected,
                 trusted_peers,
                 connected_peers,
                 event_log_len,
@@ -227,6 +231,8 @@ impl IpcRequestClient {
                 transport,
                 interface,
                 listen_addr,
+                public_endpoint,
+                relay_connected,
                 trusted_peers,
                 connected_peers,
                 event_log_len,
@@ -1227,6 +1233,8 @@ mod tests {
                                 transport: "wireguard".to_string(),
                                 interface: Some("mycel0".to_string()),
                                 listen_addr: Some("0.0.0.0:51820".to_string()),
+                                public_endpoint: Some("203.0.113.10:51820".to_string()),
+                                relay_connected: true,
                                 trusted_peers: 1,
                                 connected_peers: 1,
                                 event_log_len: 42,
@@ -1319,6 +1327,8 @@ mod tests {
         assert!(sync.enabled);
         assert_eq!(sync.device_id, "node-alpha");
         assert_eq!(sync.interface.as_deref(), Some("mycel0"));
+        assert_eq!(sync.public_endpoint.as_deref(), Some("203.0.113.10:51820"));
+        assert!(sync.relay_connected);
         assert_eq!(sync.event_log_len, 42);
         assert_eq!(sync.peers.len(), 1);
 

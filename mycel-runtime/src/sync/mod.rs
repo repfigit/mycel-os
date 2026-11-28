@@ -21,6 +21,8 @@
 //!   is explicitly enabled.
 
 pub mod log;
+pub mod nat;
+pub mod relay;
 pub mod wireguard;
 
 use crate::config::{MeshTransportMode, MycelConfig};
@@ -169,6 +171,12 @@ pub struct SyncConfig {
     pub sync_port: u16,
     pub wg_address: Option<String>,
     pub peer_endpoints: HashMap<String, String>,
+    pub stun_servers: Vec<String>,
+    pub persistent_keepalive_secs: u16,
+    pub relay_enabled: bool,
+    pub relay_addr: Option<String>,
+    pub relay_server_enabled: bool,
+    pub relay_listen_addr: Option<String>,
 }
 
 impl Default for SyncConfig {
@@ -187,6 +195,12 @@ impl Default for SyncConfig {
             sync_port: 51821,
             wg_address: None,
             peer_endpoints: HashMap::new(),
+            stun_servers: Vec::new(),
+            persistent_keepalive_secs: 25,
+            relay_enabled: false,
+            relay_addr: None,
+            relay_server_enabled: false,
+            relay_listen_addr: None,
         }
     }
 }
@@ -316,6 +330,7 @@ struct SyncState {
     wg_interface: Option<String>,
     wg: Option<wireguard::KernelWireGuard>,
     tcp_listen_addr: Option<SocketAddr>,
+    public_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -390,6 +405,10 @@ pub struct MeshStatusInfo {
     pub connected_peers: usize,
     pub event_log_len: usize,
     pub peers: Vec<PeerInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_endpoint: Option<String>,
+    #[serde(default)]
+    pub relay_connected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -589,6 +608,8 @@ pub struct SyncService {
     context_manager: Arc<RwLock<Option<crate::context::ContextManager>>>,
     /// Shutdown signal for background listener loops.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Optional zero-knowledge relay client for NAT-traversed fallback.
+    relay_client: Arc<RwLock<Option<relay::RelayClient>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -694,6 +715,12 @@ impl SyncService {
             sync_port: mesh.sync_port,
             wg_address: mesh.wg_address.clone(),
             peer_endpoints: mesh.peer_endpoints.clone(),
+            stun_servers: mesh.stun_servers.clone(),
+            persistent_keepalive_secs: mesh.persistent_keepalive_secs,
+            relay_enabled: mesh.relay_enabled,
+            relay_addr: mesh.relay_addr.clone(),
+            relay_server_enabled: mesh.relay_server_enabled,
+            relay_listen_addr: mesh.relay_listen_addr.clone(),
         };
 
         // Do NOT bind UDP mesh_port here when transport is WireGuard or Auto,
@@ -739,6 +766,7 @@ impl SyncService {
             wg_interface: None,
             wg: None,
             tcp_listen_addr: None,
+            public_endpoint: None,
         };
 
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
@@ -755,6 +783,7 @@ impl SyncService {
             command_registry: Arc::new(RwLock::new(None)),
             context_manager: Arc::new(RwLock::new(None)),
             shutdown_tx,
+            relay_client: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -798,24 +827,51 @@ impl SyncService {
     }
 
     pub async fn status(&self) -> MeshStatusInfo {
-        let state = self.state.read().await;
-        let mut peers: Vec<PeerInfo> = state.peers.values().cloned().collect();
-        peers.sort_by(|a, b| a.id.cmp(&b.id));
+        let (
+            active_transport,
+            wg_interface,
+            tcp_listen_addr,
+            trusted_peers_len,
+            event_log_len,
+            public_endpoint,
+            peers,
+        ) = {
+            let state = self.state.read().await;
+            let mut peers: Vec<PeerInfo> = state.peers.values().cloned().collect();
+            peers.sort_by(|a, b| a.id.cmp(&b.id));
+            (
+                state.active_transport.clone(),
+                state.wg_interface.clone(),
+                state.tcp_listen_addr.map(|a| a.to_string()),
+                state.trusted_peers.len(),
+                state.log.len(),
+                state.public_endpoint.clone(),
+                peers,
+            )
+        };
         let connected_peers = peers
             .iter()
             .filter(|p| matches!(p.status, PeerStatus::Connected))
             .count();
+        let relay_connected = self
+            .relay_client
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|c| c.is_connected());
 
         MeshStatusInfo {
             enabled: self.sync_config.enabled,
             device_id: self.keys.id(),
-            transport: state.active_transport.clone(),
-            interface: state.wg_interface.clone(),
-            listen_addr: state.tcp_listen_addr.map(|a| a.to_string()),
-            trusted_peers: state.trusted_peers.len(),
+            transport: active_transport,
+            interface: wg_interface,
+            listen_addr: tcp_listen_addr,
+            trusted_peers: trusted_peers_len,
             connected_peers,
-            event_log_len: state.log.len(),
+            event_log_len,
             peers,
+            public_endpoint,
+            relay_connected,
         }
     }
 
@@ -835,11 +891,12 @@ impl SyncService {
     }
 
     pub async fn generate_pairing_code(&self, endpoint: Option<String>) -> PairingCodeInfo {
-        let (wg_local_ip, tcp_listen_addr) = {
+        let (wg_local_ip, tcp_listen_addr, public_endpoint) = {
             let state = self.state.read().await;
             (
                 state.wg.as_ref().map(|w| w.local_ip().to_string()),
                 state.tcp_listen_addr,
+                state.public_endpoint.clone(),
             )
         };
 
@@ -848,6 +905,7 @@ impl SyncService {
                 .map(|e| e.trim().to_string())
                 .filter(|e| !e.is_empty())
                 .map(|e| Self::ensure_endpoint_port(&e, self.sync_config.mesh_port))
+                .or(public_endpoint)
                 .or_else(|| {
                     tcp_listen_addr.map(|a| {
                         let host = if a.ip().is_unspecified() {
@@ -866,6 +924,7 @@ impl SyncService {
             let ep = endpoint
                 .map(|e| e.trim().to_string())
                 .filter(|e| !e.is_empty())
+                .or(public_endpoint)
                 .or_else(|| {
                     tcp_listen_addr.map(|a| {
                         if a.ip().is_unspecified() {
@@ -1030,7 +1089,12 @@ impl SyncService {
 
         if let Some((wg, allowed_ip, wg_endpoint)) = wg_registration {
             if let Err(e) = wg
-                .set_peer(peer_id, allowed_ip, wg_endpoint.as_deref())
+                .set_peer(
+                    peer_id,
+                    allowed_ip,
+                    wg_endpoint.as_deref(),
+                    self.sync_config.persistent_keepalive_secs,
+                )
                 .await
             {
                 warn!(
@@ -1046,17 +1110,24 @@ impl SyncService {
             state: "peer_paired".to_string(),
         });
 
-        let synced_events = if !peer_info.addresses.is_empty() && self.sync_config.enabled {
-            match self.sync_with_peer(peer_id).await {
-                Ok(n) => n,
-                Err(e) => {
-                    debug!(peer = %peer_id, error = %e, "Initial sync after pairing failed");
-                    0
+        let relay_ready = self
+            .relay_client
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|c| c.is_connected());
+        let synced_events =
+            if (!peer_info.addresses.is_empty() || relay_ready) && self.sync_config.enabled {
+                match self.sync_with_peer(peer_id).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        debug!(peer = %peer_id, error = %e, "Initial sync after pairing failed");
+                        0
+                    }
                 }
-            }
-        } else {
-            0
-        };
+            } else {
+                0
+            };
 
         let updated_peer = self
             .state
@@ -1167,7 +1238,12 @@ impl SyncService {
                 // Avoid passing the overlay TCP address itself as the WireGuard UDP endpoint.
                 let wg_endpoint = endpoint.filter(|ep| !ep.starts_with(&format!("{allowed_ip}:")));
                 if let Err(e) = wg
-                    .set_peer(&peer_id, allowed_ip, wg_endpoint.as_deref())
+                    .set_peer(
+                        &peer_id,
+                        allowed_ip,
+                        wg_endpoint.as_deref(),
+                        self.sync_config.persistent_keepalive_secs,
+                    )
                     .await
                 {
                     warn!(
@@ -1293,6 +1369,89 @@ impl SyncService {
                     error!("Mesh UDP listener loop error: {}", e);
                 }
             });
+        }
+
+        // Best-effort STUN public endpoint discovery (never fails startup)
+        if !self.sync_config.stun_servers.is_empty() {
+            let stun_bind = SocketAddr::from(([0, 0, 0, 0], 0));
+            match nat::discover_public_endpoint(
+                stun_bind,
+                &self.sync_config.stun_servers,
+                Duration::from_secs(2),
+            )
+            .await
+            {
+                Ok(public_addr) => {
+                    info!("Discovered public endpoint via STUN: {}", public_addr);
+                    self.state.write().await.public_endpoint = Some(public_addr.to_string());
+                }
+                Err(e) => {
+                    warn!(
+                        "STUN public endpoint discovery failed (continuing without public endpoint): {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        // Optional embedded zero-knowledge relay server
+        if self.sync_config.relay_server_enabled {
+            if let Some(listen_addr) = self
+                .sync_config
+                .relay_listen_addr
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let relay_server = relay::MeshRelayServer::bind(listen_addr).await?;
+                let relay_shutdown_rx = self.shutdown_tx.subscribe();
+                tokio::spawn(async move {
+                    if let Err(e) = relay_server.run(relay_shutdown_rx).await {
+                        error!("Embedded MeshRelayServer error: {}", e);
+                    }
+                });
+            }
+        }
+
+        // Optional zero-knowledge relay client fallback
+        if self.sync_config.relay_enabled {
+            if let Some(relay_addr) = self
+                .sync_config
+                .relay_addr
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+            {
+                let (client, mut incoming_rx) = relay::RelayClient::start(
+                    relay_addr,
+                    self.device_id(),
+                    self.shutdown_tx.subscribe(),
+                );
+                *self.relay_client.write().await = Some(client);
+
+                let service = self.clone();
+                let mut relay_shutdown_rx = self.shutdown_tx.subscribe();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            maybe_msg = incoming_rx.recv() => {
+                                let Some((from_device_id, payload)) = maybe_msg else {
+                                    break;
+                                };
+                                if let Err(e) = service.handle_relay_payload(&from_device_id, &payload).await {
+                                    debug!(from = %from_device_id, error = %e, "Rejected or failed incoming relay payload");
+                                }
+                            }
+                            _ = relay_shutdown_rx.changed() => {
+                                if *relay_shutdown_rx.borrow() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
         }
 
         // Spawn TCP anti-entropy listener loop
@@ -1582,6 +1741,77 @@ impl SyncService {
         Ok(())
     }
 
+    async fn handle_relay_payload(&self, from_device_id: &str, payload: &[u8]) -> Result<()> {
+        let frame: WireFrame =
+            serde_json::from_slice(payload).context("Invalid WireFrame in relay payload")?;
+
+        // Enforce pre-decryption trust check before touching any AEAD state.
+        let trusted_peers = self.state.read().await.trusted_peers.clone();
+        let own_id = self.keys.id();
+        if frame.sender_id != from_device_id
+            || frame.sender_id == own_id
+            || !trusted_peers.contains(&frame.sender_id)
+        {
+            return Err(anyhow!(
+                "Rejecting untrusted or mismatched relay frame from {} (frame sender {})",
+                from_device_id,
+                frame.sender_id
+            ));
+        }
+
+        let (sender_id, msg) = self.decrypt_wire_frame(&frame, &trusted_peers)?;
+        self.validate_incoming_message(&sender_id, &msg, &trusted_peers)?;
+        self.set_peer_status(&sender_id, PeerStatus::Connected)
+            .await;
+
+        match msg {
+            SyncMessage::PushEvent { event } => {
+                self.apply_event_internal(event).await?;
+            }
+            SyncMessage::PullSince { clock } => {
+                let (missing, sender_clock) = {
+                    let state = self.state.read().await;
+                    (
+                        state.log.events_missing_for(&clock),
+                        state.local_clock.clone(),
+                    )
+                };
+                let reply = SyncMessage::EventBatch {
+                    events: missing,
+                    sender_clock,
+                };
+                self.send_via_relay(&sender_id, &reply).await?;
+            }
+            SyncMessage::EventBatch { events, .. } => {
+                for event in events {
+                    self.apply_event_internal(event).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_via_relay(&self, peer_id: &str, msg: &SyncMessage) -> Result<()> {
+        if !self.is_trusted(peer_id).await {
+            return Err(anyhow!("Refusing to relay to untrusted peer {}", peer_id));
+        }
+        let client = self
+            .relay_client
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("Relay client not configured"))?;
+        if !client.is_connected() {
+            return Err(anyhow!("Relay client not connected"));
+        }
+        let peer_pk = decode_id(peer_id).ok_or_else(|| anyhow!("Invalid peer public key"))?;
+        let frame = seal_sync_message(&self.keys.private, &self.keys.id(), &peer_pk, msg)?;
+        let payload = serde_json::to_vec(&frame)?;
+        client.forward(peer_id, payload).await?;
+        Ok(())
+    }
+
     pub async fn sync_with_peer(&self, peer_id: &str) -> Result<usize> {
         if !self.sync_config.enabled {
             return Err(anyhow!("Mesh sync is disabled"));
@@ -1608,6 +1838,19 @@ impl SyncService {
         };
 
         if addresses.is_empty() {
+            if self
+                .send_via_relay(
+                    peer_id,
+                    &SyncMessage::PullSince {
+                        clock: local_clock.clone(),
+                    },
+                )
+                .await
+                .is_ok()
+            {
+                self.set_peer_status(peer_id, PeerStatus::Connected).await;
+                return Ok(0);
+            }
             return Err(anyhow!("No known endpoint address for peer {}", peer_id));
         }
 
@@ -1631,6 +1874,19 @@ impl SyncService {
         let mut stream = match connected_stream {
             Some(s) => s,
             None => {
+                if self
+                    .send_via_relay(
+                        peer_id,
+                        &SyncMessage::PullSince {
+                            clock: local_clock.clone(),
+                        },
+                    )
+                    .await
+                    .is_ok()
+                {
+                    self.set_peer_status(peer_id, PeerStatus::Connected).await;
+                    return Ok(0);
+                }
                 self.set_peer_status(peer_id, PeerStatus::Disconnected)
                     .await;
                 return Err(last_err.unwrap_or_else(|| anyhow!("Failed to connect to peer")));
@@ -2022,14 +2278,27 @@ impl SyncService {
 
         for peer in peers.values() {
             let _ = self.send_event(peer, &event).await;
-            if !peer.addresses.is_empty() {
-                if let Err(e) = self.push_event_tcp(peer, &event).await {
-                    debug!(peer = %peer.id, error = %e, "TCP push failed; marking peer disconnected");
-                    self.set_peer_status(&peer.id, PeerStatus::Disconnected)
-                        .await;
-                } else {
-                    self.set_peer_status(&peer.id, PeerStatus::Connected).await;
-                }
+            let delivered = if !peer.addresses.is_empty() {
+                self.push_event_tcp(peer, &event).await.is_ok()
+            } else {
+                false
+            };
+            if delivered
+                || self
+                    .send_via_relay(
+                        &peer.id,
+                        &SyncMessage::PushEvent {
+                            event: event.clone(),
+                        },
+                    )
+                    .await
+                    .is_ok()
+            {
+                self.set_peer_status(&peer.id, PeerStatus::Connected).await;
+            } else if !peer.addresses.is_empty() {
+                debug!(peer = %peer.id, "TCP push failed and relay unavailable; marking peer disconnected");
+                self.set_peer_status(&peer.id, PeerStatus::Disconnected)
+                    .await;
             }
         }
 
@@ -2905,5 +3174,257 @@ mod tests {
             restored_meta.wg_endpoint.as_deref(),
             Some("192.168.100.10:51820")
         );
+    }
+
+    #[tokio::test]
+    async fn test_two_node_relay_e2e_zero_knowledge_and_untrusted_rejection() {
+        let relay_server = relay::MeshRelayServer::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_server.local_addr().to_string();
+        let mut observed_rx = relay_server.subscribe_observed_payloads();
+        let (relay_shutdown_tx, relay_shutdown_rx) = tokio::sync::watch::channel(false);
+        let relay_handle = tokio::spawn(async move {
+            let _ = relay_server.run(relay_shutdown_rx).await;
+        });
+
+        let build_relay_node = |dir: &str| {
+            let dir = dir.to_string();
+            let relay_addr = relay_addr.clone();
+            async move {
+                let cfg = MycelConfig {
+                    context_path: dir,
+                    mesh: crate::config::MeshConfig {
+                        enabled: true,
+                        listen_port: 0,
+                        mdns_enabled: false,
+                        transport: MeshTransportMode::Direct,
+                        sync_port: 0,
+                        sync_ai_context: true,
+                        relay_enabled: true,
+                        relay_addr: Some(relay_addr),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let cm = crate::context::ContextManager::new(&cfg).await.unwrap();
+                let reg = crate::commands::CommandRegistry::in_memory();
+                let (tx, _) = broadcast::channel(32);
+                let svc = SyncService::new(&cfg, None, tx).await.unwrap();
+                svc.set_context_manager(cm.clone()).await;
+                svc.set_command_registry(reg.clone()).await;
+                svc.start().await.unwrap();
+                (svc, cm, reg)
+            }
+        };
+
+        let dir_a = temp_dir();
+        let dir_b = temp_dir();
+        let dir_c = temp_dir();
+        let (node_a, cm_a, reg_a) = build_relay_node(&dir_a).await;
+        let (node_b, cm_b, reg_b) = build_relay_node(&dir_b).await;
+
+        // Wait until both nodes report relay_connected == true.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if node_a.status().await.relay_connected && node_b.status().await.relay_connected {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out waiting for nodes A and B to connect to relay"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Pair Node A <-> Node B with NO direct address (endpoint: None).
+        node_a
+            .add_trusted_peer(&node_b.device_id(), Some("node-b".to_string()), None)
+            .await
+            .unwrap();
+        node_b
+            .add_trusted_peer(&node_a.device_id(), Some("node-a".to_string()), None)
+            .await
+            .unwrap();
+
+        let cmd_name = "relay-deploy-check";
+        let cmd_desc = "Verify zero-knowledge relay command replication";
+        let user_prompt = "secret-relay-user-prompt-xyz";
+        let assistant_reply = "secret-relay-assistant-reply-abc";
+
+        // Broadcast DefineCommand from Node A -> assert Node B applies it.
+        node_a
+            .create_event(SyncOperation::DefineCommand {
+                name: cmd_name.to_string(),
+                description: cmd_desc.to_string(),
+                steps_json: "[]".to_string(),
+                params: vec!["env".to_string()],
+                script: Some("echo ok".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if reg_b.get(cmd_name).await.is_some() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Node B did not apply DefineCommand via relay"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let applied_cmd = reg_b.get(cmd_name).await.unwrap();
+        assert_eq!(applied_cmd.description, cmd_desc);
+
+        // Broadcast AddConversationTurn from Node B -> assert Node A applies it.
+        node_b
+            .create_event(SyncOperation::AddConversationTurn {
+                session_id: "relay-sess-1".to_string(),
+                user: user_prompt.to_string(),
+                assistant: assistant_reply.to_string(),
+            })
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let ctx = cm_a.get_context("relay-sess-1").await.unwrap();
+            if !ctx.conversation_history.is_empty() {
+                assert_eq!(ctx.conversation_history[0].user, user_prompt);
+                assert_eq!(ctx.conversation_history[0].assistant, assistant_reply);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Node A did not apply AddConversationTurn via relay"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Verify zero-knowledge property: relay observed >= 2 forwarded payloads and NONE
+        // contain any plaintext command name, description, user prompt, or assistant reply.
+        let mut observed_payloads = Vec::new();
+        while let Ok(payload) = observed_rx.try_recv() {
+            observed_payloads.push(payload);
+        }
+        assert!(
+            observed_payloads.len() >= 2,
+            "Expected relay to observe >= 2 forwarded payloads, got {}",
+            observed_payloads.len()
+        );
+        for payload in &observed_payloads {
+            let text = String::from_utf8_lossy(payload);
+            assert!(
+                !text.contains(cmd_name)
+                    && !text.contains(cmd_desc)
+                    && !text.contains(user_prompt)
+                    && !text.contains(assistant_reply),
+                "Relay observed plaintext in forwarded payload!"
+            );
+        }
+
+        // Connect untrusted Node C to the same MeshRelayServer and forward spoofed/malicious
+        // frames targeting Node A and Node B; both must reject them completely.
+        let (node_c, _cm_c, _reg_c) = build_relay_node(&dir_c).await;
+        let (c_shutdown_tx, c_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (c_client, _c_rx) =
+            relay::RelayClient::start(relay_addr.clone(), node_c.device_id(), c_shutdown_rx);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !c_client.is_connected() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Untrusted Node C failed to connect to relay"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let rogue_cmd = "rogue-untrusted-cmd";
+        let rogue_event = SyncEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: node_c.device_id(),
+            timestamp: Utc::now(),
+            clock: VectorClock::default(),
+            operation: SyncOperation::DefineCommand {
+                name: rogue_cmd.to_string(),
+                description: "Should be rejected".to_string(),
+                steps_json: "[]".to_string(),
+                params: Vec::new(),
+                script: Some("echo pwned".to_string()),
+            },
+            signature: Vec::new(),
+        };
+        let rogue_turn_event = SyncEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: node_c.device_id(),
+            timestamp: Utc::now(),
+            clock: VectorClock::default(),
+            operation: SyncOperation::AddConversationTurn {
+                session_id: "rogue-sess".to_string(),
+                user: "rogue-user".to_string(),
+                assistant: "rogue-assistant".to_string(),
+            },
+            signature: Vec::new(),
+        };
+
+        let a_pk = decode_id(&node_a.device_id()).unwrap();
+        let b_pk = decode_id(&node_b.device_id()).unwrap();
+        let frame_for_a = seal_sync_message(
+            &node_c.keys.private,
+            &node_c.device_id(),
+            &a_pk,
+            &SyncMessage::PushEvent {
+                event: rogue_turn_event,
+            },
+        )
+        .unwrap();
+        let frame_for_b = seal_sync_message(
+            &node_c.keys.private,
+            &node_c.device_id(),
+            &b_pk,
+            &SyncMessage::PushEvent { event: rogue_event },
+        )
+        .unwrap();
+
+        c_client
+            .forward(
+                &node_a.device_id(),
+                serde_json::to_vec(&frame_for_a).unwrap(),
+            )
+            .await
+            .unwrap();
+        c_client
+            .forward(
+                &node_b.device_id(),
+                serde_json::to_vec(&frame_for_b).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            reg_b.get(rogue_cmd).await.is_none(),
+            "Node B must reject DefineCommand from untrusted Node C"
+        );
+        assert!(
+            reg_a.get(rogue_cmd).await.is_none(),
+            "Node A must reject DefineCommand from untrusted Node C"
+        );
+        let a_rogue_ctx = cm_a.get_context("rogue-sess").await.unwrap();
+        assert!(
+            a_rogue_ctx.conversation_history.is_empty(),
+            "Node A must reject AddConversationTurn from untrusted Node C"
+        );
+        let b_rogue_ctx = cm_b.get_context("rogue-sess").await.unwrap();
+        assert!(
+            b_rogue_ctx.conversation_history.is_empty(),
+            "Node B must reject AddConversationTurn from untrusted Node C"
+        );
+
+        node_a.shutdown();
+        node_b.shutdown();
+        node_c.shutdown();
+        let _ = c_shutdown_tx.send(true);
+        let _ = relay_shutdown_tx.send(true);
+        let _ = relay_handle.await;
     }
 }

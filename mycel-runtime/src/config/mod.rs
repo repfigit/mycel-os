@@ -299,6 +299,30 @@ pub struct MeshConfig {
     /// Static peer endpoints keyed by Mycel ID (base64 public key) -> "ip:port"
     #[serde(default)]
     pub peer_endpoints: HashMap<String, String>,
+
+    /// STUN servers (host:port) for best-effort public endpoint discovery
+    #[serde(default)]
+    pub stun_servers: Vec<String>,
+
+    /// WireGuard PersistentKeepalive interval in seconds (0 disables keepalive)
+    #[serde(default = "default_persistent_keepalive_secs")]
+    pub persistent_keepalive_secs: u16,
+
+    /// Connect to a zero-knowledge relay server when direct peer connections fail
+    #[serde(default)]
+    pub relay_enabled: bool,
+
+    /// Relay server address ("host:port") used when `relay_enabled = true`
+    #[serde(default)]
+    pub relay_addr: Option<String>,
+
+    /// Run an embedded zero-knowledge relay server on this node
+    #[serde(default)]
+    pub relay_server_enabled: bool,
+
+    /// Listen address ("ip:port") for the embedded relay server
+    #[serde(default)]
+    pub relay_listen_addr: Option<String>,
 }
 
 impl Default for MeshConfig {
@@ -314,6 +338,12 @@ impl Default for MeshConfig {
             sync_port: default_sync_port(),
             wg_address: None,
             peer_endpoints: HashMap::new(),
+            stun_servers: Vec::new(),
+            persistent_keepalive_secs: default_persistent_keepalive_secs(),
+            relay_enabled: false,
+            relay_addr: None,
+            relay_server_enabled: false,
+            relay_listen_addr: None,
         }
     }
 }
@@ -328,6 +358,10 @@ fn default_mesh_interface() -> String {
 
 fn default_sync_port() -> u16 {
     51821
+}
+
+fn default_persistent_keepalive_secs() -> u16 {
+    25
 }
 
 /// MCP (Model Context Protocol) configuration
@@ -538,6 +572,12 @@ mod tests {
         assert_eq!(config.mesh.sync_port, 51821);
         assert_eq!(config.mesh.wg_address, None);
         assert!(config.mesh.peer_endpoints.is_empty());
+        assert!(config.mesh.stun_servers.is_empty());
+        assert_eq!(config.mesh.persistent_keepalive_secs, 25);
+        assert!(!config.mesh.relay_enabled);
+        assert_eq!(config.mesh.relay_addr, None);
+        assert!(!config.mesh.relay_server_enabled);
+        assert_eq!(config.mesh.relay_listen_addr, None);
     }
 
     #[test]
@@ -571,6 +611,46 @@ sync_ai_context = true
         assert_eq!(parsed.mesh.sync_port, 51821);
         assert_eq!(parsed.mesh.wg_address, None);
         assert!(parsed.mesh.peer_endpoints.is_empty());
+        assert!(parsed.mesh.stun_servers.is_empty());
+        assert_eq!(parsed.mesh.persistent_keepalive_secs, 25);
+        assert!(!parsed.mesh.relay_enabled);
+        assert_eq!(parsed.mesh.relay_addr, None);
+        assert!(!parsed.mesh.relay_server_enabled);
+        assert_eq!(parsed.mesh.relay_listen_addr, None);
+    }
+
+    #[test]
+    fn test_mesh_config_nat_and_relay_toml() {
+        let nat_relay_toml = r#"
+[mesh]
+enabled = true
+stun_servers = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
+persistent_keepalive_secs = 15
+relay_enabled = true
+relay_addr = "relay.example.com:51822"
+relay_server_enabled = true
+relay_listen_addr = "0.0.0.0:51822"
+"#;
+        let parsed: MycelConfig = toml::from_str(nat_relay_toml).unwrap();
+        assert!(parsed.mesh.enabled);
+        assert_eq!(
+            parsed.mesh.stun_servers,
+            vec![
+                "stun.l.google.com:19302".to_string(),
+                "stun1.l.google.com:19302".to_string()
+            ]
+        );
+        assert_eq!(parsed.mesh.persistent_keepalive_secs, 15);
+        assert!(parsed.mesh.relay_enabled);
+        assert_eq!(
+            parsed.mesh.relay_addr.as_deref(),
+            Some("relay.example.com:51822")
+        );
+        assert!(parsed.mesh.relay_server_enabled);
+        assert_eq!(
+            parsed.mesh.relay_listen_addr.as_deref(),
+            Some("0.0.0.0:51822")
+        );
     }
 
     #[test]

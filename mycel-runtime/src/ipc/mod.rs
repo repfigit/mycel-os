@@ -779,6 +779,8 @@ async fn process_request(
                 connected_peers: status.connected_peers,
                 event_log_len: status.event_log_len,
                 peers: status.peers,
+                public_endpoint: status.public_endpoint,
+                relay_connected: status.relay_connected,
             }
         }
         IpcRequest::GeneratePairingCode { endpoint } => {
@@ -995,6 +997,10 @@ pub enum IpcResponse {
         connected_peers: usize,
         event_log_len: usize,
         peers: Vec<crate::sync::PeerInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        public_endpoint: Option<String>,
+        #[serde(default)]
+        relay_connected: bool,
     },
     /// Generated pairing code
     PairingCode {
