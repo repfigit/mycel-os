@@ -30,18 +30,12 @@ services:
       - build-output:/workspace/mycel-os/output
 
     ports:
-      - "2222:22"         # SSH
-      - "11434:11434"     # Ollama API
-      - "3000:3000"       # Dev server
-      - "51820:51820/udp" # WireGuard (mesh)
+      - "127.0.0.1:11434:11434"     # Ollama API (localhost only)
+      - "127.0.0.1:3000:3000"       # Dev server (localhost only)
 
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - RUST_BACKTRACE=1
       - RUST_LOG=info
-
-    # Needed for ISO building (loop devices, etc.)
-    privileged: true
 
     deploy:
       resources:

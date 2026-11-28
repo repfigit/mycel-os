@@ -30,6 +30,13 @@ impl McpEvolver {
         code: &str,
         emit_event: bool,
     ) -> Result<String> {
+        if !self.manager.allow_evolution() {
+            return Err(anyhow!(
+                "MCP evolution is disabled in configuration (allow_evolution = false)"
+            ));
+        }
+        super::validate_server_name(name)?;
+
         let server_dir = format!("{}/{}", self.dynamic_dir, name);
         fs::create_dir_all(&server_dir).await?;
 

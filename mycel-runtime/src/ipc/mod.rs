@@ -13,7 +13,9 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -138,6 +140,94 @@ fn write_token_atomically(token_path: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
+type ActiveSessions = Arc<std::sync::Mutex<HashMap<String, u64>>>;
+
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+struct SessionOwnershipGuard {
+    active_sessions: ActiveSessions,
+    conn_id: u64,
+    session_id: String,
+}
+
+impl SessionOwnershipGuard {
+    fn new(active_sessions: ActiveSessions, conn_id: u64, session_id: String) -> Self {
+        if let Ok(mut map) = active_sessions.lock() {
+            map.insert(session_id.clone(), conn_id);
+        }
+        Self {
+            active_sessions,
+            conn_id,
+            session_id,
+        }
+    }
+}
+
+impl Drop for SessionOwnershipGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.active_sessions.lock() {
+            if map.get(&self.session_id) == Some(&self.conn_id) {
+                map.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+fn try_claim_session(
+    active_sessions: &ActiveSessions,
+    conn_id: u64,
+    current_session: &mut String,
+    new_id: &str,
+) -> std::result::Result<(), String> {
+    if new_id.trim().is_empty() {
+        return Err("Session ID cannot be empty".to_string());
+    }
+    let mut map = active_sessions
+        .lock()
+        .map_err(|_| "Session registry lock poisoned".to_string())?;
+    if let Some(&owner) = map.get(new_id) {
+        if owner != conn_id {
+            return Err("Session is currently active on another connection".to_string());
+        }
+    }
+    if map.get(current_session.as_str()) == Some(&conn_id) {
+        map.remove(current_session.as_str());
+    }
+    map.insert(new_id.to_string(), conn_id);
+    *current_session = new_id.to_string();
+    Ok(())
+}
+
+fn ensure_ipc_parent_dir(parent: &Path) -> Result<()> {
+    let existed = parent.exists();
+    std::fs::create_dir_all(parent)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::metadata(parent)?;
+        let my_uid = nix::unistd::getuid().as_raw();
+        if !existed || meta.uid() == my_uid {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            let updated = std::fs::metadata(parent)?;
+            if updated.permissions().mode() & 0o077 != 0 {
+                anyhow::bail!(
+                    "IPC socket parent directory {} must not be group/world accessible",
+                    parent.display()
+                );
+            }
+        } else if meta.permissions().mode() & 0o1000 == 0 {
+            anyhow::bail!(
+                "IPC socket parent directory {} is owned by uid {} without sticky bit",
+                parent.display(),
+                meta.uid()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// IPC Server for Mycel Runtime
 pub struct IpcServer {
     listener: UnixListener,
@@ -145,6 +235,7 @@ pub struct IpcServer {
     auth_token: String,
     socket_path: PathBuf,
     token_path: PathBuf,
+    active_sessions: ActiveSessions,
 }
 
 impl IpcServer {
@@ -154,7 +245,7 @@ impl IpcServer {
 
         if let Some(parent) = socket_path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
+                ensure_ipc_parent_dir(parent)?;
             }
         }
 
@@ -187,6 +278,7 @@ impl IpcServer {
             auth_token,
             socket_path,
             token_path,
+            active_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -217,8 +309,11 @@ impl IpcServer {
                 Ok((stream, _)) => {
                     let runtime = Arc::clone(&self.runtime);
                     let auth_token = self.auth_token.clone();
+                    let active_sessions = Arc::clone(&self.active_sessions);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, runtime, auth_token).await {
+                        if let Err(e) =
+                            handle_connection(stream, runtime, auth_token, active_sessions).await
+                        {
                             error!("Connection handler error: {}", e);
                         }
                     });
@@ -267,17 +362,23 @@ async fn handle_connection(
     stream: UnixStream,
     runtime: Arc<MycelRuntime>,
     expected_token: String,
+    active_sessions: ActiveSessions,
 ) -> Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let writer = Arc::new(Mutex::new(writer));
 
-    let mut session_id = uuid::Uuid::new_v4().to_string();
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+    let mut session_guard = SessionOwnershipGuard::new(
+        Arc::clone(&active_sessions),
+        conn_id,
+        uuid::Uuid::new_v4().to_string(),
+    );
     let mut authenticated = false;
     let mut rate_limiter = RateLimiter::new(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW);
     let mut line_buf = LineBuffer::new();
 
-    debug!("New IPC connection, session: {}", session_id);
+    debug!("New IPC connection, session: {}", session_guard.session_id);
 
     loop {
         // Read with size limit enforced before allocation
@@ -302,7 +403,10 @@ async fn handle_connection(
 
                 // Check rate limit
                 if !rate_limiter.check() {
-                    warn!("Rate limit exceeded for session {}", session_id);
+                    warn!(
+                        "Rate limit exceeded for session {}",
+                        session_guard.session_id
+                    );
                     let error_response = IpcResponse::Error {
                         message: format!(
                             "Rate limit exceeded: max {} requests per minute",
@@ -332,9 +436,15 @@ async fn handle_connection(
                                         let mut w = writer.lock().await;
                                         w.write_all(response_json.as_bytes()).await?;
                                         w.flush().await?;
-                                        info!("Client authenticated for session {}", session_id);
+                                        info!(
+                                            "Client authenticated for session {}",
+                                            session_guard.session_id
+                                        );
                                     } else {
-                                        warn!("Invalid auth token for session {}", session_id);
+                                        warn!(
+                                            "Invalid auth token for session {}",
+                                            session_guard.session_id
+                                        );
                                         let error_response = IpcResponse::Error {
                                             message: "Invalid authentication token".to_string(),
                                         };
@@ -370,16 +480,17 @@ async fn handle_connection(
                         }
 
                         // Process request
+                        let session_id = &mut session_guard.session_id;
                         match &request {
                             IpcRequest::Chat { message, provider } => {
                                 match runtime
-                                    .process_input_with_provider(message, &session_id, *provider)
+                                    .process_input_with_provider(message, session_id, *provider)
                                     .await
                                 {
                                     Ok(crate::RuntimeResponse::Text(text)) => {
                                         // Record the interaction for history and sync
                                         let _ = runtime
-                                            .record_interaction(&session_id, message, &text)
+                                            .record_interaction(session_id, message, &text)
                                             .await;
 
                                         let response = IpcResponse::Chat {
@@ -421,15 +532,13 @@ async fn handle_connection(
                                             let code =
                                                 full_response.trim_start_matches("#!exec").trim();
                                             match runtime
-                                                .execute_code_with_policy(code, &session_id)
+                                                .execute_code_with_policy(code, session_id)
                                                 .await
                                             {
                                                 Ok(crate::RuntimeResponse::Text(text)) => {
                                                     let _ = runtime
                                                         .record_interaction(
-                                                            &session_id,
-                                                            message,
-                                                            &text,
+                                                            session_id, message, &text,
                                                         )
                                                         .await;
                                                     let resp = IpcResponse::Chat {
@@ -459,11 +568,7 @@ async fn handle_connection(
 
                                         // Record the interaction for history and sync
                                         let _ = runtime
-                                            .record_interaction(
-                                                &session_id,
-                                                message,
-                                                &full_response,
-                                            )
+                                            .record_interaction(session_id, message, &full_response)
                                             .await;
 
                                         // Send final full message
@@ -507,8 +612,14 @@ async fn handle_connection(
                                 break;
                             }
                             _ => {
-                                let response =
-                                    process_request(&request, &runtime, &mut session_id).await;
+                                let response = process_request_with_ownership(
+                                    &request,
+                                    &runtime,
+                                    session_id,
+                                    Some(&active_sessions),
+                                    conn_id,
+                                )
+                                .await;
                                 let json = serde_json::to_string(&response)? + "\n";
                                 let mut w = writer.lock().await;
                                 w.write_all(json.as_bytes()).await?;
@@ -535,7 +646,10 @@ async fn handle_connection(
         }
     }
 
-    debug!("IPC connection closed, session: {}", session_id);
+    debug!(
+        "IPC connection closed, session: {}",
+        session_guard.session_id
+    );
     Ok(())
 }
 
@@ -647,6 +761,16 @@ async fn process_request(
     runtime: &MycelRuntime,
     session_id: &mut String,
 ) -> IpcResponse {
+    process_request_with_ownership(request, runtime, session_id, None, 0).await
+}
+
+async fn process_request_with_ownership(
+    request: &IpcRequest,
+    runtime: &MycelRuntime,
+    session_id: &mut String,
+    active_sessions: Option<&ActiveSessions>,
+    conn_id: u64,
+) -> IpcResponse {
     match request {
         IpcRequest::Authenticate { .. } => {
             // Already authenticated, ignore
@@ -661,9 +785,23 @@ async fn process_request(
             }
         }
         IpcRequest::SetSession { id } => {
-            *session_id = id.clone();
-            IpcResponse::Ok {
-                message: format!("Session set to {}", id),
+            if let Some(sessions) = active_sessions {
+                match try_claim_session(sessions, conn_id, session_id, id) {
+                    Ok(()) => IpcResponse::Ok {
+                        message: format!("Session set to {}", id),
+                    },
+                    Err(msg) => IpcResponse::Error { message: msg },
+                }
+            } else {
+                if id.trim().is_empty() {
+                    return IpcResponse::Error {
+                        message: "Session ID cannot be empty".to_string(),
+                    };
+                }
+                *session_id = id.clone();
+                IpcResponse::Ok {
+                    message: format!("Session set to {}", id),
+                }
             }
         }
         IpcRequest::GetContext => match runtime.context_manager.get_context(session_id).await {
@@ -687,6 +825,17 @@ async fn process_request(
             }
         }
         IpcRequest::ExecuteCode { code } => {
+            // Reject internal/legacy magic prefixes in ExecuteCode so clients
+            // cannot spoof privileged confirmation or dispatch paths.
+            if code.starts_with("#!wine\n")
+                || code.starts_with("#!defcmd\n")
+                || code.starts_with("#!exec\n")
+                || code.starts_with("#!exec ")
+            {
+                return IpcResponse::Error {
+                    message: "Reserved magic prefix is not allowed in ExecuteCode".to_string(),
+                };
+            }
             // Gate direct execution through the policy evaluator, same as the
             // chat flow. Denied commands are rejected outright; commands
             // requiring confirmation are stored in ConfirmationStore and
@@ -758,20 +907,67 @@ async fn process_request(
                         IpcResponse::Ok {
                             message: format!("Action {} denied", pending.id),
                         }
-                    } else if let Some(payload) = pending.code.strip_prefix(WINE_CONFIRM_PREFIX) {
-                        match serde_json::from_str::<PendingWineRun>(payload) {
-                            Ok(req) => wine_result_to_ipc(
+                    } else {
+                        match pending.payload {
+                            crate::policy::PendingAction::ExecuteCode { code } => {
+                                execute_and_report(runtime, &code).await
+                            }
+                            crate::policy::PendingAction::DefineCommand { def } => {
+                                let params = def.params.clone();
+                                let script = def.script.clone();
+                                let steps_json = match serde_json::to_string(&def.steps) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        return IpcResponse::Error {
+                                            message: e.to_string(),
+                                        };
+                                    }
+                                };
+                                match runtime
+                                    .command_registry
+                                    .define_full(
+                                        &def.name,
+                                        &def.description,
+                                        def.steps,
+                                        def.params,
+                                        def.script,
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        let _ = runtime
+                                            .sync_service
+                                            .create_event(
+                                                crate::sync::SyncOperation::DefineCommand {
+                                                    name: def.name.clone(),
+                                                    description: def.description.clone(),
+                                                    steps_json,
+                                                    params,
+                                                    script,
+                                                },
+                                            )
+                                            .await;
+                                        IpcResponse::Ok {
+                                            message: format!("Command '{}' saved", def.name),
+                                        }
+                                    }
+                                    Err(e) => IpcResponse::Error {
+                                        message: e.to_string(),
+                                    },
+                                }
+                            }
+                            #[cfg(feature = "wine")]
+                            crate::policy::PendingAction::RunWindowsApp {
+                                app_name,
+                                exe_path,
+                                args,
+                            } => wine_result_to_ipc(
                                 runtime
                                     .wine_service
-                                    .run_windows_app(&req.app_name, &req.exe_path, &req.args)
+                                    .run_windows_app(&app_name, &exe_path, &args)
                                     .await,
                             ),
-                            Err(e) => IpcResponse::Error {
-                                message: format!("Invalid pending Wine request: {}", e),
-                            },
                         }
-                    } else {
-                        execute_and_report(runtime, &pending.code).await
                     }
                 }
             }
@@ -877,6 +1073,7 @@ async fn process_request(
                 },
             }
         }
+        #[cfg(feature = "collective")]
         IpcRequest::CollectiveStatus => {
             let status = runtime.collective_service.status().await;
             IpcResponse::CollectiveStatus {
@@ -893,10 +1090,20 @@ async fn process_request(
                 share_patterns_enabled: status.share_patterns_enabled,
             }
         }
+        #[cfg(not(feature = "collective"))]
+        IpcRequest::CollectiveStatus => IpcResponse::Error {
+            message: "Collective feature is not enabled in this build (compile with --features collective)".to_string(),
+        },
+        #[cfg(feature = "collective")]
         IpcRequest::ListPatterns => {
             let patterns = runtime.collective_service.list_patterns().await;
             IpcResponse::Patterns { patterns }
         }
+        #[cfg(not(feature = "collective"))]
+        IpcRequest::ListPatterns => IpcResponse::Error {
+            message: "Collective feature is not enabled in this build (compile with --features collective)".to_string(),
+        },
+        #[cfg(feature = "collective")]
         IpcRequest::SharePattern {
             name,
             description,
@@ -911,6 +1118,11 @@ async fn process_request(
                 message: e.to_string(),
             },
         },
+        #[cfg(not(feature = "collective"))]
+        IpcRequest::SharePattern { .. } => IpcResponse::Error {
+            message: "Collective feature is not enabled in this build (compile with --features collective)".to_string(),
+        },
+        #[cfg(feature = "wine")]
         IpcRequest::WineStatus => {
             let status = runtime.wine_service.status().await;
             IpcResponse::WineStatus {
@@ -926,6 +1138,11 @@ async fn process_request(
                 install_guidance: status.install_guidance,
             }
         }
+        #[cfg(not(feature = "wine"))]
+        IpcRequest::WineStatus => IpcResponse::Error {
+            message: "Wine feature is not enabled in this build (compile with --features wine)".to_string(),
+        },
+        #[cfg(feature = "wine")]
         IpcRequest::RunWindowsApp {
             app_name,
             exe_path,
@@ -953,65 +1170,56 @@ async fn process_request(
                 format!("wine {} {}", exe_path, args.join(" "))
             };
             use crate::policy::ActionPolicy;
-            match runtime.policy_evaluator.evaluate_code(&command_display) {
-                ActionPolicy::Deny { reason } => IpcResponse::Error {
-                    message: format!("denied by policy: {}", reason),
-                },
-                ActionPolicy::RequiresConfirmation { message, .. } => {
-                    let payload = PendingWineRun {
+            let reason = match runtime.policy_evaluator.evaluate_code(&command_display) {
+                ActionPolicy::Deny { reason } => {
+                    return IpcResponse::Error {
+                        message: format!("denied by policy: {}", reason),
+                    };
+                }
+                ActionPolicy::RequiresConfirmation { message, .. } => message,
+                // Wine execution ALWAYS requires explicit user confirmation (never auto-Allow).
+                ActionPolicy::Allow => {
+                    format!("Confirm running Windows app '{}' via Wine", app_name)
+                }
+            };
+
+            let pending = runtime
+                .confirmations
+                .insert_action(
+                    session_id,
+                    crate::policy::PendingAction::RunWindowsApp {
                         app_name: app_name.clone(),
                         exe_path: exe_path.clone(),
                         args: args.clone(),
-                    };
-                    let marker = match serde_json::to_string(&payload) {
-                        Ok(json) => format!("{}{}", WINE_CONFIRM_PREFIX, json),
-                        Err(e) => {
-                            return IpcResponse::Error {
-                                message: format!("Failed to encode Wine confirmation: {}", e),
-                            };
-                        }
-                    };
-                    let pending = runtime
-                        .confirmations
-                        .insert(session_id, "run_windows_app", &marker, &message)
-                        .await;
-                    let _ =
-                        runtime
-                            .event_bus
-                            .send(crate::events::SystemEvent::ConfirmationRequired {
-                                id: pending.id.clone(),
-                                session_id: session_id.clone(),
-                                command: command_display.clone(),
-                                reason: message.clone(),
-                            });
-                    IpcResponse::ConfirmationRequired {
-                        id: pending.id,
-                        action: pending.action,
-                        code: command_display,
-                        reason: message,
-                    }
-                }
-                ActionPolicy::Allow => wine_result_to_ipc(
-                    runtime
-                        .wine_service
-                        .run_windows_app(app_name, exe_path, args)
-                        .await,
-                ),
+                    },
+                    &reason,
+                )
+                .await;
+            let _ =
+                runtime
+                    .event_bus
+                    .send(crate::events::SystemEvent::ConfirmationRequired {
+                        id: pending.id.clone(),
+                        session_id: session_id.clone(),
+                        command: command_display.clone(),
+                        reason: reason.clone(),
+                    });
+            IpcResponse::ConfirmationRequired {
+                id: pending.id,
+                action: pending.action,
+                code: command_display,
+                reason,
             }
         }
+        #[cfg(not(feature = "wine"))]
+        IpcRequest::RunWindowsApp { .. } => IpcResponse::Error {
+            message: "Wine feature is not enabled in this build (compile with --features wine)".to_string(),
+        },
         IpcRequest::Ping => IpcResponse::Pong,
     }
 }
 
-const WINE_CONFIRM_PREFIX: &str = "#!wine\n";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PendingWineRun {
-    app_name: String,
-    exe_path: String,
-    args: Vec<String>,
-}
-
+#[cfg(feature = "wine")]
 fn wine_result_to_ipc(res: Result<crate::wine::WineRunResult>) -> IpcResponse {
     match res {
         Ok(r) => IpcResponse::WineResult {
@@ -1220,10 +1428,12 @@ pub enum IpcResponse {
         share_patterns_enabled: bool,
     },
     /// Stored collective patterns
+    #[cfg(feature = "collective")]
     Patterns {
         patterns: Vec<crate::collective::patterns::CollectivePatternRecord>,
     },
     /// Newly shared pattern record
+    #[cfg(feature = "collective")]
     PatternShared {
         pattern: crate::collective::patterns::CollectivePatternRecord,
     },
@@ -1592,9 +1802,11 @@ mod tests {
                 .await;
         let command_registry =
             crate::commands::CommandRegistry::load(dir.join("commands.json")).await;
+        #[cfg(feature = "collective")]
         let collective_service = crate::collective::CollectiveService::new(&config, false)
             .await
             .unwrap();
+        #[cfg(feature = "wine")]
         let wine_service = crate::wine::WineService::new(&config);
 
         crate::MycelRuntime {
@@ -1609,7 +1821,9 @@ mod tests {
             mcp_manager,
             selfdev,
             command_registry,
+            #[cfg(feature = "collective")]
             collective_service,
+            #[cfg(feature = "wine")]
             wine_service,
             event_bus,
         }
@@ -2571,6 +2785,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "collective")]
     #[tokio::test]
     async fn test_ipc_collective_disabled_and_enabled_roundtrip() {
         let dir = std::env::temp_dir().join(format!(
@@ -2667,6 +2882,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "wine")]
     #[tokio::test]
     async fn test_ipc_wine_disabled_and_validation() {
         let dir =
@@ -2747,6 +2963,156 @@ mod tests {
             other => panic!("expected Error for path traversal exe_path, got {other:?}"),
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "wine")]
+    #[tokio::test]
+    async fn test_run_windows_app_always_requires_confirmation() {
+        let dir =
+            std::env::temp_dir().join(format!("mycel-ipc-wine-confirm-{}", uuid::Uuid::new_v4()));
+        let mut runtime = build_test_runtime(&dir).await;
+        runtime.config.wine.enabled = true;
+        runtime.wine_service = crate::wine::WineService::new(&runtime.config);
+        let exe_path = dir.join("notepad.exe");
+        std::fs::write(&exe_path, b"MZ").unwrap();
+        let mut session = "wine-confirm-sess".to_string();
+
+        // Even with safe exe_path/args, RunWindowsApp must NEVER auto-Allow.
+        match process_request(
+            &IpcRequest::RunWindowsApp {
+                app_name: "notepad".to_string(),
+                exe_path: exe_path.to_string_lossy().to_string(),
+                args: vec!["readme.txt".to_string()],
+            },
+            &runtime,
+            &mut session,
+        )
+        .await
+        {
+            IpcResponse::ConfirmationRequired { id, action, .. } => {
+                assert!(!id.is_empty());
+                assert_eq!(action, "run_windows_app");
+            }
+            other => panic!("expected ConfirmationRequired for RunWindowsApp, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_server_creates_0700_parent_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mycel-ipc-0700-{}", uuid::Uuid::new_v4()));
+        let mut runtime = build_test_runtime(&dir).await;
+        let sock_dir = dir.join("nested-ipc");
+        runtime.config.ipc_socket_path =
+            sock_dir.join("runtime.sock").to_string_lossy().to_string();
+
+        let server = IpcServer::new(&runtime).await.unwrap();
+        let dir_mode = std::fs::metadata(&sock_dir).unwrap().permissions().mode() & 0o777;
+        let sock_mode = std::fs::metadata(&server.socket_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(sock_mode, 0o600);
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_execute_code_rejects_magic_prefixes() {
+        let dir = std::env::temp_dir().join(format!("mycel-ipc-magic-{}", uuid::Uuid::new_v4()));
+        let runtime = build_test_runtime(&dir).await;
+        let mut session = "magic-sess".to_string();
+
+        for bad in ["#!wine\n{\"app\":\"x\"}", "#!defcmd\n{}", "#!exec\necho hi"] {
+            match process_request(
+                &IpcRequest::ExecuteCode {
+                    code: bad.to_string(),
+                },
+                &runtime,
+                &mut session,
+            )
+            .await
+            {
+                IpcResponse::Error { message } => {
+                    assert!(
+                        message.to_lowercase().contains("magic"),
+                        "expected magic prefix error, got: {message}"
+                    );
+                }
+                other => panic!("expected Error for {bad:?}, got {other:?}"),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_set_session_cannot_steal_active_session_and_allows_reconnect() {
+        let dir = std::env::temp_dir().join(format!("mycel-ipc-sess-own-{}", uuid::Uuid::new_v4()));
+        let runtime = build_test_runtime(&dir).await;
+        let active: ActiveSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let mut guard_a = SessionOwnershipGuard::new(Arc::clone(&active), 1, "init-a".to_string());
+        match process_request_with_ownership(
+            &IpcRequest::SetSession {
+                id: "shared-sess".to_string(),
+            },
+            &runtime,
+            &mut guard_a.session_id,
+            Some(&active),
+            1,
+        )
+        .await
+        {
+            IpcResponse::Ok { .. } => {}
+            other => panic!("expected Ok for conn 1 SetSession, got {other:?}"),
+        }
+
+        // Concurrent connection 2 must NOT be able to steal "shared-sess".
+        let mut guard_b = SessionOwnershipGuard::new(Arc::clone(&active), 2, "init-b".to_string());
+        match process_request_with_ownership(
+            &IpcRequest::SetSession {
+                id: "shared-sess".to_string(),
+            },
+            &runtime,
+            &mut guard_b.session_id,
+            Some(&active),
+            2,
+        )
+        .await
+        {
+            IpcResponse::Error { message } => {
+                assert!(message.contains("another connection"));
+            }
+            other => panic!("expected Error for concurrent SetSession steal, got {other:?}"),
+        }
+        assert_eq!(guard_b.session_id, "init-b");
+
+        // Once connection 1 disconnects, connection 2 CAN sequentially claim "shared-sess".
+        drop(guard_a);
+        match process_request_with_ownership(
+            &IpcRequest::SetSession {
+                id: "shared-sess".to_string(),
+            },
+            &runtime,
+            &mut guard_b.session_id,
+            Some(&active),
+            2,
+        )
+        .await
+        {
+            IpcResponse::Ok { .. } => {}
+            other => panic!("expected Ok after previous connection closed, got {other:?}"),
+        }
+        assert_eq!(guard_b.session_id, "shared-sess");
+
+        drop(guard_b);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

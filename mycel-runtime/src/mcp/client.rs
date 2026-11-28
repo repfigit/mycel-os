@@ -83,6 +83,39 @@ impl Default for ServerConfig {
 /// Channel sender for pending JSON-RPC requests awaiting responses
 type RequestSender = mpsc::Sender<(JsonRpcRequest, oneshot::Sender<Result<JsonRpcResponse>>)>;
 
+/// Minimal environment variables forwarded from the daemon to MCP server subprocesses.
+const SAFE_MCP_ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"];
+
+/// Build an isolated [`Command`] for an MCP server subprocess.
+///
+/// Clears all inherited environment variables and forwards only a minimal safe
+/// allowlist from the parent process plus the server's explicit `extra_env`.
+pub(crate) fn build_mcp_command(
+    command: &str,
+    args: &[String],
+    extra_env: &HashMap<String, String>,
+) -> Command {
+    let mut cmd = Command::new(command);
+    cmd.args(args)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    for key in SAFE_MCP_ENV_ALLOWLIST {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
+    }
+
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+
+    cmd
+}
+
 /// MCP Server instance
 pub struct McpServer {
     pub name: String,
@@ -164,18 +197,8 @@ impl McpServer {
             self.args.join(" ")
         );
 
-        // Spawn the subprocess
-        let mut cmd = Command::new(&self.command);
-        cmd.args(&self.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        // Add environment variables
-        for (key, value) in &self.env {
-            cmd.env(key, value);
-        }
+        // Spawn the subprocess with an isolated environment
+        let mut cmd = build_mcp_command(&self.command, &self.args, &self.env);
 
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -669,5 +692,47 @@ mod tests {
 
         assert_eq!(server.config.tool_timeout, Duration::from_secs(60));
         assert_eq!(server.config.max_restart_attempts, 5);
+    }
+
+    #[tokio::test]
+    async fn test_build_mcp_command_strips_provider_secrets() {
+        std::env::set_var("OPENAI_API_KEY", "sk-secret-openai-test");
+        std::env::set_var("VENICE_API_KEY", "venice-secret-test");
+
+        let mut extra_env = HashMap::new();
+        extra_env.insert("MCP_TEST_VAR".to_string(), "allowed-value".to_string());
+
+        let mut cmd = build_mcp_command("env", &[], &extra_env);
+        let output = cmd
+            .output()
+            .await
+            .expect("should spawn env subprocess via build_mcp_command");
+        assert!(output.status.success());
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("OPENAI_API_KEY="),
+            "OPENAI_API_KEY leaked into MCP child env"
+        );
+        assert!(
+            !stdout.contains("VENICE_API_KEY="),
+            "VENICE_API_KEY leaked into MCP child env"
+        );
+        assert!(
+            !stdout.contains("sk-secret-openai-test"),
+            "OPENAI_API_KEY value leaked into MCP child env"
+        );
+        assert!(
+            !stdout.contains("venice-secret-test"),
+            "VENICE_API_KEY value leaked into MCP child env"
+        );
+        assert!(
+            stdout.contains("MCP_TEST_VAR=allowed-value"),
+            "Configured extra_env should be passed to MCP child"
+        );
+        assert!(
+            stdout.contains("PATH="),
+            "Safe allowlist PATH should be forwarded to MCP child"
+        );
     }
 }

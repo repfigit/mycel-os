@@ -25,6 +25,57 @@ pub const DEFAULT_MAX_PENDING_CONFIRMATIONS: usize = 64;
 /// Default per-session cap on pending confirmations.
 pub const DEFAULT_MAX_PENDING_PER_SESSION: usize = 8;
 
+/// Typed action payload stored in `ConfirmationStore`.
+#[derive(Debug, Clone)]
+pub enum PendingAction {
+    ExecuteCode {
+        code: String,
+    },
+    DefineCommand {
+        def: crate::commands::PendingCommandDef,
+    },
+    #[cfg(feature = "wine")]
+    RunWindowsApp {
+        app_name: String,
+        exe_path: String,
+        args: Vec<String>,
+    },
+}
+
+impl PendingAction {
+    fn action_name(&self) -> &'static str {
+        match self {
+            PendingAction::ExecuteCode { .. } => "execute_code",
+            PendingAction::DefineCommand { .. } => "define_command",
+            #[cfg(feature = "wine")]
+            PendingAction::RunWindowsApp { .. } => "run_windows_app",
+        }
+    }
+
+    fn display_code(&self) -> String {
+        match self {
+            PendingAction::ExecuteCode { code } => code.clone(),
+            PendingAction::DefineCommand { def } => format!("save command '{}'", def.name),
+            #[cfg(feature = "wine")]
+            PendingAction::RunWindowsApp { exe_path, args, .. } => {
+                if args.is_empty() {
+                    format!("wine {}", exe_path)
+                } else {
+                    format!("wine {} {}", exe_path, args.join(" "))
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of inspecting the latest pending confirmation for a session.
+#[derive(Debug, Clone)]
+pub enum LatestConfirmation {
+    None,
+    Expired,
+    Pending(Box<PendingConfirmation>),
+}
+
 /// A pending confirmation awaiting user approval.
 #[derive(Debug, Clone)]
 pub struct PendingConfirmation {
@@ -32,6 +83,7 @@ pub struct PendingConfirmation {
     pub session_id: String,
     pub action: String,
     pub code: String,
+    pub payload: PendingAction,
     pub reason: String,
     pub created_at: Instant,
 }
@@ -93,6 +145,39 @@ impl ConfirmationStore {
         code: &str,
         reason: &str,
     ) -> PendingConfirmation {
+        self.insert_with_parts(
+            session_id,
+            action.to_string(),
+            code.to_string(),
+            PendingAction::ExecuteCode {
+                code: code.to_string(),
+            },
+            reason,
+        )
+        .await
+    }
+
+    /// Insert a typed pending action into the confirmation store.
+    pub async fn insert_action(
+        &self,
+        session_id: &str,
+        payload: PendingAction,
+        reason: &str,
+    ) -> PendingConfirmation {
+        let action = payload.action_name().to_string();
+        let code = payload.display_code();
+        self.insert_with_parts(session_id, action, code, payload, reason)
+            .await
+    }
+
+    async fn insert_with_parts(
+        &self,
+        session_id: &str,
+        action: String,
+        code: String,
+        payload: PendingAction,
+        reason: &str,
+    ) -> PendingConfirmation {
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
 
@@ -128,13 +213,37 @@ impl ConfirmationStore {
         let confirmation = PendingConfirmation {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
-            action: action.to_string(),
-            code: code.to_string(),
+            action,
+            code,
+            payload,
             reason: reason.to_string(),
             created_at: now,
         };
         inner.entries.push_back(confirmation.clone());
         confirmation
+    }
+
+    /// Inspect the latest pending confirmation for `session_id`, pruning any
+    /// expired entries for that session.
+    pub async fn latest_for_session(&self, session_id: &str) -> LatestConfirmation {
+        let mut inner = self.inner.lock().await;
+        let now = Instant::now();
+        let Some(pos) = inner
+            .entries
+            .iter()
+            .rposition(|entry| entry.session_id == session_id)
+        else {
+            return LatestConfirmation::None;
+        };
+
+        if now.duration_since(inner.entries[pos].created_at) >= self.ttl {
+            inner.entries.retain(|entry| {
+                entry.session_id != session_id || now.duration_since(entry.created_at) < self.ttl
+            });
+            return LatestConfirmation::Expired;
+        }
+
+        LatestConfirmation::Pending(Box::new(inner.entries[pos].clone()))
     }
 
     /// Look up and consume a pending confirmation for `session_id`.

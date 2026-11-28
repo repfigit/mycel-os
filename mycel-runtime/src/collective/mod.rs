@@ -256,6 +256,11 @@ impl CollectiveService {
                 "Collective intelligence is disabled; enable [collective] in config.toml"
             ));
         }
+        if !self.config.share_patterns {
+            return Err(anyhow!(
+                "Pattern sharing is disabled; set share_patterns = true in [collective] to share patterns"
+            ));
+        }
 
         let privacy_cfg = PrivacyConfig {
             epsilon: self.config.differential_privacy_epsilon,
@@ -602,6 +607,58 @@ mod tests {
         let all = svc.list_patterns().await;
         assert_eq!(all.len(), 2);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn share_pattern_refused_and_no_ipfs_upload_when_share_patterns_false() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir =
+            std::env::temp_dir().join(format!("mycel-collective-noshare-{}", uuid::Uuid::new_v4()));
+
+        let ipfs_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ipfs");
+        let ipfs_addr = ipfs_listener.local_addr().expect("ipfs addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_clone = Arc::clone(&request_count);
+        let server_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = ipfs_listener.accept().await {
+                request_count_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let cfg = CollectiveConfig {
+            enabled: true,
+            ipfs_enabled: true,
+            ipfs_api: format!("http://{}", ipfs_addr),
+            share_patterns: false,
+            ..Default::default()
+        };
+
+        let svc = CollectiveService::from_collective_config(cfg, &dir, false)
+            .await
+            .expect("service init");
+        assert!(svc.is_enabled());
+
+        let err = svc
+            .share_pattern("Safe pattern", "Should not upload", "coding")
+            .await
+            .expect_err("share_pattern must refuse when share_patterns = false");
+        assert!(err.to_string().contains("share_patterns"));
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            0,
+            "mock IPFS server must receive 0 requests when share_patterns = false"
+        );
+        assert!(svc.list_patterns().await.is_empty());
+
+        server_task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

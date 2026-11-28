@@ -166,6 +166,8 @@ pub struct SyncConfig {
     pub trusted_peers: HashSet<String>,
     /// Replicate conversation turns to trusted peers.
     pub sync_ai_context: bool,
+    /// Replicate user-defined commands to/from trusted peers.
+    pub sync_commands: bool,
     pub transport: MeshTransportMode,
     pub interface: String,
     pub sync_port: u16,
@@ -190,6 +192,7 @@ impl Default for SyncConfig {
             near_account: None,
             trusted_peers: HashSet::new(),
             sync_ai_context: false,
+            sync_commands: true,
             transport: MeshTransportMode::Auto,
             interface: "mycel0".to_string(),
             sync_port: 51821,
@@ -288,9 +291,78 @@ fn decode_id(id: &str) -> Option<PublicKey> {
     Some(PublicKey::from(arr))
 }
 
+fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    let hex = sha256::digest(data);
+    let bytes = hex.as_bytes();
+    let mut out = [0u8; 32];
+    let nibble = |b: u8| match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    };
+    for (i, slot) in out.iter_mut().enumerate() {
+        if let (Some(&hi), Some(&lo)) = (bytes.get(2 * i), bytes.get(2 * i + 1)) {
+            *slot = (nibble(hi) << 4) | nibble(lo);
+        }
+    }
+    out
+}
+
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
+    const LUT: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(LUT[(b >> 4) as usize] as char);
+        out.push(LUT[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut k0 = [0u8; 64];
+    if key.len() > 64 {
+        let hashed = sha256_bytes(key);
+        k0[..32].copy_from_slice(&hashed);
+    } else {
+        k0[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0u8; 64];
+    let mut opad = [0u8; 64];
+    for i in 0..64 {
+        ipad[i] = k0[i] ^ 0x36;
+        opad[i] = k0[i] ^ 0x5c;
+    }
+
+    let mut inner_input = Vec::with_capacity(64 + data.len());
+    inner_input.extend_from_slice(&ipad);
+    inner_input.extend_from_slice(data);
+    let inner_hash = sha256_bytes(&inner_input);
+
+    let mut outer_input = Vec::with_capacity(64 + 32);
+    outer_input.extend_from_slice(&opad);
+    outer_input.extend_from_slice(&inner_hash);
+    sha256_bytes(&outer_input)
+}
+
+fn hkdf_sha256_32(salt: &[u8], ikm: &[u8], info: &[u8]) -> [u8; 32] {
+    let actual_salt = if salt.is_empty() {
+        &[0u8; 32][..]
+    } else {
+        salt
+    };
+    let prk = hmac_sha256(actual_salt, ikm);
+    let mut expand_input = Vec::with_capacity(info.len() + 1);
+    expand_input.extend_from_slice(info);
+    expand_input.push(0x01);
+    hmac_sha256(&prk, &expand_input)
+}
+
 fn cipher_for(own: &StaticSecret, peer: &PublicKey) -> ChaCha20Poly1305 {
     let shared = own.diffie_hellman(peer);
-    ChaCha20Poly1305::new(shared.as_bytes().into())
+    let key = hkdf_sha256_32(&[], shared.as_bytes(), b"mycel-sync-v2-chacha20poly1305");
+    ChaCha20Poly1305::new((&key).into())
 }
 
 /// Encrypt an event for one peer.
@@ -710,6 +782,7 @@ impl SyncService {
             near_account: config.near_account.clone(),
             trusted_peers: trusted_peers.clone(),
             sync_ai_context: mesh.sync_ai_context,
+            sync_commands: mesh.sync_commands,
             transport: mesh.transport,
             interface: mesh.interface.clone(),
             sync_port: mesh.sync_port,
@@ -1426,6 +1499,7 @@ impl SyncService {
                 let (client, mut incoming_rx) = relay::RelayClient::start(
                     relay_addr,
                     self.device_id(),
+                    self.keys.private.to_bytes(),
                     self.shutdown_tx.subscribe(),
                 );
                 *self.relay_client.write().await = Some(client);
@@ -1684,7 +1758,9 @@ impl SyncService {
 
         match msg {
             SyncMessage::PushEvent { event } => {
-                self.apply_event_internal(event).await?;
+                if self.should_accept_inbound_event(&event) {
+                    self.apply_event_internal(event).await?;
+                }
             }
             SyncMessage::PullSince { clock } => {
                 let (missing, sender_clock) = {
@@ -1725,14 +1801,18 @@ impl SyncService {
                     self.validate_incoming_message(&rev_sender, &rev_msg, &trusted_now)?;
                     if let SyncMessage::EventBatch { events, .. } = rev_msg {
                         for event in events {
-                            self.apply_event_internal(event).await?;
+                            if self.should_accept_inbound_event(&event) {
+                                self.apply_event_internal(event).await?;
+                            }
                         }
                     }
                 }
             }
             SyncMessage::EventBatch { events, .. } => {
                 for event in events {
-                    self.apply_event_internal(event).await?;
+                    if self.should_accept_inbound_event(&event) {
+                        self.apply_event_internal(event).await?;
+                    }
                 }
             }
         }
@@ -1766,7 +1846,9 @@ impl SyncService {
 
         match msg {
             SyncMessage::PushEvent { event } => {
-                self.apply_event_internal(event).await?;
+                if self.should_accept_inbound_event(&event) {
+                    self.apply_event_internal(event).await?;
+                }
             }
             SyncMessage::PullSince { clock } => {
                 let (missing, sender_clock) = {
@@ -1784,7 +1866,9 @@ impl SyncService {
             }
             SyncMessage::EventBatch { events, .. } => {
                 for event in events {
-                    self.apply_event_internal(event).await?;
+                    if self.should_accept_inbound_event(&event) {
+                        self.apply_event_internal(event).await?;
+                    }
                 }
             }
         }
@@ -1938,7 +2022,7 @@ impl SyncService {
 
         let mut applied_count = 0usize;
         for event in events {
-            if self.apply_event_internal(event).await? {
+            if self.should_accept_inbound_event(&event) && self.apply_event_internal(event).await? {
                 applied_count += 1;
             }
         }
@@ -2045,7 +2129,9 @@ impl SyncService {
                             );
                             return;
                         }
-                        let _ = self.apply_event(event).await;
+                        if self.should_accept_inbound_event(&event) {
+                            let _ = self.apply_event(event).await;
+                        }
                     }
                     None => debug!("Dropping event from {}: not sealed by a trusted peer", addr),
                 }
@@ -2362,12 +2448,28 @@ impl SyncService {
         self.state.read().await.peers.values().cloned().collect()
     }
 
+    fn should_accept_inbound_event(&self, event: &SyncEvent) -> bool {
+        match &event.operation {
+            SyncOperation::AddConversationTurn { .. } => self.sync_config.sync_ai_context,
+            SyncOperation::DefineCommand { .. } => self.sync_config.sync_commands,
+            _ => true,
+        }
+    }
+
     pub async fn apply_event(&self, event: SyncEvent) -> Result<()> {
         self.apply_event_internal(event).await?;
         Ok(())
     }
 
     async fn apply_event_internal(&self, event: SyncEvent) -> Result<bool> {
+        if !self.should_accept_inbound_event(&event) {
+            debug!(
+                event_id = %event.id,
+                device = %event.device_id,
+                "Ignoring inbound sync event disabled by policy"
+            );
+            return Ok(false);
+        }
         debug!(event_id = %event.id, device = %event.device_id, "Applying sync event");
 
         {
@@ -3037,7 +3139,20 @@ mod tests {
             .await
             .unwrap();
         let (_peer_d, synced_d) = node_d.pair_peer(&code_a.code).await.unwrap();
-        assert_eq!(synced_d, 5);
+        // AddConversationTurn is gated before sync_log.append when sync_ai_context = false,
+        // so only the 4 non-conversation events are accepted.
+        assert_eq!(synced_d, 4);
+        assert!(
+            node_d
+                .state
+                .read()
+                .await
+                .log
+                .events()
+                .iter()
+                .all(|e| !matches!(e.operation, SyncOperation::AddConversationTurn { .. })),
+            "AddConversationTurn must not be persisted in sync_log when sync_ai_context is false"
+        );
         assert_eq!(node_d.sync_with_peer(&node_a.device_id()).await.unwrap(), 0);
         let d_ctx = cm_d.get_context("sess-1").await.unwrap();
         assert!(
@@ -3327,8 +3442,12 @@ mod tests {
         // frames targeting Node A and Node B; both must reject them completely.
         let (node_c, _cm_c, _reg_c) = build_relay_node(&dir_c).await;
         let (c_shutdown_tx, c_shutdown_rx) = tokio::sync::watch::channel(false);
-        let (c_client, _c_rx) =
-            relay::RelayClient::start(relay_addr.clone(), node_c.device_id(), c_shutdown_rx);
+        let (c_client, _c_rx) = relay::RelayClient::start(
+            relay_addr.clone(),
+            node_c.device_id(),
+            node_c.keys.private.to_bytes(),
+            c_shutdown_rx,
+        );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !c_client.is_connected() {
             assert!(
@@ -3426,5 +3545,166 @@ mod tests {
         let _ = c_shutdown_tx.send(true);
         let _ = relay_shutdown_tx.send(true);
         let _ = relay_handle.await;
+    }
+
+    #[test]
+    fn test_hkdf_sha256_rfc5869_vector_1_and_cipher_for() {
+        // RFC 5869 Appendix A.1 Test Case 1
+        let ikm = [0x0bu8; 22];
+        let salt = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        ];
+        let info = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9];
+        let okm = hkdf_sha256_32(&salt, &ikm, &info);
+        assert_eq!(
+            to_hex(&okm),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+        );
+
+        // cipher_for is symmetric between A/B and differs from raw DH output
+        let sec_a = StaticSecret::random_from_rng(rand::thread_rng());
+        let pub_a = PublicKey::from(&sec_a);
+        let sec_b = StaticSecret::random_from_rng(rand::thread_rng());
+        let pub_b = PublicKey::from(&sec_b);
+
+        let raw_dh = sec_a.diffie_hellman(&pub_b);
+        let derived = hkdf_sha256_32(&[], raw_dh.as_bytes(), b"mycel-sync-v2-chacha20poly1305");
+        assert_ne!(derived, *raw_dh.as_bytes());
+
+        let nonce = [7u8; 12];
+        let pt = b"mycel-hkdf-symmetry-check";
+        let ct = cipher_for(&sec_a, &pub_b)
+            .encrypt(&nonce.into(), Payload { msg: pt, aad: &[] })
+            .unwrap();
+        let dec = cipher_for(&sec_b, &pub_a)
+            .decrypt(&nonce.into(), Payload { msg: &ct, aad: &[] })
+            .unwrap();
+        assert_eq!(dec, pt);
+    }
+
+    #[tokio::test]
+    async fn test_inbound_sync_gating_blocks_ai_context_and_commands_before_log() {
+        let mut cfg = crate::config::MycelConfig::default();
+        cfg.mesh.enabled = true;
+        cfg.mesh.transport = crate::config::MeshTransportMode::Direct;
+        cfg.mesh.listen_port = 0;
+        cfg.mesh.sync_port = 0;
+
+        let peer_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let peer_pub = PublicKey::from(&peer_secret);
+        let peer_id = encode_id(peer_pub.as_bytes());
+        cfg.mesh.trusted_peers = vec![peer_id.clone()];
+
+        // Case 1: sync_ai_context = false blocks AddConversationTurn before sync_log.jsonl
+        let dir1 = format!("/tmp/mycel-sync-gate-ctx-{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(&dir1).unwrap();
+        cfg.context_path = dir1.clone();
+        cfg.mesh.sync_ai_context = false;
+        cfg.mesh.sync_commands = true;
+
+        let (tx1, _) = broadcast::channel(16);
+        let svc1 = SyncService::new(&cfg, None, tx1).await.unwrap();
+        let cm1 = crate::context::ContextManager::new(&cfg).await.unwrap();
+        svc1.set_context_manager(cm1.clone()).await;
+
+        let turn_event = SyncEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: peer_id.clone(),
+            timestamp: Utc::now(),
+            clock: VectorClock::default(),
+            operation: SyncOperation::AddConversationTurn {
+                session_id: "gated-sess".to_string(),
+                user: "secret prompt".to_string(),
+                assistant: "secret reply".to_string(),
+            },
+            signature: Vec::new(),
+        };
+        let frame1 = seal_sync_message(
+            &peer_secret,
+            &peer_id,
+            &svc1.keys.public,
+            &SyncMessage::PushEvent { event: turn_event },
+        )
+        .unwrap();
+        let mut line1 = serde_json::to_string(&frame1).unwrap();
+        line1.push('\n');
+
+        let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener1.local_addr().unwrap();
+        let client1 = tokio::spawn(async move {
+            let mut s = TcpStream::connect(addr1).await.unwrap();
+            s.write_all(line1.as_bytes()).await.unwrap();
+            s.flush().await.unwrap();
+        });
+        let (srv_stream1, remote1) = listener1.accept().await.unwrap();
+        svc1.handle_tcp_connection(srv_stream1, remote1)
+            .await
+            .unwrap();
+        client1.await.unwrap();
+
+        assert!(
+            svc1.state.read().await.log.events().is_empty(),
+            "AddConversationTurn must NOT be appended to sync_log when sync_ai_context = false"
+        );
+        let ctx1 = cm1.get_context("gated-sess").await.unwrap();
+        assert!(ctx1.conversation_history.is_empty());
+
+        // Case 2: sync_commands = false blocks DefineCommand before sync_log.jsonl
+        let dir2 = format!("/tmp/mycel-sync-gate-cmd-{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(&dir2).unwrap();
+        cfg.context_path = dir2.clone();
+        cfg.mesh.sync_ai_context = true;
+        cfg.mesh.sync_commands = false;
+
+        let (tx2, _) = broadcast::channel(16);
+        let svc2 = SyncService::new(&cfg, None, tx2).await.unwrap();
+        let reg2 = crate::commands::CommandRegistry::in_memory();
+        svc2.set_command_registry(reg2.clone()).await;
+
+        let cmd_event = SyncEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: peer_id.clone(),
+            timestamp: Utc::now(),
+            clock: VectorClock::default(),
+            operation: SyncOperation::DefineCommand {
+                name: "blocked-mesh-cmd".to_string(),
+                description: "must be gated".to_string(),
+                steps_json: "[]".to_string(),
+                params: Vec::new(),
+                script: None,
+            },
+            signature: Vec::new(),
+        };
+        let frame2 = seal_sync_message(
+            &peer_secret,
+            &peer_id,
+            &svc2.keys.public,
+            &SyncMessage::PushEvent { event: cmd_event },
+        )
+        .unwrap();
+        let mut line2 = serde_json::to_string(&frame2).unwrap();
+        line2.push('\n');
+
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let client2 = tokio::spawn(async move {
+            let mut s = TcpStream::connect(addr2).await.unwrap();
+            s.write_all(line2.as_bytes()).await.unwrap();
+            s.flush().await.unwrap();
+        });
+        let (srv_stream2, remote2) = listener2.accept().await.unwrap();
+        svc2.handle_tcp_connection(srv_stream2, remote2)
+            .await
+            .unwrap();
+        client2.await.unwrap();
+
+        assert!(
+            svc2.state.read().await.log.events().is_empty(),
+            "DefineCommand must NOT be appended to sync_log when sync_commands = false"
+        );
+        assert!(reg2.get("blocked-mesh-cmd").await.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }

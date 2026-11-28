@@ -3,9 +3,11 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Configuration for a custom or overridden AI inference provider.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CustomProviderConfig {
     #[serde(default)]
     pub api: Option<String>,
@@ -58,8 +60,260 @@ impl LocalBackend {
     }
 }
 
+/// System identity and directory paths (`[system]` section).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemConfig {
+    #[serde(default = "default_hostname")]
+    pub hostname: String,
+    #[serde(default = "default_node_name")]
+    pub node_name: String,
+    #[serde(default = "default_data_dir")]
+    pub data_dir: String,
+    #[serde(default = "default_cache_dir")]
+    pub cache_dir: String,
+    #[serde(default = "default_config_dir")]
+    pub config_dir: String,
+}
+
+impl Default for SystemConfig {
+    fn default() -> Self {
+        Self {
+            hostname: default_hostname(),
+            node_name: default_node_name(),
+            data_dir: default_data_dir(),
+            cache_dir: default_cache_dir(),
+            config_dir: default_config_dir(),
+        }
+    }
+}
+
+fn default_hostname() -> String {
+    "mycel".to_string()
+}
+fn default_node_name() -> String {
+    "default".to_string()
+}
+fn default_data_dir() -> String {
+    "/var/lib/mycel".to_string()
+}
+fn default_cache_dir() -> String {
+    "/var/cache/mycel".to_string()
+}
+fn default_config_dir() -> String {
+    "/etc/mycel".to_string()
+}
+
+/// `[ai]` section in `config.toml`. Values set here sync into `MycelConfig`'s
+/// top-level fields while remaining backwards-compatible with top-level keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiConfig {
+    #[serde(default)]
+    pub local_backend: Option<LocalBackend>,
+    #[serde(default = "default_true")]
+    pub local_enabled: bool,
+    #[serde(default)]
+    pub local_model: Option<String>,
+    #[serde(default)]
+    pub local_url: Option<String>,
+    #[serde(default)]
+    pub llama_cpp_url: Option<String>,
+    #[serde(default = "default_local_timeout_secs")]
+    pub local_timeout_secs: u64,
+    #[serde(default)]
+    pub cloud_enabled: bool,
+    #[serde(default)]
+    pub cloud_provider: Option<String>,
+    #[serde(default)]
+    pub cloud_api_key: Option<String>,
+    #[serde(default)]
+    pub cloud_model: Option<String>,
+    #[serde(default = "default_cloud_timeout_secs")]
+    pub cloud_timeout_secs: u64,
+    #[serde(default)]
+    pub prefer_local: Option<bool>,
+    #[serde(default = "default_escalate_threshold")]
+    pub escalate_threshold: f32,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            local_backend: None,
+            local_enabled: true,
+            local_model: None,
+            local_url: None,
+            llama_cpp_url: None,
+            local_timeout_secs: default_local_timeout_secs(),
+            cloud_enabled: false,
+            cloud_provider: None,
+            cloud_api_key: None,
+            cloud_model: None,
+            cloud_timeout_secs: default_cloud_timeout_secs(),
+            prefer_local: None,
+            escalate_threshold: default_escalate_threshold(),
+        }
+    }
+}
+
+fn default_local_timeout_secs() -> u64 {
+    120
+}
+fn default_cloud_timeout_secs() -> u64 {
+    60
+}
+fn default_escalate_threshold() -> f32 {
+    0.7
+}
+
+/// `[ui]` section in `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiConfig {
+    #[serde(default = "default_layout")]
+    pub default_layout: String,
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    #[serde(default = "default_font_family")]
+    pub font_family: String,
+    #[serde(default = "default_true")]
+    pub learn_from_usage: bool,
+    #[serde(default)]
+    pub adopt_collective_patterns: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            default_layout: default_layout(),
+            theme: default_theme(),
+            font_family: default_font_family(),
+            learn_from_usage: true,
+            adopt_collective_patterns: false,
+        }
+    }
+}
+
+fn default_layout() -> String {
+    "conversation".to_string()
+}
+fn default_theme() -> String {
+    "dark".to_string()
+}
+fn default_font_family() -> String {
+    "monospace".to_string()
+}
+
+/// `[logging]` section in `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingConfig {
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    #[serde(default = "default_log_file")]
+    pub file: String,
+    #[serde(default = "default_log_max_size_mb")]
+    pub max_size_mb: u32,
+    #[serde(default = "default_log_max_files")]
+    pub max_files: u32,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            file: default_log_file(),
+            max_size_mb: default_log_max_size_mb(),
+            max_files: default_log_max_files(),
+        }
+    }
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+fn default_log_file() -> String {
+    "/var/log/mycel/runtime.log".to_string()
+}
+fn default_log_max_size_mb() -> u32 {
+    100
+}
+fn default_log_max_files() -> u32 {
+    5
+}
+
+/// Lightweight placeholder for `[collective]` when compiled without the `collective` feature.
+#[cfg(not(feature = "collective"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectiveConfig {
+    pub enabled: bool,
+    pub near_network: String,
+    pub near_rpc_url: String,
+    pub near_account: String,
+    pub near_contract: String,
+    pub ipfs_enabled: bool,
+    pub ipfs_api: String,
+    pub bittensor_enabled: bool,
+    pub bittensor_api_url: Option<String>,
+    pub bittensor_network: String,
+    pub bittensor_subnet: u16,
+    pub share_patterns: bool,
+    pub differential_privacy_epsilon: f64,
+}
+
+#[cfg(not(feature = "collective"))]
+impl Default for CollectiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            near_network: "testnet".to_string(),
+            near_rpc_url: String::new(),
+            near_account: String::new(),
+            near_contract: "patterns.mycel.testnet".to_string(),
+            ipfs_enabled: false,
+            ipfs_api: "http://127.0.0.1:5001".to_string(),
+            bittensor_enabled: false,
+            bittensor_api_url: None,
+            bittensor_network: "finney".to_string(),
+            bittensor_subnet: 0,
+            share_patterns: false,
+            differential_privacy_epsilon: 1.0,
+        }
+    }
+}
+
+/// Lightweight placeholder for `[wine]` when compiled without the `wine` feature.
+#[cfg(not(feature = "wine"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WineConfig {
+    pub enabled: bool,
+    pub wine_binary: String,
+    pub prefix_root: Option<String>,
+    pub sandbox_with_bwrap: bool,
+    pub allow_network: bool,
+    pub timeout_secs: u64,
+}
+
+#[cfg(not(feature = "wine"))]
+impl Default for WineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            wine_binary: "wine".to_string(),
+            prefix_root: None,
+            sandbox_with_bwrap: true,
+            allow_network: false,
+            timeout_secs: 60,
+        }
+    }
+}
+
 /// Main configuration struct
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "MycelConfigRaw")]
 pub struct MycelConfig {
     /// Local inference backend selection (auto, ollama, llama-cpp)
     #[serde(default)]
@@ -158,12 +412,198 @@ pub struct MycelConfig {
     pub recovery: crate::recovery::RecoveryConfig,
 
     /// Collective intelligence network (NEAR, IPFS, Bittensor)
+    #[cfg(feature = "collective")]
     #[serde(default)]
     pub collective: crate::collective::CollectiveConfig,
 
+    /// Collective intelligence network (placeholder when `collective` feature is disabled)
+    #[cfg(not(feature = "collective"))]
+    #[serde(default)]
+    pub collective: CollectiveConfig,
+
     /// Windows application compatibility via Wine
+    #[cfg(feature = "wine")]
     #[serde(default)]
     pub wine: crate::wine::WineConfig,
+
+    /// Windows application compatibility via Wine (placeholder when `wine` feature is disabled)
+    #[cfg(not(feature = "wine"))]
+    #[serde(default)]
+    pub wine: WineConfig,
+
+    /// System identity and directory paths (`[system]` section)
+    #[serde(default)]
+    pub system: SystemConfig,
+
+    /// `[ai]` section (values sync into top-level AI fields)
+    #[serde(default)]
+    pub ai: AiConfig,
+
+    /// `[ui]` section
+    #[serde(default)]
+    pub ui: UiConfig,
+
+    /// `[logging]` section
+    #[serde(default)]
+    pub logging: LoggingConfig,
+}
+
+/// Raw deserialization target for `MycelConfig` with `deny_unknown_fields`
+/// so unknown TOML keys are rejected rather than silently dropped.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MycelConfigRaw {
+    #[serde(default)]
+    local_backend: LocalBackend,
+    #[serde(default = "default_ollama_url")]
+    ollama_url: String,
+    #[serde(default = "default_llama_cpp_url")]
+    llama_cpp_url: String,
+    #[serde(default = "default_local_model")]
+    local_model: String,
+    #[serde(default)]
+    cloud_provider: String,
+    #[serde(default = "default_cloud_model")]
+    cloud_model: String,
+    #[serde(default)]
+    openrouter_api_key: String,
+    #[serde(default)]
+    providers: HashMap<String, CustomProviderConfig>,
+    #[serde(default)]
+    prefer_cloud: bool,
+    #[serde(default = "default_context_path")]
+    context_path: String,
+    #[serde(default = "default_code_path")]
+    code_path: String,
+    #[serde(default = "default_ipc_path")]
+    ipc_socket_path: String,
+    #[serde(default = "default_max_tokens")]
+    local_max_tokens: u32,
+    #[serde(default = "default_false")]
+    force_cloud_for_complex: bool,
+    #[serde(default = "default_execution_timeout")]
+    execution_timeout_secs: u64,
+    #[serde(default = "default_execution_memory")]
+    execution_memory_mb: u32,
+    #[serde(default)]
+    blockchain_sync: bool,
+    #[serde(default)]
+    near_account: Option<String>,
+    #[serde(default)]
+    router: crate::ai::router::RouterConfig,
+    #[serde(default)]
+    selfdev: crate::selfdev::SelfDevConfig,
+    #[serde(default)]
+    mcp: McpConfig,
+    #[serde(default)]
+    mesh: MeshConfig,
+    #[serde(default)]
+    sandbox: SandboxConfig,
+    #[serde(default)]
+    recovery: crate::recovery::RecoveryConfig,
+    #[cfg(feature = "collective")]
+    #[serde(default)]
+    collective: crate::collective::CollectiveConfig,
+    #[cfg(not(feature = "collective"))]
+    #[serde(default)]
+    collective: CollectiveConfig,
+    #[cfg(feature = "wine")]
+    #[serde(default)]
+    wine: crate::wine::WineConfig,
+    #[cfg(not(feature = "wine"))]
+    #[serde(default)]
+    wine: WineConfig,
+    #[serde(default)]
+    system: SystemConfig,
+    #[serde(default)]
+    ai: AiConfig,
+    #[serde(default)]
+    ui: UiConfig,
+    #[serde(default)]
+    logging: LoggingConfig,
+}
+
+impl From<MycelConfigRaw> for MycelConfig {
+    fn from(raw: MycelConfigRaw) -> Self {
+        let mut cfg = Self {
+            local_backend: raw.local_backend,
+            ollama_url: raw.ollama_url,
+            llama_cpp_url: raw.llama_cpp_url,
+            local_model: raw.local_model,
+            cloud_provider: raw.cloud_provider,
+            cloud_model: raw.cloud_model,
+            openrouter_api_key: raw.openrouter_api_key,
+            providers: raw.providers,
+            prefer_cloud: raw.prefer_cloud,
+            context_path: raw.context_path,
+            code_path: raw.code_path,
+            ipc_socket_path: raw.ipc_socket_path,
+            local_max_tokens: raw.local_max_tokens,
+            force_cloud_for_complex: raw.force_cloud_for_complex,
+            execution_timeout_secs: raw.execution_timeout_secs,
+            execution_memory_mb: raw.execution_memory_mb,
+            blockchain_sync: raw.blockchain_sync,
+            near_account: raw.near_account,
+            router: raw.router,
+            selfdev: raw.selfdev,
+            mcp: raw.mcp,
+            mesh: raw.mesh,
+            sandbox: raw.sandbox,
+            recovery: raw.recovery,
+            collective: raw.collective,
+            wine: raw.wine,
+            system: raw.system,
+            ai: raw.ai,
+            ui: raw.ui,
+            logging: raw.logging,
+        };
+        cfg.sync_ai_section();
+        cfg
+    }
+}
+
+impl MycelConfig {
+    /// Sync `[ai]` section values into top-level `MycelConfig` fields when set.
+    fn sync_ai_section(&mut self) {
+        if let Some(backend) = self.ai.local_backend {
+            self.local_backend = backend;
+        }
+        if let Some(ref model) = self.ai.local_model {
+            if !model.is_empty() {
+                self.local_model = model.clone();
+            }
+        }
+        if let Some(ref url) = self.ai.local_url {
+            if !url.is_empty() {
+                self.ollama_url = url.clone();
+            }
+        }
+        if let Some(ref url) = self.ai.llama_cpp_url {
+            if !url.is_empty() {
+                self.llama_cpp_url = url.clone();
+            }
+        }
+        if let Some(ref provider) = self.ai.cloud_provider {
+            if !provider.is_empty() {
+                self.cloud_provider = provider.clone();
+            }
+        }
+        if let Some(ref model) = self.ai.cloud_model {
+            if !model.is_empty() {
+                self.cloud_model = model.clone();
+            }
+        }
+        if let Some(ref key) = self.ai.cloud_api_key {
+            if !key.is_empty() && self.openrouter_api_key.is_empty() {
+                self.openrouter_api_key = key.clone();
+            }
+        }
+        if let Some(prefer_local) = self.ai.prefer_local {
+            if !prefer_local && !self.prefer_cloud {
+                self.prefer_cloud = true;
+            }
+        }
+    }
 }
 
 /// How AI-generated code is isolated from the host.
@@ -191,6 +631,7 @@ impl SandboxMode {
 
 /// Sandbox configuration for the code executor. Secure by default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
     #[serde(default)]
     pub mode: SandboxMode,
@@ -266,6 +707,7 @@ pub enum MeshTransportMode {
 /// Secure by default: the mesh is off, and when on, only explicitly trusted
 /// device keys can exchange events with this node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshConfig {
     /// Enable the mesh (UDP listener, discovery, event exchange)
     #[serde(default)]
@@ -287,6 +729,10 @@ pub struct MeshConfig {
     /// Replicate conversation history to trusted peers (opt-in)
     #[serde(default)]
     pub sync_ai_context: bool,
+
+    /// Replicate user-defined commands to trusted peers
+    #[serde(default = "default_true")]
+    pub sync_commands: bool,
 
     /// Kernel WireGuard interface name
     #[serde(default = "default_mesh_interface")]
@@ -341,6 +787,7 @@ impl Default for MeshConfig {
             mdns_enabled: true,
             trusted_peers: Vec::new(),
             sync_ai_context: false,
+            sync_commands: true,
             interface: default_mesh_interface(),
             transport: MeshTransportMode::Auto,
             sync_port: default_sync_port(),
@@ -374,10 +821,15 @@ fn default_persistent_keepalive_secs() -> u16 {
 
 /// MCP (Model Context Protocol) configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpConfig {
     /// Enable MCP server integration
     #[serde(default = "default_true")]
     pub enabled: bool,
+
+    /// Allow MCP self-evolution (dynamic server/tool registration). Off by default.
+    #[serde(default)]
+    pub allow_evolution: bool,
 
     /// List of MCP servers to connect to
     #[serde(default)]
@@ -388,6 +840,7 @@ impl Default for McpConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            allow_evolution: false,
             servers: Vec::new(),
         }
     }
@@ -395,6 +848,7 @@ impl Default for McpConfig {
 
 /// Configuration for a single MCP server
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     /// Server name (used for identification)
     pub name: String,
@@ -450,8 +904,19 @@ fn default_code_path() -> String {
         .unwrap_or_else(|| "/tmp/mycel/code".to_string())
 }
 
-fn default_ipc_path() -> String {
-    "/tmp/mycel.sock".to_string()
+pub fn default_ipc_path() -> String {
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        let trimmed = xdg.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed)
+                .join("mycel")
+                .join("runtime.sock")
+                .to_string_lossy()
+                .to_string();
+        }
+    }
+    let uid = nix::unistd::getuid().as_raw();
+    format!("/tmp/mycel-{}/runtime.sock", uid)
 }
 
 fn default_false() -> bool {
@@ -497,8 +962,18 @@ impl Default for MycelConfig {
             mesh: MeshConfig::default(),
             sandbox: SandboxConfig::default(),
             recovery: crate::recovery::RecoveryConfig::default(),
+            #[cfg(feature = "collective")]
             collective: crate::collective::CollectiveConfig::default(),
+            #[cfg(not(feature = "collective"))]
+            collective: CollectiveConfig::default(),
+            #[cfg(feature = "wine")]
             wine: crate::wine::WineConfig::default(),
+            #[cfg(not(feature = "wine"))]
+            wine: WineConfig::default(),
+            system: SystemConfig::default(),
+            ai: AiConfig::default(),
+            ui: UiConfig::default(),
+            logging: LoggingConfig::default(),
         }
     }
 }
@@ -516,8 +991,6 @@ impl MycelConfig {
         // Environment variable overrides
         if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
             config.openrouter_api_key = key;
-            // Auto-prefer cloud when OpenRouter key is set
-            config.prefer_cloud = true;
         }
         if let Ok(url) = std::env::var("OLLAMA_URL") {
             config.ollama_url = url;
@@ -543,8 +1016,13 @@ impl MycelConfig {
         if let Ok(model) = std::env::var("MYCEL_CLOUD_MODEL") {
             config.cloud_model = model;
         }
-        if std::env::var("MYCEL_PREFER_CLOUD").is_ok() {
-            config.prefer_cloud = true;
+        if let Ok(val) = std::env::var("MYCEL_PREFER_CLOUD") {
+            let v = val.trim().to_ascii_lowercase();
+            if matches!(v.as_str(), "1" | "true" | "yes") {
+                config.prefer_cloud = true;
+            } else if matches!(v.as_str(), "0" | "false" | "no") {
+                config.prefer_cloud = false;
+            }
         }
 
         // Dev mode adjustments
@@ -857,5 +1335,71 @@ timeout_secs = 120
         assert!(!parsed.wine.sandbox_with_bwrap);
         assert!(parsed.wine.allow_network);
         assert_eq!(parsed.wine.timeout_secs, 120);
+    }
+
+    #[test]
+    fn test_shipped_config_toml_parses_cleanly() {
+        let shipped = include_str!("../../../config/config.toml");
+        let parsed: MycelConfig = toml::from_str(shipped)
+            .expect("shipped config/config.toml must parse cleanly with deny_unknown_fields");
+        assert!(!parsed.ai.cloud_enabled);
+        assert!(!parsed.mesh.enabled);
+        assert!(parsed.mesh.sync_commands);
+        assert!(!parsed.mcp.allow_evolution);
+        assert!(!parsed.collective.enabled);
+        assert!(!parsed.wine.enabled);
+        assert_eq!(parsed.local_model, "qwen3:8b");
+        assert_eq!(parsed.ollama_url, "http://localhost:11434");
+
+        // Unknown keys must be rejected rather than silently dropped.
+        let bad = "unknown_top_level_key = true\n";
+        assert!(toml::from_str::<MycelConfig>(bad).is_err());
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_openrouter_key_does_not_force_prefer_cloud_and_ipc_path_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let prev_or = std::env::var("OPENROUTER_API_KEY").ok();
+        let prev_pc = std::env::var("MYCEL_PREFER_CLOUD").ok();
+        let prev_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+
+        std::env::set_var("OPENROUTER_API_KEY", "sk-or-test-key");
+        std::env::remove_var("MYCEL_PREFER_CLOUD");
+        let cfg = MycelConfig::load("non_existent_config.toml", false).unwrap();
+        assert_eq!(cfg.openrouter_api_key, "sk-or-test-key");
+        assert!(
+            !cfg.prefer_cloud,
+            "OPENROUTER_API_KEY must not silently set prefer_cloud = true"
+        );
+
+        std::env::set_var("MYCEL_PREFER_CLOUD", "true");
+        let cfg_explicit = MycelConfig::load("non_existent_config.toml", false).unwrap();
+        assert!(cfg_explicit.prefer_cloud);
+
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1234");
+        assert_eq!(default_ipc_path(), "/run/user/1234/mycel/runtime.sock");
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        let uid = nix::unistd::getuid().as_raw();
+        assert_eq!(
+            default_ipc_path(),
+            format!("/tmp/mycel-{}/runtime.sock", uid)
+        );
+
+        match prev_or {
+            Some(v) => std::env::set_var("OPENROUTER_API_KEY", v),
+            None => std::env::remove_var("OPENROUTER_API_KEY"),
+        }
+        match prev_pc {
+            Some(v) => std::env::set_var("MYCEL_PREFER_CLOUD", v),
+            None => std::env::remove_var("MYCEL_PREFER_CLOUD"),
+        }
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
     }
 }

@@ -476,12 +476,13 @@ def cmd_wine(args):
             print(f"Guidance: {response['install_guidance']}")
 
     elif args.wine_cmd == "run":
+        session_id = str(uuid.uuid4())
         response = send_request({
             "type": "RunWindowsApp",
             "app_name": args.app,
             "exe_path": args.exe,
             "args": args.args,
-        })
+        }, session_id=session_id)
         if response.get("type") == "Error":
             print(f"Error: {response.get('message', 'Unknown error')}", file=sys.stderr)
             sys.exit(1)
@@ -501,7 +502,7 @@ def cmd_wine(args):
                 "type": "ConfirmAction",
                 "id": req_id,
                 "approved": approved,
-            })
+            }, session_id=session_id)
             if confirm_resp.get("type") == "Error":
                 print(f"Error: {confirm_resp.get('message', 'Unknown error')}", file=sys.stderr)
                 sys.exit(1)

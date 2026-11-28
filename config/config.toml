@@ -133,8 +133,8 @@ ipfs_api = "http://127.0.0.1:5001"
 bittensor_enabled = false
 # bittensor_api_url = "http://127.0.0.1:8090"
 bittensor_network = "finney"  # or "test"
-bittensor_coldkey = ""
-bittensor_hotkey = ""
+# bittensor_coldkey = ""
+# bittensor_hotkey = ""
 bittensor_subnet = 0  # TBD
 
 # Privacy settings
@@ -164,6 +164,9 @@ trusted_peers = []
 # Replicate conversation history to trusted devices (off by default)
 sync_ai_context = false
 
+# Replicate user-defined commands to trusted devices
+sync_commands = true
+
 # Discovery (only advertises/accepts devices listed in trusted_peers)
 mdns_enabled = true
 
@@ -182,6 +185,10 @@ relay_server_enabled = false
 # sync_config = true
 # sync_patterns = true
 # sync_documents = false
+
+[mcp]
+enabled = true
+allow_evolution = false
 
 [ui]
 # Interface settings

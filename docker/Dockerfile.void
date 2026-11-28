@@ -42,7 +42,6 @@ RUN xbps-install -Syu && xbps-install -y \
     gtk4-devel \
     webkit2gtk-devel \
     # Sandboxing
-    firejail \
     bubblewrap \
     # Compression
     xz \
@@ -80,15 +79,13 @@ RUN curl -fsSL https://ollama.com/install.sh | sh
 RUN curl -fsSL https://claude.ai/install.sh | bash && \
     curl -fsSL https://opencode.ai/install | bash
 
-# Set up SSH
+# Set up SSH (key-based auth only; no baked passwords)
 RUN ssh-keygen -A && \
-    echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config && \
-    echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config && \
-    echo 'root:mycel' | chpasswd
+    echo 'PermitRootLogin no' >> /etc/ssh/sshd_config && \
+    echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config
 
 # Create development user
 RUN useradd -m -s /bin/bash -G wheel mycel && \
-    echo 'mycel:mycel' | chpasswd && \
     echo '%wheel ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
 
 # Create directories
