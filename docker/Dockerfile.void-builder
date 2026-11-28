@@ -22,6 +22,8 @@ RUN xbps-install -Syu -y \
     cpio \
     file \
     gcc \
+    cmake \
+    make \
     llvm-libunwind-devel \
     rust \
     cargo \

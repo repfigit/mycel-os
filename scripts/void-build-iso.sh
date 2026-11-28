@@ -42,8 +42,9 @@ case "$PROFILE" in
         ;;
 esac
 
-echo "[1/4] Verifying static musl mycel-runtime binary..."
+echo "[1/4] Verifying static musl mycel-runtime and llama-server binaries..."
 RUNTIME_BIN="$WORKSPACE/mycel-runtime/target/x86_64-unknown-linux-musl/release/mycel-runtime"
+LLAMA_BIN="$WORKSPACE/build/llama-cpp/llama-server"
 CLI_SCRIPT="$WORKSPACE/tools/mycel-cli.py"
 
 if [ ! -f "$RUNTIME_BIN" ]; then
@@ -51,12 +52,17 @@ if [ ! -f "$RUNTIME_BIN" ]; then
     echo "Build it first with: cargo build --release --target x86_64-unknown-linux-musl" >&2
     exit 1
 fi
+if [ ! -f "$LLAMA_BIN" ]; then
+    echo "ERROR: Native Void musl llama-server binary not found at $LLAMA_BIN" >&2
+    exit 1
+fi
 if [ ! -f "$CLI_SCRIPT" ]; then
     echo "ERROR: CLI script not found at $CLI_SCRIPT" >&2
     exit 1
 fi
 
-echo "Binary info: $(file "$RUNTIME_BIN")"
+echo "Runtime binary info: $(file "$RUNTIME_BIN")"
+echo "llama-server binary info: $(file "$LLAMA_BIN")"
 
 echo "[2/4] Preparing rootfs overlay..."
 INCLUDEDIR="/tmp/mycel-includedir"
@@ -66,10 +72,20 @@ mkdir -p \
     "$INCLUDEDIR/usr/local/lib/mycel" \
     "$INCLUDEDIR/etc/mycel" \
     "$INCLUDEDIR/etc/sv/mycel-runtime" \
-    "$INCLUDEDIR/etc/runit/runsvdir/default"
+    "$INCLUDEDIR/etc/sv/llama-server" \
+    "$INCLUDEDIR/etc/runit/runsvdir/default" \
+    "$INCLUDEDIR/var/lib/mycel/models"
 
-# Real static musl mycel-runtime binary
+# Real static musl mycel-runtime and llama-server binaries
 install -m 0755 "$RUNTIME_BIN" "$INCLUDEDIR/usr/local/bin/mycel-runtime"
+install -m 0755 "$LLAMA_BIN" "$INCLUDEDIR/usr/local/bin/llama-server"
+
+# Optional bundled GGUF model
+if [ -n "${MYCEL_GGUF_MODEL:-}" ] && [ -r "$MYCEL_GGUF_MODEL" ]; then
+    GGUF_NAME="${MYCEL_GGUF_NAME:-$(basename "$MYCEL_GGUF_MODEL")}"
+    echo "Bundling GGUF model: $GGUF_NAME"
+    install -m 0644 "$MYCEL_GGUF_MODEL" "$INCLUDEDIR/var/lib/mycel/models/$GGUF_NAME"
+fi
 
 if [ "$PROFILE" = "desktop" ] || [ "$PROFILE" = "full" ]; then
     for bin in mycel-compositor mycel-shell; do
@@ -108,6 +124,8 @@ chmod 0755 "$INCLUDEDIR/usr/local/bin/mycel"
 
 # Real MycelConfig TOML (top-level keys)
 cat > "$INCLUDEDIR/etc/mycel/config.toml" << 'EOF'
+local_backend = "auto"
+llama_cpp_url = "http://127.0.0.1:8080/v1"
 ollama_url = "http://10.0.2.2:11434"
 local_model = "qwen3:8b"
 ipc_socket_path = "/run/mycel/runtime.sock"
@@ -136,6 +154,29 @@ exec /usr/local/bin/mycel-runtime --daemon --config /etc/mycel/config.toml
 EOF
 chmod 0755 "$INCLUDEDIR/etc/sv/mycel-runtime/run"
 ln -sf /etc/sv/mycel-runtime "$INCLUDEDIR/etc/runit/runsvdir/default/mycel-runtime"
+
+# Runit service for local llama-server (auto-starts when a .gguf model is present)
+cat > "$INCLUDEDIR/etc/sv/llama-server/run" << 'EOF'
+#!/bin/sh
+exec 2>&1
+MODEL_DIR="/var/lib/mycel/models"
+mkdir -p "$MODEL_DIR"
+while true; do
+    MODEL=""
+    for f in "$MODEL_DIR"/*.gguf; do
+        if [ -f "$f" ]; then
+            MODEL="$f"
+            break
+        fi
+    done
+    if [ -n "$MODEL" ]; then
+        exec /usr/local/bin/llama-server --host 127.0.0.1 --port 8080 -m "$MODEL"
+    fi
+    sleep 5
+done
+EOF
+chmod 0755 "$INCLUDEDIR/etc/sv/llama-server/run"
+ln -sf /etc/sv/llama-server "$INCLUDEDIR/etc/runit/runsvdir/default/llama-server"
 
 # Clean branding
 echo "mycel" > "$INCLUDEDIR/etc/hostname"

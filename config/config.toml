@@ -12,10 +12,13 @@ cache_dir = "/var/cache/mycel"
 config_dir = "/etc/mycel"
 
 [ai]
-# Local AI (Ollama)
+# Local AI backend selection: "auto" (probe llama-cpp first, then Ollama),
+# "ollama", or "llama-cpp". Override via MYCEL_LOCAL_BACKEND.
+local_backend = "auto"
 local_enabled = true
 local_model = "qwen3:8b"  # Native tool-calling + strong code gen; use qwen3:4b on <8GB RAM
 local_url = "http://localhost:11434"
+llama_cpp_url = "http://127.0.0.1:8080/v1"  # Override via MYCEL_LLAMA_CPP_URL
 local_timeout_secs = 120
 
 # Cloud AI (auto-detects configured provider, or set cloud_provider explicitly)

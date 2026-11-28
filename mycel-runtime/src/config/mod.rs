@@ -23,12 +23,55 @@ pub struct CustomProviderConfig {
     pub requires_auth: Option<bool>,
 }
 
+/// Which local inference backend to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalBackend {
+    /// Probe llama-cpp first, then fall back to Ollama.
+    #[default]
+    Auto,
+    /// Use Ollama (`/api/generate`).
+    Ollama,
+    /// Use llama.cpp OpenAI-compatible server (`/v1/chat/completions`).
+    #[serde(alias = "llamacpp", alias = "llama_cpp")]
+    LlamaCpp,
+}
+
+impl LocalBackend {
+    /// Stable kebab-case name used in logs and diagnostics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LocalBackend::Auto => "auto",
+            LocalBackend::Ollama => "ollama",
+            LocalBackend::LlamaCpp => "llama-cpp",
+        }
+    }
+
+    /// Parse a backend name case-insensitively, accepting common aliases.
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(LocalBackend::Auto),
+            "ollama" => Some(LocalBackend::Ollama),
+            "llama-cpp" | "llamacpp" | "llama_cpp" => Some(LocalBackend::LlamaCpp),
+            _ => None,
+        }
+    }
+}
+
 /// Main configuration struct
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MycelConfig {
+    /// Local inference backend selection (auto, ollama, llama-cpp)
+    #[serde(default)]
+    pub local_backend: LocalBackend,
+
     /// URL for local Ollama instance
     #[serde(default = "default_ollama_url")]
     pub ollama_url: String,
+
+    /// URL for local llama.cpp OpenAI-compatible server
+    #[serde(default = "default_llama_cpp_url")]
+    pub llama_cpp_url: String,
 
     /// Local model to use (Ollama model name)
     #[serde(default = "default_local_model")]
@@ -338,6 +381,10 @@ fn default_ollama_url() -> String {
     "http://localhost:11434".to_string()
 }
 
+fn default_llama_cpp_url() -> String {
+    "http://127.0.0.1:8080/v1".to_string()
+}
+
 fn default_local_model() -> String {
     // qwen3:8b - best balance for Mycel's core loop: native tool-calling
     // (required by MCP), strong code generation, 40K context, runs on CPU
@@ -384,7 +431,9 @@ fn default_execution_memory() -> u32 {
 impl Default for MycelConfig {
     fn default() -> Self {
         Self {
+            local_backend: LocalBackend::default(),
             ollama_url: default_ollama_url(),
+            llama_cpp_url: default_llama_cpp_url(),
             local_model: default_local_model(),
             cloud_provider: String::new(),
             cloud_model: default_cloud_model(),
@@ -428,6 +477,18 @@ impl MycelConfig {
         }
         if let Ok(url) = std::env::var("OLLAMA_URL") {
             config.ollama_url = url;
+        }
+        if let Ok(backend) = std::env::var("MYCEL_LOCAL_BACKEND") {
+            match LocalBackend::from_str_loose(&backend) {
+                Some(parsed) => config.local_backend = parsed,
+                None => tracing::warn!(
+                    "Ignoring invalid MYCEL_LOCAL_BACKEND value '{}'; expected auto, ollama, or llama-cpp",
+                    backend
+                ),
+            }
+        }
+        if let Ok(url) = std::env::var("MYCEL_LLAMA_CPP_URL") {
+            config.llama_cpp_url = url;
         }
         if let Ok(model) = std::env::var("MYCEL_LOCAL_MODEL") {
             config.local_model = model;
@@ -567,5 +628,66 @@ X-Custom = "val"
         );
         assert_eq!(p.requires_auth, Some(false));
         assert_eq!(p.headers.get("X-Custom").map(String::as_str), Some("val"));
+    }
+
+    #[test]
+    fn test_local_backend_defaults_and_legacy_toml() {
+        let config = MycelConfig::default();
+        assert_eq!(config.local_backend, LocalBackend::Auto);
+        assert_eq!(config.llama_cpp_url, "http://127.0.0.1:8080/v1");
+        assert_eq!(LocalBackend::Auto.as_str(), "auto");
+        assert_eq!(LocalBackend::Ollama.as_str(), "ollama");
+        assert_eq!(LocalBackend::LlamaCpp.as_str(), "llama-cpp");
+
+        // Existing configs without local_backend or llama_cpp_url must still parse.
+        let legacy_toml = r#"
+ollama_url = "http://127.0.0.1:11434"
+local_model = "qwen3:8b"
+"#;
+        let parsed: MycelConfig = toml::from_str(legacy_toml).unwrap();
+        assert_eq!(parsed.local_backend, LocalBackend::Auto);
+        assert_eq!(parsed.ollama_url, "http://127.0.0.1:11434");
+        assert_eq!(parsed.llama_cpp_url, "http://127.0.0.1:8080/v1");
+    }
+
+    #[test]
+    fn test_local_backend_explicit_toml_and_from_str_loose() {
+        for (raw, expected) in [
+            ("llama-cpp", LocalBackend::LlamaCpp),
+            ("llamacpp", LocalBackend::LlamaCpp),
+            ("llama_cpp", LocalBackend::LlamaCpp),
+            ("ollama", LocalBackend::Ollama),
+            ("auto", LocalBackend::Auto),
+        ] {
+            let toml_str = format!(
+                "local_backend = \"{}\"\nllama_cpp_url = \"http://127.0.0.1:9090/v1\"\n",
+                raw
+            );
+            let parsed: MycelConfig = toml::from_str(&toml_str).unwrap();
+            assert_eq!(parsed.local_backend, expected);
+            assert_eq!(parsed.llama_cpp_url, "http://127.0.0.1:9090/v1");
+        }
+
+        assert_eq!(
+            LocalBackend::from_str_loose("auto"),
+            Some(LocalBackend::Auto)
+        );
+        assert_eq!(
+            LocalBackend::from_str_loose(" OLLAMA "),
+            Some(LocalBackend::Ollama)
+        );
+        assert_eq!(
+            LocalBackend::from_str_loose("llama-cpp"),
+            Some(LocalBackend::LlamaCpp)
+        );
+        assert_eq!(
+            LocalBackend::from_str_loose("LlamaCpp"),
+            Some(LocalBackend::LlamaCpp)
+        );
+        assert_eq!(
+            LocalBackend::from_str_loose("LLAMA_CPP"),
+            Some(LocalBackend::LlamaCpp)
+        );
+        assert_eq!(LocalBackend::from_str_loose("vllm"), None);
     }
 }

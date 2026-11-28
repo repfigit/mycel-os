@@ -14,7 +14,7 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::config::MycelConfig;
+use crate::config::{LocalBackend, MycelConfig};
 use crate::context::Context;
 
 pub mod providers;
@@ -140,12 +140,28 @@ fn strip_markdown_formatting(text: &str) -> String {
     result.trim().to_string()
 }
 
+/// Which local LLM backend is currently active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveLocalBackend {
+    Ollama,
+    LlamaCpp,
+}
+
+impl ActiveLocalBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            ActiveLocalBackend::Ollama => "ollama",
+            ActiveLocalBackend::LlamaCpp => "llama-cpp",
+        }
+    }
+}
+
 /// Main AI router that handles all LLM interactions
 #[derive(Clone)]
 pub struct AiRouter {
     config: MycelConfig,
     http_client: Client,
-    local_available: bool,
+    active_local: Option<ActiveLocalBackend>,
     spend_tracker: SpendTracker,
     provider_registry: Arc<providers::ProviderRegistry>,
     active_cloud: Arc<RwLock<Option<(String, String)>>>,
@@ -169,21 +185,60 @@ impl AiRouter {
             .connect_timeout(std::time::Duration::from_secs(30))
             .build()?;
 
-        // Check if local model (Ollama) is available
-        let mut local_available = Self::check_local_availability(&http_client, config).await;
+        // Short-timeout probe client so unreachable endpoints on offline VMs
+        // fail immediately instead of stalling startup.
+        let probe_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()?;
 
-        // If not available, try to start it
-        if !local_available {
-            info!("Ollama not running, attempting to start...");
-            if Self::try_start_ollama().await {
-                local_available = Self::check_local_availability(&http_client, config).await;
+        let active_local = match config.local_backend {
+            LocalBackend::Ollama => {
+                if Self::probe_ollama(&probe_client, &config.ollama_url).await {
+                    Some(ActiveLocalBackend::Ollama)
+                } else {
+                    info!("Ollama not running, attempting to start...");
+                    if Self::try_start_ollama().await
+                        && Self::probe_ollama(&probe_client, &config.ollama_url).await
+                    {
+                        Some(ActiveLocalBackend::Ollama)
+                    } else {
+                        None
+                    }
+                }
             }
-        }
+            LocalBackend::LlamaCpp => {
+                if Self::probe_llama_cpp(&probe_client, &config.llama_cpp_url).await {
+                    Some(ActiveLocalBackend::LlamaCpp)
+                } else {
+                    None
+                }
+            }
+            LocalBackend::Auto => {
+                if Self::probe_llama_cpp(&probe_client, &config.llama_cpp_url).await {
+                    Some(ActiveLocalBackend::LlamaCpp)
+                } else if Self::probe_ollama(&probe_client, &config.ollama_url).await {
+                    Some(ActiveLocalBackend::Ollama)
+                } else {
+                    info!("Ollama not running, attempting to start...");
+                    if Self::try_start_ollama().await
+                        && Self::probe_ollama(&probe_client, &config.ollama_url).await
+                    {
+                        Some(ActiveLocalBackend::Ollama)
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
 
-        if local_available {
-            info!("🧠 Local LLM online - this is the kernel's brain");
+        if let Some(backend) = active_local {
+            info!(
+                "🧠 Local LLM online ({}) - this is the kernel's brain",
+                backend.as_str()
+            );
         } else {
-            warn!("⚠️  Local LLM not available! Running in degraded cloud-only mode. Start Ollama for full capability.");
+            warn!("⚠️  Local LLM not available! Running in degraded cloud-only mode. Start llama.cpp or Ollama for full capability.");
         }
 
         let spend_tracker = SpendTracker::load(Self::spend_path(config)).await;
@@ -193,7 +248,7 @@ impl AiRouter {
         let router = Self {
             config: config.clone(),
             http_client,
-            local_available,
+            active_local,
             spend_tracker,
             provider_registry,
             active_cloud,
@@ -214,11 +269,14 @@ impl AiRouter {
     /// Spawn a background task that preloads the local model into memory and
     /// pins it with keep_alive so subsequent requests are fast.
     fn spawn_warmup(&self) {
-        if !self.local_available {
+        if self.active_local != Some(ActiveLocalBackend::Ollama) {
             return;
         }
         let client = self.http_client.clone();
-        let url = format!("{}/api/generate", self.config.ollama_url);
+        let url = format!(
+            "{}/api/generate",
+            self.config.ollama_url.trim_end_matches('/')
+        );
         let model = self.config.local_model.clone();
         tokio::spawn(async move {
             debug!("Warming up local model '{}'...", model);
@@ -252,16 +310,38 @@ impl AiRouter {
         Ok(Self {
             config: config.clone(),
             http_client,
-            local_available: false,
+            active_local: None,
             spend_tracker: SpendTracker::load(Self::spend_path(config)).await,
             provider_registry,
             active_cloud,
         })
     }
 
-    async fn check_local_availability(client: &Client, config: &MycelConfig) -> bool {
-        let url = format!("{}/api/tags", config.ollama_url);
-        client.get(&url).send().await.is_ok()
+    async fn probe_ollama(client: &Client, base_url: &str) -> bool {
+        let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+        match client.get(&url).send().await {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
+    async fn probe_llama_cpp(client: &Client, base_url: &str) -> bool {
+        let base = base_url.trim_end_matches('/');
+        let models_url = format!("{}/models", base);
+        if let Ok(resp) = client.get(&models_url).send().await {
+            if resp.status().is_success() {
+                return true;
+            }
+        }
+        let origin = base
+            .strip_suffix("/v1")
+            .unwrap_or(base)
+            .trim_end_matches('/');
+        let health_url = format!("{}/health", origin);
+        match client.get(&health_url).send().await {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
     }
 
     /// Try to start Ollama if it's not running
@@ -321,9 +401,9 @@ impl AiRouter {
         prompt: &str,
         force_cloud: bool,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
-        if self.local_available && !force_cloud {
+        if self.is_local_available() && !force_cloud {
             match self.local_generate_stream(prompt).await {
-                Ok(stream) => return Ok(Box::pin(stream)),
+                Ok(stream) => return Ok(stream),
                 Err(e) => {
                     warn!("Local LLM streaming failed, escalating to cloud: {}", e);
                 }
@@ -435,12 +515,23 @@ Provide a helpful response based on these results. Include relevant details, com
             .await
     }
 
-    /// Generate using local Ollama with streaming
+    /// Generate using the active local LLM backend with streaming.
     async fn local_generate_stream(
         &self,
         prompt: &str,
-    ) -> Result<impl Stream<Item = Result<String>> + Send> {
-        debug!("🧠 Streaming with local LLM (kernel brain)");
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        match self.active_local {
+            Some(ActiveLocalBackend::LlamaCpp) => self.llama_cpp_generate_stream(prompt).await,
+            Some(ActiveLocalBackend::Ollama) => self.ollama_generate_stream(prompt).await,
+            None => Err(anyhow!("Local LLM is not available")),
+        }
+    }
+
+    async fn ollama_generate_stream(
+        &self,
+        prompt: &str,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        debug!("🧠 Streaming with local Ollama (kernel brain)");
 
         let request = OllamaRequest {
             model: self.config.local_model.clone(),
@@ -450,7 +541,10 @@ Provide a helpful response based on these results. Include relevant details, com
             options: OllamaOptions { num_predict: 2048 },
         };
 
-        let url = format!("{}/api/generate", self.config.ollama_url);
+        let url = format!(
+            "{}/api/generate",
+            self.config.ollama_url.trim_end_matches('/')
+        );
         let response = self.http_client.post(&url).json(&request).send().await?;
 
         if !response.status().is_success() {
@@ -480,7 +574,108 @@ Provide a helpful response based on these results. Include relevant details, com
             }
         });
 
-        Ok(stream)
+        Ok(Box::pin(stream))
+    }
+
+    async fn llama_cpp_generate_stream(
+        &self,
+        prompt: &str,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        debug!("🧠 Streaming with local llama.cpp (kernel brain)");
+
+        let body = serde_json::json!({
+            "model": self.config.local_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.config.local_max_tokens,
+            "stream": true,
+        });
+
+        let url = format!(
+            "{}/chat/completions",
+            self.config.llama_cpp_url.trim_end_matches('/')
+        );
+        let response = self.http_client.post(&url).json(&body).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("llama.cpp API error ({}): {}", status, error_text));
+        }
+
+        struct SseState<S> {
+            inner: S,
+            buf: Vec<u8>,
+            pending: std::collections::VecDeque<String>,
+            done: bool,
+        }
+
+        let state = SseState {
+            inner: response.bytes_stream(),
+            buf: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            done: false,
+        };
+
+        let stream = futures::stream::unfold(state, |mut st| async move {
+            loop {
+                if let Some(chunk) = st.pending.pop_front() {
+                    return Some((Ok(chunk), st));
+                }
+                if st.done {
+                    return None;
+                }
+
+                while let Some(pos) = st.buf.iter().position(|&b| b == b'\n') {
+                    let line_bytes: Vec<u8> = st.buf.drain(..=pos).collect();
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    let line = line.trim_end_matches(['\r', '\n']);
+                    if let Some(data) = line.strip_prefix("data:") {
+                        let data = data.trim_start();
+                        if data == "[DONE]" {
+                            st.done = true;
+                            break;
+                        }
+                        if let Some(delta) = extract_llama_cpp_sse_delta(data) {
+                            st.pending.push_back(delta);
+                        }
+                    }
+                }
+
+                if let Some(chunk) = st.pending.pop_front() {
+                    return Some((Ok(chunk), st));
+                }
+                if st.done {
+                    return None;
+                }
+
+                match st.inner.next().await {
+                    Some(Ok(bytes)) => st.buf.extend_from_slice(&bytes),
+                    Some(Err(e)) => {
+                        st.done = true;
+                        return Some((Err(anyhow!("llama.cpp stream error: {}", e)), st));
+                    }
+                    None => {
+                        st.done = true;
+                        if !st.buf.is_empty() {
+                            let line = String::from_utf8_lossy(&st.buf).to_string();
+                            st.buf.clear();
+                            if let Some(data) =
+                                line.trim_end_matches(['\r', '\n']).strip_prefix("data:")
+                            {
+                                let data = data.trim_start();
+                                if data != "[DONE]" {
+                                    if let Some(delta) = extract_llama_cpp_sse_delta(data) {
+                                        return Some((Ok(delta), st));
+                                    }
+                                }
+                            }
+                        }
+                        return None;
+                    }
+                }
+            }
+        });
+
+        Ok(Box::pin(stream))
     }
 
     /// Generate using cloud API with streaming
@@ -917,7 +1112,7 @@ Reply (1-2 sentences max):"#,
             match self.cloud_generate(prompt).await {
                 Ok(response) => Ok(response),
                 Err(e) => {
-                    if self.local_available {
+                    if self.is_local_available() {
                         warn!("Cloud failed, falling back to local: {}", e);
                         self.local_generate(prompt).await
                     } else {
@@ -927,7 +1122,7 @@ Reply (1-2 sentences max):"#,
             }
         } else {
             // Local first mode
-            if self.local_available {
+            if self.is_local_available() {
                 match self.local_generate(prompt).await {
                     Ok(response) => Ok(response),
                     Err(e) => {
@@ -960,7 +1155,7 @@ Reply (1-2 sentences max):"#,
         let start = std::time::Instant::now();
         let router = AutoRouter::new(
             self.config.router.clone(),
-            self.local_available,
+            self.is_local_available(),
             self.has_cloud_api().await,
         );
         let spent_today = self.spend_tracker.spent_today_usd().await;
@@ -1008,9 +1203,17 @@ Reply (1-2 sentences max):"#,
         result
     }
 
-    /// Generate using local Ollama - the primary brain of Mycel OS    /// Generate using local Ollama - the primary brain of Mycel OS
+    /// Generate using the active local LLM backend - the primary brain of Mycel OS
     async fn local_generate(&self, prompt: &str) -> Result<String> {
-        debug!("🧠 Generating with local LLM (kernel brain)");
+        match self.active_local {
+            Some(ActiveLocalBackend::LlamaCpp) => self.llama_cpp_generate(prompt).await,
+            Some(ActiveLocalBackend::Ollama) => self.ollama_generate(prompt).await,
+            None => Err(anyhow!("Local LLM is not available")),
+        }
+    }
+
+    async fn ollama_generate(&self, prompt: &str) -> Result<String> {
+        debug!("🧠 Generating with local Ollama (kernel brain)");
 
         let request = OllamaRequest {
             model: self.config.local_model.clone(),
@@ -1020,7 +1223,10 @@ Reply (1-2 sentences max):"#,
             options: OllamaOptions { num_predict: 2048 },
         };
 
-        let url = format!("{}/api/generate", self.config.ollama_url);
+        let url = format!(
+            "{}/api/generate",
+            self.config.ollama_url.trim_end_matches('/')
+        );
         let response = self.http_client.post(&url).json(&request).send().await?;
 
         // Save status code before consuming response
@@ -1044,6 +1250,45 @@ Reply (1-2 sentences max):"#,
         ollama_response
             .response
             .ok_or_else(|| anyhow!("Ollama returned empty response"))
+    }
+
+    async fn llama_cpp_generate(&self, prompt: &str) -> Result<String> {
+        debug!("🧠 Generating with local llama.cpp (kernel brain)");
+
+        let body = serde_json::json!({
+            "model": self.config.local_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.config.local_max_tokens,
+            "stream": false,
+        });
+
+        let url = format!(
+            "{}/chat/completions",
+            self.config.llama_cpp_url.trim_end_matches('/')
+        );
+        let response = self.http_client.post(&url).json(&body).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("llama.cpp API error ({}): {}", status, error_text));
+        }
+
+        let payload: serde_json::Value = response.json().await?;
+        let content = payload
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c0| c0.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|t| t.as_str())
+            .map(str::to_string);
+
+        match content {
+            Some(text) if !text.is_empty() => Ok(text),
+            Some(_) => Err(anyhow!("llama.cpp returned empty content")),
+            None => Err(anyhow!(
+                "llama.cpp response missing choices[0].message.content"
+            )),
+        }
     }
 
     /// Generate using the active cloud provider
@@ -1129,8 +1374,8 @@ Reply (1-2 sentences max):"#,
             // conservative for privacy, which is the safe direction).
             LlmProvider::Auto => self.smart_generate_routed(prompt, prompt, "").await,
             LlmProvider::Local => {
-                if !self.local_available {
-                    return Err(anyhow!("Local LLM (Ollama) is not available"));
+                if !self.is_local_available() {
+                    return Err(anyhow!("Local LLM is not available"));
                 }
                 self.local_generate(prompt).await
             }
@@ -1245,13 +1490,29 @@ Provide a concise final response based on these tool results."#,
 
     /// Check if local LLM is available
     pub fn is_local_available(&self) -> bool {
-        self.local_available
+        self.active_local.is_some()
+    }
+
+    /// Name of the active local LLM backend, if any (`"ollama"` or `"llama-cpp"`).
+    pub fn active_local_backend(&self) -> Option<&'static str> {
+        self.active_local.map(ActiveLocalBackend::as_str)
     }
 
     /// Check if cloud API is available
     async fn has_cloud_api(&self) -> bool {
         self.active_cloud.read().await.is_some()
     }
+}
+
+fn extract_llama_cpp_sse_delta(data: &str) -> Option<String> {
+    let val: serde_json::Value = serde_json::from_str(data).ok()?;
+    val.get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c0| c0.get("delta"))
+        .and_then(|d| d.get("content"))
+        .and_then(|t| t.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 // Request/Response types for Ollama
@@ -1336,5 +1597,243 @@ mod tests {
                 // We don't fail the test because CI environments might not have Ollama
             }
         }
+    }
+
+    async fn spawn_mock_llama_cpp_server(
+        models_ok: bool,
+        health_ok: bool,
+    ) -> (std::net::SocketAddr, Arc<tokio::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let recorded_paths = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_clone = Arc::clone(&recorded_paths);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorded = Arc::clone(&recorded_clone);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let header_end = loop {
+                        let n = match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let header_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let content_length = header_str
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if k.eq_ignore_ascii_case("content-length") {
+                                v.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < header_end + content_length {
+                        let n = match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let req_line = header_str.lines().next().unwrap_or("");
+                    let path = req_line.split_whitespace().nth(1).unwrap_or("");
+                    let body_str = String::from_utf8_lossy(
+                        &buf[header_end..buf.len().min(header_end + content_length)],
+                    )
+                    .to_string();
+                    recorded.lock().await.push(path.to_string());
+
+                    if path == "/v1/models" {
+                        let status = if models_ok { "200 OK" } else { "404 Not Found" };
+                        let body = if models_ok {
+                            r#"{"data":[{"id":"qwen3:8b"}]}"#
+                        } else {
+                            r#"{"error":"not found"}"#
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            status,
+                            body.len(),
+                            body
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    } else if path == "/health" {
+                        let status = if health_ok {
+                            "200 OK"
+                        } else {
+                            "503 Service Unavailable"
+                        };
+                        let body = if health_ok {
+                            r#"{"status":"ok"}"#
+                        } else {
+                            r#"{"status":"unavailable"}"#
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            status,
+                            body.len(),
+                            body
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    } else if path == "/v1/chat/completions" {
+                        let is_stream = body_str.contains("\"stream\":true")
+                            || body_str.contains("\"stream\": true");
+                        if is_stream {
+                            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                            let _ = socket.write_all(headers.as_bytes()).await;
+                            let _ = socket.flush().await;
+
+                            // Intentionally split SSE line across two TCP writes to verify buffering.
+                            let part1 = b"data: {\"choices\":[{\"delta\":{\"content\":\"hel";
+                            let part2 = b"lo \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"llama\"}}]}\n\ndata: [DONE]\n\n";
+                            let _ = socket.write_all(part1).await;
+                            let _ = socket.flush().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            let _ = socket.write_all(part2).await;
+                            let _ = socket.flush().await;
+                        } else {
+                            let body = r#"{"choices":[{"message":{"role":"assistant","content":"local-llamacpp-ok"}}]}"#;
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                        }
+                    } else {
+                        let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    }
+                });
+            }
+        });
+
+        (addr, recorded_paths)
+    }
+
+    async fn closed_localhost_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{}", addr)
+    }
+
+    fn offline_test_config(
+        backend: LocalBackend,
+        llama_cpp_url: String,
+        ollama_url: String,
+    ) -> MycelConfig {
+        MycelConfig {
+            local_backend: backend,
+            llama_cpp_url,
+            ollama_url,
+            openrouter_api_key: String::new(),
+            cloud_provider: String::new(),
+            providers: std::collections::HashMap::new(),
+            prefer_cloud: false,
+            context_path: std::env::temp_dir()
+                .join(format!("mycel-test-{}", uuid::Uuid::new_v4()))
+                .to_string_lossy()
+                .to_string(),
+            ..MycelConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_llama_cpp_non_streaming_and_sse_streaming() {
+        let (addr, recorded) = spawn_mock_llama_cpp_server(true, true).await;
+        let closed_ollama = closed_localhost_url().await;
+        let config = offline_test_config(
+            LocalBackend::LlamaCpp,
+            format!("http://{}/v1", addr),
+            closed_ollama,
+        );
+
+        let router = AiRouter::new(&config).await.unwrap();
+        assert!(router.is_local_available());
+        assert_eq!(router.active_local_backend(), Some("llama-cpp"));
+
+        let reply = router.local_generate("hello").await.unwrap();
+        assert_eq!(reply, "local-llamacpp-ok");
+
+        let via_provider = router
+            .generate_with_provider("hello", crate::ipc::LlmProvider::Local)
+            .await
+            .unwrap();
+        assert_eq!(via_provider, "local-llamacpp-ok");
+
+        let mut stream = router.smart_generate_stream("hello", false).await.unwrap();
+        let mut collected = String::new();
+        while let Some(chunk) = stream.next().await {
+            collected.push_str(&chunk.unwrap());
+        }
+        assert_eq!(collected, "hello llama");
+
+        let paths = recorded.lock().await;
+        assert!(paths.iter().any(|p| p == "/v1/models"));
+        assert!(paths.iter().any(|p| p == "/v1/chat/completions"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_backend_falls_back_to_llama_cpp_health_when_ollama_unreachable() {
+        // /v1/models returns 404, /health returns 200 -> probe_llama_cpp must succeed via /health.
+        let (addr, recorded) = spawn_mock_llama_cpp_server(false, true).await;
+        let closed_ollama = closed_localhost_url().await;
+        let config = offline_test_config(
+            LocalBackend::Auto,
+            format!("http://{}/v1", addr),
+            closed_ollama,
+        );
+
+        let router = AiRouter::new(&config).await.unwrap();
+        assert!(router.is_local_available());
+        assert_eq!(router.active_local_backend(), Some("llama-cpp"));
+
+        let reply = router.local_generate("status").await.unwrap();
+        assert_eq!(reply, "local-llamacpp-ok");
+
+        let paths = recorded.lock().await;
+        assert!(paths.iter().any(|p| p == "/v1/models"));
+        assert!(paths.iter().any(|p| p == "/health"));
+    }
+
+    #[tokio::test]
+    async fn test_privacy_sensitive_query_stays_local_on_llama_cpp() {
+        let (addr, recorded) = spawn_mock_llama_cpp_server(true, true).await;
+        let closed_ollama = closed_localhost_url().await;
+        let config = offline_test_config(
+            LocalBackend::Auto,
+            format!("http://{}/v1", addr),
+            closed_ollama,
+        );
+
+        let router = AiRouter::new(&config).await.unwrap();
+        assert_eq!(router.active_local_backend(), Some("llama-cpp"));
+
+        let reply = router
+            .generate_with_provider(
+                "Please inspect ~/.ssh/id_rsa permissions",
+                crate::ipc::LlmProvider::Auto,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, "local-llamacpp-ok");
+
+        let paths = recorded.lock().await;
+        assert!(paths.iter().any(|p| p == "/v1/chat/completions"));
     }
 }
