@@ -115,12 +115,82 @@ if [ "$PROFILE" = "desktop" ] || [ "$PROFILE" = "full" ]; then
     done
 fi
 
+echo "[2c/3] Ensuring native Void musl llama-server binary..."
+LLAMA_CACHE_DIR="$PROJECT_DIR/build/llama-cpp"
+LLAMA_SRC_DIR="$LLAMA_CACHE_DIR/src"
+LLAMA_BIN="$LLAMA_CACHE_DIR/llama-server"
+mkdir -p "$LLAMA_CACHE_DIR"
+
+if [ ! -x "$LLAMA_BIN" ] || [ "${REBUILD_LLAMA_CPP:-0}" = "1" ]; then
+    docker run --rm \
+        -u "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -e LLAMA_CPP_REF="${LLAMA_CPP_REF:-}" \
+        -v "$PROJECT_DIR:/workspace" \
+        mycel-iso-builder \
+        bash -c '
+            set -eo pipefail
+            SRC="/workspace/build/llama-cpp/src"
+            BUILD="/workspace/build/llama-cpp/build"
+            OUT="/workspace/build/llama-cpp/llama-server"
+            if [ ! -d "$SRC/.git" ]; then
+                rm -rf "$SRC"
+                if [ -n "$LLAMA_CPP_REF" ]; then
+                    git clone --depth 1 --branch "$LLAMA_CPP_REF" https://github.com/ggml-org/llama.cpp.git "$SRC"
+                else
+                    git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "$SRC"
+                fi
+            fi
+            cmake -S "$SRC" -B "$BUILD" \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_SHARED_LIBS=OFF \
+                -DGGML_NATIVE=OFF \
+                -DLLAMA_CURL=OFF \
+                -DLLAMA_BUILD_TESTS=OFF \
+                -DLLAMA_BUILD_EXAMPLES=OFF \
+                -DGGML_OPENMP=OFF \
+                -DCMAKE_EXE_LINKER_FLAGS="-static"
+            cmake --build "$BUILD" --target llama-server -j"$(nproc)"
+            cp "$BUILD/bin/llama-server" "$OUT"
+            chmod 0755 "$OUT"
+        '
+else
+    echo "Using cached llama-server at $LLAMA_BIN (set REBUILD_LLAMA_CPP=1 to rebuild)"
+fi
+
+if [ ! -x "$LLAMA_BIN" ]; then
+    echo "ERROR: Expected llama-server binary not found at $LLAMA_BIN" >&2
+    exit 1
+fi
+
+echo "Verifying static Void musl linkage of $LLAMA_BIN:"
+file "$LLAMA_BIN"
+if command -v ldd &> /dev/null; then
+    if ldd "$LLAMA_BIN" 2>&1 | grep -q "libc\.so\.6"; then
+        echo "ERROR: llama-server is dynamically linked against glibc!" >&2
+        exit 1
+    fi
+fi
+
 echo "[3/3] Running void-mklive ISO build (profile=$PROFILE)..."
-docker run --rm \
-    --privileged \
-    -v "$PROJECT_DIR:/workspace:ro" \
-    -v "$OUTPUT_DIR:/output" \
-    -e PROFILE="$PROFILE" \
+DOCKER_ISO_ARGS=(
+    --rm
+    --privileged
+    -v "$PROJECT_DIR:/workspace:ro"
+    -v "$OUTPUT_DIR:/output"
+    -e PROFILE="$PROFILE"
+)
+if [ -n "${MYCEL_GGUF_MODEL:-}" ] && [ -r "$MYCEL_GGUF_MODEL" ]; then
+    HOST_GGUF_ABS="$(cd "$(dirname "$MYCEL_GGUF_MODEL")" && pwd)/$(basename "$MYCEL_GGUF_MODEL")"
+    GGUF_NAME="${MYCEL_GGUF_NAME:-$(basename "$MYCEL_GGUF_MODEL")}"
+    DOCKER_ISO_ARGS+=(
+        -v "$HOST_GGUF_ABS:/tmp/mycel-model.gguf:ro"
+        -e MYCEL_GGUF_MODEL="/tmp/mycel-model.gguf"
+        -e MYCEL_GGUF_NAME="$GGUF_NAME"
+    )
+fi
+
+docker run "${DOCKER_ISO_ARGS[@]}" \
     mycel-iso-builder \
     /build/void-build-iso.sh "$PROFILE"
 
