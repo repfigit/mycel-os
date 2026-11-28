@@ -47,18 +47,22 @@ struct LoopData {
 /// Run the compositor according to `config`.
 pub fn run_compositor(config: CompositorConfig) -> anyhow::Result<()> {
     if !config.headless {
+        #[cfg(feature = "drm")]
+        {
+            return crate::drm_backend::run_drm(config);
+        }
+        #[cfg(all(feature = "winit", not(feature = "drm")))]
+        {
+            warn!(
+                "Winit backend feature enabled, but only headless/DRM modes are wired; \
+                 falling back to headless mode."
+            );
+        }
         #[cfg(not(any(feature = "winit", feature = "drm")))]
         {
             anyhow::bail!(
                 "No graphical backend compiled in (rebuild with `--features winit` or `--features drm`), \
                  or pass `--headless` to run in headless mode."
-            );
-        }
-        #[cfg(any(feature = "winit", feature = "drm"))]
-        {
-            warn!(
-                "Graphical backend feature enabled, but only headless mode is currently wired; \
-                 falling back to headless mode."
             );
         }
     }

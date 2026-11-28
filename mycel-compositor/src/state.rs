@@ -18,7 +18,7 @@ use smithay::{
             Client, Display, DisplayHandle,
         },
     },
-    utils::{Serial, Transform},
+    utils::{Serial, Transform, SERIAL_COUNTER},
     wayland::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState},
@@ -65,6 +65,7 @@ pub struct MycelCompositorState {
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
     pub seat: Seat<Self>,
+    pub needs_redraw: bool,
 }
 
 impl MycelCompositorState {
@@ -122,6 +123,7 @@ impl MycelCompositorState {
             seat_state,
             data_device_state,
             seat,
+            needs_redraw: true,
         })
     }
 }
@@ -144,6 +146,15 @@ impl CompositorHandler for MycelCompositorState {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        if let Some(window) = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
+            .cloned()
+        {
+            window.on_commit();
+        }
+        self.needs_redraw = true;
     }
 }
 
@@ -159,12 +170,26 @@ impl XdgShellHandler for MycelCompositorState {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        let output_size = self.output.current_mode().map(|m| {
+            m.size
+                .to_logical(self.output.current_scale().integer_scale())
+        });
         surface.with_pending_state(|state| {
+            state.size = output_size;
+            state.states.set(xdg_toplevel::State::Maximized);
             state.states.set(xdg_toplevel::State::Activated);
         });
         let window = Window::new_wayland_window(surface.clone());
         self.space.map_element(window, (0, 0), true);
         surface.send_configure();
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(
+                self,
+                Some(surface.wl_surface().clone()),
+                SERIAL_COUNTER.next_serial(),
+            );
+        }
+        self.needs_redraw = true;
         debug!("Mapped new XDG toplevel and sent initial configure");
     }
 

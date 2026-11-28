@@ -29,7 +29,7 @@ case "$PROFILE" in
         SERVICES="agetty-ttyS0 dhcpcd"
         ;;
     desktop)
-        PACKAGES="base-system linux grub-x86_64-efi grub dhcpcd iproute2 iputils curl ca-certificates bubblewrap python3 wireguard-tools seatd eudev mesa-dri libdrm libxkbcommon libinput pixman wayland dejavu-fonts-ttf"
+        PACKAGES="base-system linux grub-x86_64-efi grub dhcpcd iproute2 iputils curl ca-certificates bubblewrap python3 wireguard-tools seatd libseat eudev mesa-dri libgbm libdrm libxkbcommon libinput pixman wayland dejavu-fonts-ttf fontconfig"
         SERVICES="agetty-ttyS0 dhcpcd udevd seatd"
         ;;
     full)

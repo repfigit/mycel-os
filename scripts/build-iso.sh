@@ -43,6 +43,8 @@ docker build -t mycel-iso-builder -f "$PROJECT_DIR/docker/Dockerfile.void-builde
 
 echo "[2/3] Building static musl mycel-runtime binary..."
 RUNTIME_BIN="$PROJECT_DIR/mycel-runtime/target/x86_64-unknown-linux-musl/release/mycel-runtime"
+CARGO_CACHE_DIR="${CARGO_CACHE_DIR:-$HOME/.cache/mycel-musl-cargo}"
+mkdir -p "$CARGO_CACHE_DIR"
 
 if command -v x86_64-linux-musl-gcc &> /dev/null; then
     (
@@ -57,6 +59,7 @@ else
         -e HOME=/tmp \
         -e CARGO_HOME=/tmp/.cargo \
         -e RUSTFLAGS="-C target-feature=+crt-static" \
+        -v "$CARGO_CACHE_DIR:/tmp/.cargo" \
         -v "$PROJECT_DIR:/workspace" \
         -w /workspace/mycel-runtime \
         mycel-iso-builder \
@@ -83,6 +86,7 @@ if [ "$PROFILE" = "desktop" ] || [ "$PROFILE" = "full" ]; then
         -u "$(id -u):$(id -g)" \
         -e HOME=/tmp \
         -e CARGO_HOME=/tmp/.cargo \
+        -v "$CARGO_CACHE_DIR:/tmp/.cargo" \
         -v "$PROJECT_DIR:/workspace" \
         -w /workspace/mycel-shell \
         mycel-iso-builder \
@@ -96,6 +100,7 @@ if [ "$PROFILE" = "desktop" ] || [ "$PROFILE" = "full" ]; then
         -u "$(id -u):$(id -g)" \
         -e HOME=/tmp \
         -e CARGO_HOME=/tmp/.cargo \
+        -v "$CARGO_CACHE_DIR:/tmp/.cargo" \
         -v "$PROJECT_DIR:/workspace" \
         -w /workspace/mycel-compositor \
         mycel-iso-builder \
