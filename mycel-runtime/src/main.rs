@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
     };
     let executor = executor::CodeExecutor::new(&config)?;
     let policy_evaluator = policy::PolicyEvaluator::with_defaults();
+    let confirmations = policy::ConfirmationStore::new();
     let ui_factory = ui::UiFactory::new(&config)?;
 
     // Create system event bus
@@ -165,6 +166,7 @@ async fn main() -> Result<()> {
         ai_router,
         executor,
         policy_evaluator,
+        confirmations,
         ui_factory,
         sync_service,
         mcp_manager,
@@ -193,7 +195,37 @@ async fn main() -> Result<()> {
         }
     });
 
-    ipc_server.run().await?;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            res = ipc_server.run() => {
+                res?;
+            }
+            res = tokio::signal::ctrl_c() => {
+                res?;
+                tracing::info!("Received SIGINT, shutting down IPC server");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM, shutting down IPC server");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            res = ipc_server.run() => {
+                res?;
+            }
+            res = tokio::signal::ctrl_c() => {
+                res?;
+                tracing::info!("Received SIGINT, shutting down IPC server");
+            }
+        }
+    }
+
+    ipc_server.cleanup();
 
     Ok(())
 }
@@ -206,6 +238,7 @@ pub struct MycelRuntime {
     pub ai_router: ai::AiRouter,
     pub executor: executor::CodeExecutor,
     pub policy_evaluator: policy::PolicyEvaluator,
+    pub confirmations: policy::ConfirmationStore,
     pub ui_factory: ui::UiFactory,
     pub sync_service: sync::SyncService,
     pub mcp_manager: mcp::McpManager,
@@ -300,6 +333,9 @@ impl MycelRuntime {
                 self.context_manager
                     .clear_pending_command(session_id)
                     .await?;
+                self.confirmations
+                    .clear_matching_code(session_id, pending_code)
+                    .await;
                 let report = self.executor.run_detailed(pending_code).await?;
                 if !report.succeeded() {
                     let class = recovery::classify_failure(&report);
@@ -311,6 +347,9 @@ impl MycelRuntime {
                 self.context_manager
                     .clear_pending_command(session_id)
                     .await?;
+                self.confirmations
+                    .clear_matching_code(session_id, pending_code)
+                    .await;
                 return Ok(RuntimeResponse::Text("action cancelled.".to_string()));
             } else {
                 // User typed something else - inform them they have a pending action
@@ -428,9 +467,22 @@ impl MycelRuntime {
             ActionPolicy::Allow => self.run_and_recover(code).await,
             ActionPolicy::RequiresConfirmation { message, .. } => {
                 // Store in session and ask user
+                self.context_manager.get_context(session_id).await?;
                 self.context_manager
                     .set_pending_command(session_id, Some(code.to_string()))
                     .await?;
+                let pending = self
+                    .confirmations
+                    .insert(session_id, "execute_code", code, &message)
+                    .await;
+                let _ = self
+                    .event_bus
+                    .send(events::SystemEvent::ConfirmationRequired {
+                        id: pending.id,
+                        session_id: session_id.to_string(),
+                        command: code.to_string(),
+                        reason: message.clone(),
+                    });
                 Ok(RuntimeResponse::Text(format!(
                     "{}\ncode: {}",
                     message, code
@@ -1413,6 +1465,7 @@ mod tests {
         let ai_router = ai::AiRouter::cloud_only(&config).await.unwrap();
         let executor = executor::CodeExecutor::new(&config).unwrap();
         let policy_evaluator = policy::PolicyEvaluator::with_defaults();
+        let confirmations = policy::ConfirmationStore::new();
         let ui_factory = ui::UiFactory::new(&config).unwrap();
         let (event_bus, _) = tokio::sync::broadcast::channel(16);
         let mcp_manager = mcp::McpManager::new(&config.mcp, ".", event_bus.clone())
@@ -1431,6 +1484,7 @@ mod tests {
             ai_router,
             executor,
             policy_evaluator,
+            confirmations,
             ui_factory,
             sync_service,
             mcp_manager,

@@ -13,6 +13,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -96,45 +97,118 @@ impl RateLimiter {
     }
 }
 
+/// Compute the auth token file path corresponding to a Unix socket path.
+pub fn token_path_for_socket(socket_path: &str) -> PathBuf {
+    Path::new(socket_path).with_extension("token")
+}
+
+fn write_token_atomically(token_path: &Path, token: &str) -> Result<()> {
+    let parent = match token_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let file_name = token_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("mycel");
+    let tmp_path = parent.join(format!(".{}.tmp.{}", file_name, uuid::Uuid::new_v4()));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let write_res = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = opts.open(&tmp_path)?;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, token_path)?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+
+    Ok(())
+}
+
 /// IPC Server for Mycel Runtime
 pub struct IpcServer {
     listener: UnixListener,
     runtime: Arc<MycelRuntime>,
     auth_token: String,
+    socket_path: PathBuf,
+    token_path: PathBuf,
 }
 
 impl IpcServer {
     pub async fn new(runtime: &MycelRuntime) -> Result<Self> {
-        let socket_path = &runtime.config.ipc_socket_path;
+        let socket_path = PathBuf::from(&runtime.config.ipc_socket_path);
+        let token_path = token_path_for_socket(&runtime.config.ipc_socket_path);
+
+        if let Some(parent) = socket_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
 
         // Remove existing socket if present
-        let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_file(&socket_path);
 
-        let listener = UnixListener::bind(socket_path)?;
+        let listener = UnixListener::bind(&socket_path)?;
 
         // Set socket permissions to 0600 (owner read/write only)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let permissions = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(socket_path, permissions)?;
+            std::fs::set_permissions(&socket_path, permissions)?;
             info!("IPC socket permissions set to 0600");
         }
 
         // Generate authentication token (never log the secret token)
         let auth_token = uuid::Uuid::new_v4().to_string();
-        info!("IPC server listening on {}", socket_path);
+        if let Err(e) = write_token_atomically(&token_path, &auth_token) {
+            let _ = std::fs::remove_file(&socket_path);
+            return Err(e);
+        }
+        info!("IPC auth token written to {}", token_path.display());
+        info!("IPC server listening on {}", socket_path.display());
 
         Ok(Self {
             listener,
             runtime: Arc::new(runtime.clone()),
             auth_token,
+            socket_path,
+            token_path,
         })
     }
 
     /// Get the authentication token (for clients)
     pub fn auth_token(&self) -> &str {
         &self.auth_token
+    }
+
+    /// Get the auth token file path
+    pub fn token_path(&self) -> &Path {
+        &self.token_path
+    }
+
+    /// Remove the auth token file and Unix socket, ignoring NotFound errors.
+    pub fn cleanup(&self) {
+        for path in [&self.token_path, &self.socket_path] {
+            if let Err(e) = std::fs::remove_file(path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!("Failed to remove {}: {}", path.display(), e);
+                }
+            }
+        }
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -154,6 +228,12 @@ impl IpcServer {
                 }
             }
         }
+    }
+}
+
+impl Drop for IpcServer {
+    fn drop(&mut self) {
+        self.cleanup();
     }
 }
 
@@ -407,6 +487,25 @@ async fn handle_connection(
                                     }
                                 }
                             }
+                            IpcRequest::Subscribe { events } => {
+                                // Subscribe BEFORE sending the Ok ack so no post-ack events are lost.
+                                let rx = runtime.event_bus.subscribe();
+                                let ack = IpcResponse::Ok {
+                                    message: "Subscribed to system events".to_string(),
+                                };
+                                if send_response(&writer, &ack).await.is_err() {
+                                    break;
+                                }
+                                handle_subscribe_loop(
+                                    &mut reader,
+                                    &writer,
+                                    &mut line_buf,
+                                    rx,
+                                    events.clone(),
+                                )
+                                .await;
+                                break;
+                            }
                             _ => {
                                 let response =
                                     process_request(&request, &runtime, &mut session_id).await;
@@ -438,6 +537,109 @@ async fn handle_connection(
 
     debug!("IPC connection closed, session: {}", session_id);
     Ok(())
+}
+
+async fn send_response(
+    writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    response: &IpcResponse,
+) -> Result<()> {
+    let json = serde_json::to_string(response)? + "\n";
+    let mut w = writer.lock().await;
+    w.write_all(json.as_bytes()).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+async fn handle_subscribe_loop<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    line_buf: &mut LineBuffer,
+    mut rx: tokio::sync::broadcast::Receiver<crate::events::SystemEvent>,
+    events: Option<Vec<String>>,
+) {
+    loop {
+        tokio::select! {
+            recv_res = rx.recv() => {
+                match recv_res {
+                    Ok(event) => {
+                        let matches = match &events {
+                            None => true,
+                            Some(filter) => filter.iter().any(|k| k == event.kind()),
+                        };
+                        if matches {
+                            let resp = IpcResponse::Event { event };
+                            if send_response(writer, &resp).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!("IPC subscriber lagged by {} events", skipped);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+            read_res = read_bounded_line(reader, line_buf, MAX_MESSAGE_SIZE) => {
+                match read_res {
+                    Ok(BoundedRead::Eof) => break,
+                    Ok(BoundedRead::TooLarge(n)) => {
+                        warn!("Message exceeds size limit ({} bytes) in subscribe mode", n);
+                        let _ = send_response(
+                            writer,
+                            &IpcResponse::Error {
+                                message: format!("Message too large: exceeds max {} bytes", MAX_MESSAGE_SIZE),
+                            },
+                        ).await;
+                        break;
+                    }
+                    Ok(BoundedRead::Line) => {
+                        if line_buf.as_str().trim().is_empty() {
+                            continue;
+                        }
+                        let err_resp = IpcResponse::Error {
+                            message: "Connection is in push-only subscribe mode".to_string(),
+                        };
+                        if send_response(writer, &err_resp).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn execute_and_report(runtime: &MycelRuntime, code: &str) -> IpcResponse {
+    match runtime.executor.run_detailed(code).await {
+        Ok(report) => {
+            if !report.succeeded() {
+                let class = crate::recovery::classify_failure(&report);
+                let _ = runtime
+                    .event_bus
+                    .send(crate::events::SystemEvent::ExecutionFailed {
+                        language: report.language.as_str().to_string(),
+                        failure_class: class.as_str().to_string(),
+                        exit_code: report.exit_code,
+                        signal: report.signal,
+                        timed_out: report.timed_out,
+                        sandbox_mode: report.sandbox_mode.as_str().to_string(),
+                    });
+            }
+            IpcResponse::CodeResult {
+                code: code.to_string(),
+                output: report.combined_output(),
+                success: report.succeeded(),
+            }
+        }
+        Err(e) => IpcResponse::CodeResult {
+            code: code.to_string(),
+            output: e.to_string(),
+            success: false,
+        },
+    }
 }
 
 async fn process_request(
@@ -487,45 +689,46 @@ async fn process_request(
         IpcRequest::ExecuteCode { code } => {
             // Gate direct execution through the policy evaluator, same as the
             // chat flow. Denied commands are rejected outright; commands
-            // requiring confirmation are refused here (IPC has no interactive
-            // prompt) with an explanatory message.
+            // requiring confirmation are stored in ConfirmationStore and
+            // returned as structured ConfirmationRequired responses.
             use crate::policy::ActionPolicy;
             match runtime.policy_evaluator.evaluate_code(code) {
-                ActionPolicy::Allow => match runtime.executor.run_detailed(code).await {
-                    Ok(report) => {
-                        if !report.succeeded() {
-                            let class = crate::recovery::classify_failure(&report);
-                            let _ = runtime.event_bus.send(
-                                crate::events::SystemEvent::ExecutionFailed {
-                                    language: report.language.as_str().to_string(),
-                                    failure_class: class.as_str().to_string(),
-                                    exit_code: report.exit_code,
-                                    signal: report.signal,
-                                    timed_out: report.timed_out,
-                                    sandbox_mode: report.sandbox_mode.as_str().to_string(),
-                                },
-                            );
-                        }
-                        IpcResponse::CodeResult {
-                            code: code.clone(),
-                            output: report.combined_output(),
-                            success: report.succeeded(),
-                        }
+                ActionPolicy::Allow => execute_and_report(runtime, code).await,
+                ActionPolicy::RequiresConfirmation { message, .. } => {
+                    if let Err(e) = runtime.context_manager.get_context(session_id).await {
+                        return IpcResponse::Error {
+                            message: e.to_string(),
+                        };
                     }
-                    Err(e) => IpcResponse::CodeResult {
+                    if let Err(e) = runtime
+                        .context_manager
+                        .set_pending_command(session_id, Some(code.clone()))
+                        .await
+                    {
+                        return IpcResponse::Error {
+                            message: e.to_string(),
+                        };
+                    }
+                    let pending = runtime
+                        .confirmations
+                        .insert(session_id, "execute_code", code, &message)
+                        .await;
+                    let _ =
+                        runtime
+                            .event_bus
+                            .send(crate::events::SystemEvent::ConfirmationRequired {
+                                id: pending.id.clone(),
+                                session_id: session_id.clone(),
+                                command: code.clone(),
+                                reason: message.clone(),
+                            });
+                    IpcResponse::ConfirmationRequired {
+                        id: pending.id,
+                        action: pending.action,
                         code: code.clone(),
-                        output: e.to_string(),
-                        success: false,
-                    },
-                },
-                ActionPolicy::RequiresConfirmation { message, .. } => IpcResponse::CodeResult {
-                    code: code.clone(),
-                    output: format!(
-                        "requires confirmation (use chat flow to approve): {}",
-                        message
-                    ),
-                    success: false,
-                },
+                        reason: message,
+                    }
+                }
                 ActionPolicy::Deny { reason } => IpcResponse::CodeResult {
                     code: code.clone(),
                     output: format!("denied by policy: {}", reason),
@@ -533,6 +736,37 @@ async fn process_request(
                 },
             }
         }
+        IpcRequest::ConfirmAction { id, approved } => {
+            match runtime.confirmations.take_for_session(id, session_id).await {
+                Err(crate::policy::ConfirmationLookupError::NotFound)
+                | Err(crate::policy::ConfirmationLookupError::WrongSession) => IpcResponse::Error {
+                    message: "Confirmation not found".to_string(),
+                },
+                Err(crate::policy::ConfirmationLookupError::Expired) => IpcResponse::Error {
+                    message: "Confirmation expired".to_string(),
+                },
+                Ok(pending) => {
+                    if let Ok(ctx) = runtime.context_manager.get_context(session_id).await {
+                        if ctx.pending_command.as_deref() == Some(pending.code.as_str()) {
+                            let _ = runtime
+                                .context_manager
+                                .clear_pending_command(session_id)
+                                .await;
+                        }
+                    }
+                    if !approved {
+                        IpcResponse::Ok {
+                            message: format!("Action {} denied", pending.id),
+                        }
+                    } else {
+                        execute_and_report(runtime, &pending.code).await
+                    }
+                }
+            }
+        }
+        IpcRequest::Subscribe { .. } => IpcResponse::Error {
+            message: "Internal error: Subscribe should be handled by connection loop".to_string(),
+        },
         IpcRequest::Ping => IpcResponse::Pong,
     }
 }
@@ -571,6 +805,13 @@ pub enum IpcRequest {
     Status,
     /// Direct code execution
     ExecuteCode { code: String },
+    /// Confirm or deny a pending policy-gated action
+    ConfirmAction { id: String, approved: bool },
+    /// Subscribe to pushed system events (switches connection to push-only mode)
+    Subscribe {
+        #[serde(default)]
+        events: Option<Vec<String>>,
+    },
     /// Ping for health check (allowed without auth)
     Ping,
 }
@@ -605,6 +846,15 @@ pub enum IpcResponse {
         llm_model: String,
         #[serde(default)]
         cloud_spend_usd: f64,
+    },
+    /// Pushed system event (in Subscribe mode)
+    Event { event: crate::events::SystemEvent },
+    /// Structured confirmation prompt for policy-gated actions
+    ConfirmationRequired {
+        id: String,
+        action: String,
+        code: String,
+        reason: String,
     },
     /// Generic OK response
     Ok { message: String },
@@ -814,6 +1064,9 @@ mod tests {
             r#"{"type":"GetContext"}"#,
             r#"{"type":"Status"}"#,
             r#"{"type":"ExecuteCode","code":"ls"}"#,
+            r#"{"type":"ConfirmAction","id":"conf-1","approved":true}"#,
+            r#"{"type":"Subscribe"}"#,
+            r#"{"type":"Subscribe","events":["ConfirmationRequired"]}"#,
             r#"{"type":"Ping"}"#,
         ];
 
@@ -928,6 +1181,7 @@ mod tests {
         let ai_router = crate::ai::AiRouter::cloud_only(&config).await.unwrap();
         let executor = crate::executor::CodeExecutor::new(&config).unwrap();
         let policy_evaluator = crate::policy::PolicyEvaluator::with_defaults();
+        let confirmations = crate::policy::ConfirmationStore::new();
         let ui_factory = crate::ui::UiFactory::new(&config).unwrap();
         let (event_bus, _) = tokio::sync::broadcast::channel(16);
         let mcp_manager = crate::mcp::McpManager::new(&config.mcp, ".", event_bus.clone())
@@ -948,6 +1202,7 @@ mod tests {
             ai_router,
             executor,
             policy_evaluator,
+            confirmations,
             ui_factory,
             sync_service,
             mcp_manager,
@@ -995,6 +1250,580 @@ mod tests {
             }
             other => panic!("expected CodeResult, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn read_ipc_response(
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    ) -> IpcResponse {
+        let mut line = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("timed out reading IPC response")
+            .unwrap();
+        assert!(n > 0, "unexpected EOF reading IPC response");
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
+    async fn send_ipc_request(writer: &mut tokio::net::unix::OwnedWriteHalf, req: &IpcRequest) {
+        let json = serde_json::to_string(req).unwrap() + "\n";
+        writer.write_all(json.as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    async fn spawn_test_server(
+        dir: &std::path::Path,
+        runtime: crate::MycelRuntime,
+    ) -> (Arc<IpcServer>, tokio::task::JoinHandle<()>) {
+        let server = Arc::new(IpcServer::new(&runtime).await.unwrap());
+        let server_task = Arc::clone(&server);
+        let handle = tokio::spawn(async move {
+            let _ = server_task.run().await;
+        });
+        // Give the accept loop a moment to start polling
+        tokio::task::yield_now().await;
+        assert!(dir.exists());
+        (server, handle)
+    }
+
+    #[test]
+    fn test_token_path_for_socket() {
+        assert_eq!(
+            token_path_for_socket("/tmp/mycel-dev.sock"),
+            PathBuf::from("/tmp/mycel-dev.token")
+        );
+        assert_eq!(
+            token_path_for_socket("/run/mycel/runtime.sock"),
+            PathBuf::from("/run/mycel/runtime.token")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_atomic_token_file_permissions_and_cleanup_on_drop() {
+        let dir = std::env::temp_dir().join(format!("mycel-ipc-tok-{}", uuid::Uuid::new_v4()));
+        let mut runtime = build_test_runtime(&dir).await;
+        let sock_path = dir.join("nested").join("runtime.sock");
+        runtime.config.ipc_socket_path = sock_path.to_string_lossy().to_string();
+
+        let expected_token_path = dir.join("nested").join("runtime.token");
+        let server = IpcServer::new(&runtime).await.unwrap();
+        assert_eq!(server.token_path(), expected_token_path.as_path());
+        assert!(expected_token_path.exists());
+        assert!(sock_path.exists());
+
+        let token_contents = std::fs::read_to_string(&expected_token_path).unwrap();
+        assert_eq!(token_contents, server.auth_token());
+        assert!(!token_contents.is_empty());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&expected_token_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "token file must have 0600 permissions");
+            let sock_mode = std::fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(sock_mode, 0o600, "socket file must have 0600 permissions");
+        }
+
+        drop(server);
+        assert!(
+            !expected_token_path.exists(),
+            "token file should be removed on drop"
+        );
+        assert!(!sock_path.exists(), "socket file should be removed on drop");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_subscribe_and_confirm_action_rejected() {
+        let dir = std::env::temp_dir().join(format!("mycel-ipc-unauth-{}", uuid::Uuid::new_v4()));
+        let mut runtime = build_test_runtime(&dir).await;
+        let sock_path = dir.join("mycel.sock");
+        runtime.config.ipc_socket_path = sock_path.to_string_lossy().to_string();
+
+        let (server, handle) = spawn_test_server(&dir, runtime).await;
+
+        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+
+        send_ipc_request(&mut w, &IpcRequest::Subscribe { events: None }).await;
+        match read_ipc_response(&mut reader).await {
+            IpcResponse::Error { message } => {
+                assert!(
+                    message.contains("Authentication required"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected Error for unauthenticated Subscribe, got {other:?}"),
+        }
+
+        send_ipc_request(
+            &mut w,
+            &IpcRequest::ConfirmAction {
+                id: "fake-id".to_string(),
+                approved: true,
+            },
+        )
+        .await;
+        match read_ipc_response(&mut reader).await {
+            IpcResponse::Error { message } => {
+                assert!(
+                    message.contains("Authentication required"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected Error for unauthenticated ConfirmAction, got {other:?}"),
+        }
+
+        handle.abort();
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_authenticated_subscribe_unfiltered_filtered_lag_and_eof() {
+        let dir = std::env::temp_dir().join(format!("mycel-ipc-sub-{}", uuid::Uuid::new_v4()));
+        let mut runtime = build_test_runtime(&dir).await;
+        let sock_path = dir.join("mycel.sock");
+        runtime.config.ipc_socket_path = sock_path.to_string_lossy().to_string();
+        let event_bus = runtime.event_bus.clone();
+
+        let (server, handle) = spawn_test_server(&dir, runtime).await;
+        let token = std::fs::read_to_string(server.token_path()).unwrap();
+
+        // 1. Unfiltered subscriber + push-only error on unexpected line + lag survival + clean EOF
+        let stream1 = UnixStream::connect(&sock_path).await.unwrap();
+        let (r1, mut w1) = stream1.into_split();
+        let mut reader1 = BufReader::new(r1);
+
+        send_ipc_request(
+            &mut w1,
+            &IpcRequest::Authenticate {
+                token: token.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_ipc_response(&mut reader1).await,
+            IpcResponse::Ok { .. }
+        ));
+
+        send_ipc_request(&mut w1, &IpcRequest::Subscribe { events: None }).await;
+        assert!(matches!(
+            read_ipc_response(&mut reader1).await,
+            IpcResponse::Ok { .. }
+        ));
+
+        // Emit an event and verify it arrives
+        let _ = event_bus.send(crate::events::SystemEvent::McpServerRestarted {
+            name: "fs".to_string(),
+        });
+        match read_ipc_response(&mut reader1).await {
+            IpcResponse::Event {
+                event: crate::events::SystemEvent::McpServerRestarted { name },
+            } => assert_eq!(name, "fs"),
+            other => panic!("expected Event(McpServerRestarted), got {other:?}"),
+        }
+
+        // Sending a request while in push-only subscribe mode returns Error
+        send_ipc_request(&mut w1, &IpcRequest::Ping).await;
+        match read_ipc_response(&mut reader1).await {
+            IpcResponse::Error { message } => {
+                assert!(
+                    message.contains("push-only subscribe mode"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected push-only Error, got {other:?}"),
+        }
+
+        // Overflow the broadcast channel (capacity 16) to trigger RecvError::Lagged
+        for i in 0..32 {
+            let _ = event_bus.send(crate::events::SystemEvent::McpServerRestarted {
+                name: format!("lag-{i}"),
+            });
+        }
+        // Subscriber must survive lag and still receive subsequent events
+        let _ = event_bus.send(crate::events::SystemEvent::ProviderHealthChanged {
+            provider: "ollama".to_string(),
+            available: true,
+            detail: "post-lag".to_string(),
+        });
+        let mut saw_post_lag = false;
+        for _ in 0..33 {
+            if let IpcResponse::Event {
+                event: crate::events::SystemEvent::ProviderHealthChanged { detail, .. },
+            } = read_ipc_response(&mut reader1).await
+            {
+                if detail == "post-lag" {
+                    saw_post_lag = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_post_lag,
+            "subscriber should survive lag and receive post-lag event"
+        );
+
+        // Close client cleanly (EOF)
+        drop(w1);
+        drop(reader1);
+
+        // 2. Filtered subscriber: only ProviderHealthChanged
+        let stream2 = UnixStream::connect(&sock_path).await.unwrap();
+        let (r2, mut w2) = stream2.into_split();
+        let mut reader2 = BufReader::new(r2);
+
+        send_ipc_request(&mut w2, &IpcRequest::Authenticate { token }).await;
+        assert!(matches!(
+            read_ipc_response(&mut reader2).await,
+            IpcResponse::Ok { .. }
+        ));
+
+        send_ipc_request(
+            &mut w2,
+            &IpcRequest::Subscribe {
+                events: Some(vec!["ProviderHealthChanged".to_string()]),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_ipc_response(&mut reader2).await,
+            IpcResponse::Ok { .. }
+        ));
+
+        let _ = event_bus.send(crate::events::SystemEvent::McpServerRestarted {
+            name: "ignored".to_string(),
+        });
+        let _ = event_bus.send(crate::events::SystemEvent::ProviderHealthChanged {
+            provider: "claude".to_string(),
+            available: true,
+            detail: "matched".to_string(),
+        });
+
+        match read_ipc_response(&mut reader2).await {
+            IpcResponse::Event {
+                event:
+                    crate::events::SystemEvent::ProviderHealthChanged {
+                        provider, detail, ..
+                    },
+            } => {
+                assert_eq!(provider, "claude");
+                assert_eq!(detail, "matched");
+            }
+            other => panic!("expected filtered ProviderHealthChanged, got {other:?}"),
+        }
+
+        handle.abort();
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_structured_confirmation_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("mycel-ipc-conf-{}", uuid::Uuid::new_v4()));
+        let mut runtime = build_test_runtime(&dir).await;
+        let sock_path = dir.join("mycel.sock");
+        runtime.config.ipc_socket_path = sock_path.to_string_lossy().to_string();
+
+        let target_approve = dir.join("target_approve");
+        let target_deny = dir.join("target_deny");
+        std::fs::create_dir_all(&target_approve).unwrap();
+        std::fs::create_dir_all(&target_deny).unwrap();
+
+        let (server, handle) = spawn_test_server(&dir, runtime).await;
+        let token = std::fs::read_to_string(server.token_path()).unwrap();
+
+        // Subscriber to observe ConfirmationRequired push event
+        let sub_stream = UnixStream::connect(&sock_path).await.unwrap();
+        let (sub_r, mut sub_w) = sub_stream.into_split();
+        let mut sub_reader = BufReader::new(sub_r);
+        send_ipc_request(
+            &mut sub_w,
+            &IpcRequest::Authenticate {
+                token: token.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_ipc_response(&mut sub_reader).await,
+            IpcResponse::Ok { .. }
+        ));
+        send_ipc_request(
+            &mut sub_w,
+            &IpcRequest::Subscribe {
+                events: Some(vec!["ConfirmationRequired".to_string()]),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_ipc_response(&mut sub_reader).await,
+            IpcResponse::Ok { .. }
+        ));
+
+        // Session A client
+        let stream_a = UnixStream::connect(&sock_path).await.unwrap();
+        let (r_a, mut w_a) = stream_a.into_split();
+        let mut reader_a = BufReader::new(r_a);
+        send_ipc_request(
+            &mut w_a,
+            &IpcRequest::Authenticate {
+                token: token.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_ipc_response(&mut reader_a).await,
+            IpcResponse::Ok { .. }
+        ));
+        send_ipc_request(
+            &mut w_a,
+            &IpcRequest::SetSession {
+                id: "sess-a".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_ipc_response(&mut reader_a).await,
+            IpcResponse::Ok { .. }
+        ));
+
+        // Session B client (wrong session)
+        let stream_b = UnixStream::connect(&sock_path).await.unwrap();
+        let (r_b, mut w_b) = stream_b.into_split();
+        let mut reader_b = BufReader::new(r_b);
+        send_ipc_request(
+            &mut w_b,
+            &IpcRequest::Authenticate {
+                token: token.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_ipc_response(&mut reader_b).await,
+            IpcResponse::Ok { .. }
+        ));
+        send_ipc_request(
+            &mut w_b,
+            &IpcRequest::SetSession {
+                id: "sess-b".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_ipc_response(&mut reader_b).await,
+            IpcResponse::Ok { .. }
+        ));
+
+        // 1. Session A triggers ExecuteCode needing confirmation
+        let cmd_approve = format!("rm -rf {}", target_approve.display());
+        send_ipc_request(
+            &mut w_a,
+            &IpcRequest::ExecuteCode {
+                code: cmd_approve.clone(),
+            },
+        )
+        .await;
+        let conf_id = match read_ipc_response(&mut reader_a).await {
+            IpcResponse::ConfirmationRequired {
+                id,
+                action,
+                code,
+                reason,
+            } => {
+                assert_eq!(action, "execute_code");
+                assert_eq!(code, cmd_approve);
+                assert!(!reason.is_empty());
+                id
+            }
+            other => panic!("expected ConfirmationRequired, got {other:?}"),
+        };
+        assert!(
+            target_approve.exists(),
+            "command must not run before confirmation"
+        );
+
+        // Verify pushed SystemEvent::ConfirmationRequired
+        match read_ipc_response(&mut sub_reader).await {
+            IpcResponse::Event {
+                event:
+                    crate::events::SystemEvent::ConfirmationRequired {
+                        id,
+                        session_id,
+                        command,
+                        ..
+                    },
+            } => {
+                assert_eq!(id, conf_id);
+                assert_eq!(session_id, "sess-a");
+                assert_eq!(command, cmd_approve);
+            }
+            other => panic!("expected pushed ConfirmationRequired event, got {other:?}"),
+        }
+
+        // 2. Wrong session cannot confirm or steal the entry
+        send_ipc_request(
+            &mut w_b,
+            &IpcRequest::ConfirmAction {
+                id: conf_id.clone(),
+                approved: true,
+            },
+        )
+        .await;
+        match read_ipc_response(&mut reader_b).await {
+            IpcResponse::Error { message } => {
+                assert!(!message.contains("sess-a"), "must not leak session id");
+                assert!(!message.contains(&cmd_approve), "must not leak command");
+            }
+            other => panic!("expected Error for wrong session, got {other:?}"),
+        }
+        assert!(target_approve.exists());
+
+        // 3. Session A approves -> executes once
+        send_ipc_request(
+            &mut w_a,
+            &IpcRequest::ConfirmAction {
+                id: conf_id.clone(),
+                approved: true,
+            },
+        )
+        .await;
+        match read_ipc_response(&mut reader_a).await {
+            IpcResponse::CodeResult { success, .. } => assert!(success),
+            other => panic!("expected CodeResult on approval, got {other:?}"),
+        }
+        assert!(
+            !target_approve.exists(),
+            "approved command should have executed"
+        );
+
+        // 4. Second submit of same id fails
+        send_ipc_request(
+            &mut w_a,
+            &IpcRequest::ConfirmAction {
+                id: conf_id,
+                approved: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            read_ipc_response(&mut reader_a).await,
+            IpcResponse::Error { .. }
+        ));
+
+        // 5. Deny flow
+        let cmd_deny = format!("rm -rf {}", target_deny.display());
+        send_ipc_request(
+            &mut w_a,
+            &IpcRequest::ExecuteCode {
+                code: cmd_deny.clone(),
+            },
+        )
+        .await;
+        let deny_id = match read_ipc_response(&mut reader_a).await {
+            IpcResponse::ConfirmationRequired { id, .. } => id,
+            other => panic!("expected ConfirmationRequired, got {other:?}"),
+        };
+        send_ipc_request(
+            &mut w_a,
+            &IpcRequest::ConfirmAction {
+                id: deny_id,
+                approved: false,
+            },
+        )
+        .await;
+        match read_ipc_response(&mut reader_a).await {
+            IpcResponse::Ok { message } => assert!(message.contains("denied")),
+            other => panic!("expected Ok on denial, got {other:?}"),
+        }
+        assert!(target_deny.exists(), "denied command must not execute");
+
+        handle.abort();
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_expired_confirmation_and_chat_yes_no_clears_store() {
+        let dir = std::env::temp_dir().join(format!("mycel-ipc-exp-{}", uuid::Uuid::new_v4()));
+        let mut runtime = build_test_runtime(&dir).await;
+        runtime.confirmations =
+            crate::policy::ConfirmationStore::with_limits(64, 8, Duration::from_millis(15));
+
+        let mut sess = "sess-exp".to_string();
+        let conf_id = match process_request(
+            &IpcRequest::ExecuteCode {
+                code: "rm -rf /tmp/mycel-nonexistent-exp".to_string(),
+            },
+            &runtime,
+            &mut sess,
+        )
+        .await
+        {
+            IpcResponse::ConfirmationRequired { id, .. } => id,
+            other => panic!("expected ConfirmationRequired, got {other:?}"),
+        };
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        match process_request(
+            &IpcRequest::ConfirmAction {
+                id: conf_id,
+                approved: true,
+            },
+            &runtime,
+            &mut sess,
+        )
+        .await
+        {
+            IpcResponse::Error { message } => {
+                assert!(message.contains("expired"), "got: {message}");
+            }
+            other => panic!("expected expired Error, got {other:?}"),
+        }
+
+        // Chat yes/no clears structured pending confirmation
+        let mut runtime2 = build_test_runtime(&dir).await;
+        runtime2.confirmations = crate::policy::ConfirmationStore::new();
+        let target_yes = dir.join("chat_yes_target");
+        std::fs::create_dir_all(&target_yes).unwrap();
+        let cmd_yes = format!("rm -rf {}", target_yes.display());
+
+        let _ = runtime2
+            .execute_code_with_policy(&cmd_yes, "sess-chat-yes")
+            .await
+            .unwrap();
+        assert_eq!(runtime2.confirmations.len().await, 1);
+
+        let _ = runtime2
+            .process_input("yes", "sess-chat-yes")
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime2.confirmations.len().await,
+            0,
+            "chat 'yes' must clear ConfirmationStore"
+        );
+        assert!(!target_yes.exists());
+
+        let _ = runtime2
+            .execute_code_with_policy("rm -rf /tmp/mycel-nonexistent-no", "sess-chat-no")
+            .await
+            .unwrap();
+        assert_eq!(runtime2.confirmations.len().await, 1);
+
+        let _ = runtime2.process_input("no", "sess-chat-no").await.unwrap();
+        assert_eq!(
+            runtime2.confirmations.len().await,
+            0,
+            "chat 'no' must clear ConfirmationStore"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

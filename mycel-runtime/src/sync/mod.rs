@@ -479,6 +479,12 @@ impl SyncService {
                     SystemEvent::ExecutionFailed { .. } => {}
                     // Recovery decisions are local diagnostics, not synced
                     SystemEvent::RecoveryDecided { .. } => {}
+                    // Policy confirmation requests are local to this runtime, not synced
+                    SystemEvent::ConfirmationRequired { .. } => {}
+                    // Provider health changes are local diagnostics, not synced
+                    SystemEvent::ProviderHealthChanged { .. } => {}
+                    // Sync state changes are local diagnostics, not synced
+                    SystemEvent::SyncStateChanged { .. } => {}
                 }
             }
         });
