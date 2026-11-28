@@ -475,6 +475,10 @@ impl SyncService {
                     SystemEvent::ToolCalled { .. } => {}
                     // Server restart events are logged but not synced to mesh
                     SystemEvent::McpServerRestarted { .. } => {}
+                    // Execution failures are local diagnostics, not synced
+                    SystemEvent::ExecutionFailed { .. } => {}
+                    // Recovery decisions are local diagnostics, not synced
+                    SystemEvent::RecoveryDecided { .. } => {}
                 }
             }
         });

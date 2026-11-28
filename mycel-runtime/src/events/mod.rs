@@ -17,4 +17,20 @@ pub enum SystemEvent {
     },
     /// Fired when an MCP server is restarted after failure
     McpServerRestarted { name: String },
+    /// Fired when generated code fails to run cleanly
+    ExecutionFailed {
+        language: String,
+        failure_class: String,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        timed_out: bool,
+        sandbox_mode: String,
+    },
+    /// Fired when the recovery layer decides what to do about a failure
+    RecoveryDecided {
+        decision: String,
+        reason: String,
+        verified: bool,
+        attempts: u32,
+    },
 }

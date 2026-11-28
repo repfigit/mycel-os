@@ -491,12 +491,27 @@ async fn process_request(
             // prompt) with an explanatory message.
             use crate::policy::ActionPolicy;
             match runtime.policy_evaluator.evaluate_code(code) {
-                ActionPolicy::Allow => match runtime.executor.run(code).await {
-                    Ok(output) => IpcResponse::CodeResult {
-                        code: code.clone(),
-                        output,
-                        success: true,
-                    },
+                ActionPolicy::Allow => match runtime.executor.run_detailed(code).await {
+                    Ok(report) => {
+                        if !report.succeeded() {
+                            let class = crate::recovery::classify_failure(&report);
+                            let _ = runtime.event_bus.send(
+                                crate::events::SystemEvent::ExecutionFailed {
+                                    language: report.language.as_str().to_string(),
+                                    failure_class: class.as_str().to_string(),
+                                    exit_code: report.exit_code,
+                                    signal: report.signal,
+                                    timed_out: report.timed_out,
+                                    sandbox_mode: report.sandbox_mode.as_str().to_string(),
+                                },
+                            );
+                        }
+                        IpcResponse::CodeResult {
+                            code: code.clone(),
+                            output: report.combined_output(),
+                            success: report.succeeded(),
+                        }
+                    }
                     Err(e) => IpcResponse::CodeResult {
                         code: code.clone(),
                         output: e.to_string(),
@@ -896,5 +911,91 @@ mod tests {
             "large capacity retained: {}",
             buf.buf.capacity()
         );
+    }
+
+    async fn build_test_runtime(dir: &std::path::Path) -> crate::MycelRuntime {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut config = crate::config::MycelConfig {
+            context_path: dir.to_string_lossy().to_string(),
+            ollama_url: "http://127.0.0.1:1".to_string(),
+            openrouter_api_key: String::new(),
+            ..Default::default()
+        };
+        config.mcp.enabled = false;
+        config.sandbox.mode = crate::config::SandboxMode::Host;
+
+        let context_manager = crate::context::ContextManager::new(&config).await.unwrap();
+        let ai_router = crate::ai::AiRouter::cloud_only(&config).await.unwrap();
+        let executor = crate::executor::CodeExecutor::new(&config).unwrap();
+        let policy_evaluator = crate::policy::PolicyEvaluator::with_defaults();
+        let ui_factory = crate::ui::UiFactory::new(&config).unwrap();
+        let (event_bus, _) = tokio::sync::broadcast::channel(16);
+        let mcp_manager = crate::mcp::McpManager::new(&config.mcp, ".", event_bus.clone())
+            .await
+            .unwrap();
+        let sync_service = crate::sync::SyncService::new(&config, None, event_bus.clone())
+            .await
+            .unwrap();
+        let selfdev =
+            crate::selfdev::SelfDevService::new(config.selfdev.clone(), dir.join("selfdev.json"))
+                .await;
+        let command_registry =
+            crate::commands::CommandRegistry::load(dir.join("commands.json")).await;
+
+        crate::MycelRuntime {
+            config,
+            context_manager,
+            ai_router,
+            executor,
+            policy_evaluator,
+            ui_factory,
+            sync_service,
+            mcp_manager,
+            selfdev,
+            command_registry,
+            event_bus,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_code_reports_success_and_failure() {
+        let dir = std::env::temp_dir().join(format!("mycel-ipc-test-{}", uuid::Uuid::new_v4()));
+        let runtime = build_test_runtime(&dir).await;
+        let mut session = "ipc-test".to_string();
+
+        let ok = process_request(
+            &IpcRequest::ExecuteCode {
+                code: "echo ok".to_string(),
+            },
+            &runtime,
+            &mut session,
+        )
+        .await;
+        match ok {
+            IpcResponse::CodeResult {
+                success, output, ..
+            } => {
+                assert!(success, "expected success, output: {output}");
+                assert_eq!(output.trim(), "ok");
+            }
+            other => panic!("expected CodeResult, got {other:?}"),
+        }
+
+        let fail = process_request(
+            &IpcRequest::ExecuteCode {
+                code: "exit 1".to_string(),
+            },
+            &runtime,
+            &mut session,
+        )
+        .await;
+        match fail {
+            IpcResponse::CodeResult { success, .. } => {
+                assert!(!success, "expected failure for exit 1");
+            }
+            other => panic!("expected CodeResult, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

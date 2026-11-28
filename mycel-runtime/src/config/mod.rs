@@ -82,6 +82,10 @@ pub struct MycelConfig {
     /// Isolation for AI-generated code execution
     #[serde(default)]
     pub sandbox: SandboxConfig,
+
+    /// Execution-recovery policy for failed sandboxed runs
+    #[serde(default)]
+    pub recovery: crate::recovery::RecoveryConfig,
 }
 
 /// How AI-generated code is isolated from the host.
@@ -95,6 +99,16 @@ pub enum SandboxMode {
     /// Run directly on the host with the daemon's privileges. Resource
     /// limits still apply. Opt-in only.
     Host,
+}
+
+impl SandboxMode {
+    /// Stable lowercase name used in events and diagnostics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SandboxMode::Bwrap => "bwrap",
+            SandboxMode::Host => "host",
+        }
+    }
 }
 
 /// Sandbox configuration for the code executor. Secure by default.
@@ -319,6 +333,7 @@ impl Default for MycelConfig {
             mcp: McpConfig::default(),
             mesh: MeshConfig::default(),
             sandbox: SandboxConfig::default(),
+            recovery: crate::recovery::RecoveryConfig::default(),
         }
     }
 }
