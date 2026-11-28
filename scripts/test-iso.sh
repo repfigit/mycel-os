@@ -43,7 +43,10 @@ if [ ! -f "$DISK_FILE" ]; then
 fi
 
 # QEMU options
+# Note: For automated Phase 1b smoke verification, use:
+#   PYTHONDONTWRITEBYTECODE=1 python3 scripts/smoke-test-iso.py --iso <iso>
 QEMU_OPTS=(
+    -enable-kvm
     -m 4G
     -smp 2
     -cpu host
@@ -53,6 +56,12 @@ QEMU_OPTS=(
     -netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::11434-:11434
     -device virtio-net-pci,netdev=net0
 )
+
+# Use sudo -n if current user lacks direct /dev/kvm read/write access
+QEMU_PREFIX=()
+if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+    QEMU_PREFIX=(sudo -n)
+fi
 
 # Mode selection
 MODE="${2:-serial}"
@@ -65,7 +74,7 @@ case "$MODE" in
         echo ""
         echo "----------------------------------------"
 
-        qemu-system-x86_64 \
+        "${QEMU_PREFIX[@]}" qemu-system-x86_64 \
             "${QEMU_OPTS[@]}" \
             -nographic \
             -serial mon:stdio
@@ -81,7 +90,7 @@ case "$MODE" in
         echo "Press Ctrl+C to stop QEMU"
         echo ""
 
-        qemu-system-x86_64 \
+        "${QEMU_PREFIX[@]}" qemu-system-x86_64 \
             "${QEMU_OPTS[@]}" \
             -vnc :0 \
             -monitor stdio
@@ -92,7 +101,7 @@ case "$MODE" in
         echo "Connect to port 5930"
         echo ""
 
-        qemu-system-x86_64 \
+        "${QEMU_PREFIX[@]}" qemu-system-x86_64 \
             "${QEMU_OPTS[@]}" \
             -spice port=5930,disable-ticketing=on \
             -device virtio-serial-pci \

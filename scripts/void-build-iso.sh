@@ -1,6 +1,13 @@
 #!/bin/bash
-# Build Mycel OS ISO inside Void Linux container
-set -e
+# Build Mycel OS x86_64-musl ISO inside Void Linux container
+set -eo pipefail
+
+PROFILE="${1:-${PROFILE:-smoke}}"
+OUTPUT_DIR="${OUTPUT_DIR:-/output}"
+WORKSPACE="${WORKSPACE:-/workspace}"
+ARCH="x86_64-musl"
+REPO="${VOID_REPO:-https://repo-default.voidlinux.org/current/musl}"
+DATE="$(date +%Y%m%d)"
 
 echo ""
 echo "    ███╗   ███╗██╗   ██╗ ██████╗███████╗██╗     "
@@ -10,108 +17,146 @@ echo "    ██║╚██╔╝██║  ╚██╔╝  ██║     █�
 echo "    ██║ ╚═╝ ██║   ██║   ╚██████╗███████╗███████╗"
 echo "    ╚═╝     ╚═╝   ╚═╝    ╚═════╝╚══════╝╚══════╝"
 echo ""
-echo "Building Mycel OS ISO..."
+echo "Building Mycel OS ISO (profile=${PROFILE}, arch=${ARCH})..."
 echo ""
 
-BUILD_DIR="/build"
-OUTPUT_DIR="/output"
-WORKSPACE="/workspace"
+mkdir -p "$OUTPUT_DIR"
 
-# Packages to include in the ISO
-PACKAGES="
-base-system
-linux
-grub-x86_64-efi
-grub-i386-pc
-NetworkManager
-iwd
-bluez
-pipewire
-wireplumber
-elogind
-dbus
-polkit
-xorg-minimal
-xorg-fonts
-mesa-dri
-intel-video-accel
-xf86-video-intel
-xf86-video-amdgpu
-xf86-video-nouveau
-sway
-foot
-bemenu
-mako
-grim
-slurp
-wl-clipboard
-firefox
-curl
-wget
-git
-vim
-neovim
-htop
-tmux
-zsh
-python3
-rustup
-"
+case "$PROFILE" in
+    smoke|quick|minimal)
+        PROFILE="smoke"
+        PACKAGES="base-system linux grub-x86_64-efi grub dhcpcd iproute2 iputils curl ca-certificates bubblewrap python3 wireguard-tools"
+        SERVICES="agetty-ttyS0 dhcpcd"
+        ;;
+    full)
+        PACKAGES="base-system linux linux-firmware grub-x86_64-efi grub NetworkManager iwd bluez pipewire wireplumber elogind dbus polkit xorg-minimal xorg-fonts mesa-dri sway foot bemenu mako grim slurp wl-clipboard firefox curl wget git vim neovim htop tmux zsh python3 bubblewrap wireguard-tools"
+        SERVICES="agetty-ttyS0 dbus NetworkManager elogind polkit"
+        ;;
+    *)
+        echo "ERROR: Unknown profile '$PROFILE' (expected: smoke | full)" >&2
+        exit 1
+        ;;
+esac
 
-# Services to enable
-SERVICES="
-dbus
-NetworkManager
-elogind
-polkit
-"
+echo "[1/4] Verifying static musl mycel-runtime binary..."
+RUNTIME_BIN="$WORKSPACE/mycel-runtime/target/x86_64-unknown-linux-musl/release/mycel-runtime"
+CLI_SCRIPT="$WORKSPACE/tools/mycel-cli.py"
 
-echo "[1/5] Setting up build environment..."
-cd "$BUILD_DIR"
-
-# Check if void-mklive exists
-if [ ! -d "/usr/share/void-mklive" ]; then
-    echo "Cloning void-mklive..."
-    git clone https://github.com/void-linux/void-mklive.git
-    cd void-mklive
-else
-    cd /usr/share/void-mklive || cd void-mklive 2>/dev/null || {
-        git clone https://github.com/void-linux/void-mklive.git
-        cd void-mklive
-    }
+if [ ! -f "$RUNTIME_BIN" ]; then
+    echo "ERROR: Static musl binary not found at $RUNTIME_BIN" >&2
+    echo "Build it first with: cargo build --release --target x86_64-unknown-linux-musl" >&2
+    exit 1
+fi
+if [ ! -f "$CLI_SCRIPT" ]; then
+    echo "ERROR: CLI script not found at $CLI_SCRIPT" >&2
+    exit 1
 fi
 
-echo "[2/5] Creating package list..."
-echo "$PACKAGES" | tr ' ' '\n' | grep -v '^$' > /tmp/packages.txt
+echo "Binary info: $(file "$RUNTIME_BIN")"
 
-echo "[3/5] Building ISO (this takes 10-20 minutes)..."
+echo "[2/4] Preparing rootfs overlay..."
+INCLUDEDIR="/tmp/mycel-includedir"
+rm -rf "$INCLUDEDIR"
+mkdir -p \
+    "$INCLUDEDIR/usr/local/bin" \
+    "$INCLUDEDIR/usr/local/lib/mycel" \
+    "$INCLUDEDIR/etc/mycel" \
+    "$INCLUDEDIR/etc/sv/mycel-runtime" \
+    "$INCLUDEDIR/etc/runit/runsvdir/default"
 
-# Build the ISO
-# -a x86_64: 64-bit
-# -r repo: use default repo
-# -p packages: include these packages
-# -S services: enable these services
-# -o output: output file
-# -I includedir: include additional files
+# Real static musl mycel-runtime binary
+install -m 0755 "$RUNTIME_BIN" "$INCLUDEDIR/usr/local/bin/mycel-runtime"
+
+# Real Python CLI + thin wrapper
+install -m 0755 "$CLI_SCRIPT" "$INCLUDEDIR/usr/local/lib/mycel/mycel-cli.py"
+cat > "$INCLUDEDIR/usr/local/bin/mycel" << 'EOF'
+#!/bin/sh
+export MYCEL_SOCKET="${MYCEL_SOCKET:-/run/mycel/runtime.sock}"
+exec python3 /usr/local/lib/mycel/mycel-cli.py "$@"
+EOF
+chmod 0755 "$INCLUDEDIR/usr/local/bin/mycel"
+
+# Real MycelConfig TOML (top-level keys)
+cat > "$INCLUDEDIR/etc/mycel/config.toml" << 'EOF'
+ollama_url = "http://10.0.2.2:11434"
+local_model = "qwen3:8b"
+ipc_socket_path = "/run/mycel/runtime.sock"
+context_path = "/var/lib/mycel"
+code_path = "/var/cache/mycel/code"
+
+[mcp]
+enabled = false
+
+[sandbox]
+mode = "bwrap"
+bwrap_path = "bwrap"
+allow_network = false
+
+[mesh]
+enabled = false
+EOF
+chmod 0644 "$INCLUDEDIR/etc/mycel/config.toml"
+
+# Runit service for mycel-runtime
+cat > "$INCLUDEDIR/etc/sv/mycel-runtime/run" << 'EOF'
+#!/bin/sh
+exec 2>&1
+mkdir -p /run/mycel /var/lib/mycel /var/cache/mycel/code
+exec /usr/local/bin/mycel-runtime --daemon --config /etc/mycel/config.toml
+EOF
+chmod 0755 "$INCLUDEDIR/etc/sv/mycel-runtime/run"
+ln -sf /etc/sv/mycel-runtime "$INCLUDEDIR/etc/runit/runsvdir/default/mycel-runtime"
+
+# Clean branding
+echo "mycel" > "$INCLUDEDIR/etc/hostname"
+cat > "$INCLUDEDIR/etc/os-release" << 'EOF'
+NAME="Mycel OS"
+ID=mycel
+ID_LIKE=void
+VERSION="0.1.0"
+VERSION_ID="0.1.0"
+PRETTY_NAME="Mycel OS 0.1.0 (Void musl)"
+HOME_URL="https://mycel-os.org"
+EOF
+cat > "$INCLUDEDIR/etc/motd" << 'EOF'
+
+    ███╗   ███╗██╗   ██╗ ██████╗███████╗██╗
+    ████╗ ████║╚██╗ ██╔╝██╔════╝██╔════╝██║
+    ██╔████╔██║ ╚████╔╝ ██║     █████╗  ██║
+    ██║╚██╔╝██║  ╚██╔╝  ██║     ██╔══╝  ██║
+    ██║ ╚═╝ ██║   ██║   ╚██████╗███████╗███████╗
+    ╚═╝     ╚═╝   ╚═╝    ╚═════╝╚══════╝╚══════╝
+
+    Welcome to Mycel OS (x86_64-musl)
+    Run 'mycel --help' or 'sv status mycel-runtime' to get started.
+
+EOF
+
+echo "[3/4] Setting up void-mklive..."
+MKLIVE_DIR="/opt/void-mklive"
+if [ ! -d "$MKLIVE_DIR" ]; then
+    MKLIVE_DIR="/build/void-mklive"
+    if [ ! -d "$MKLIVE_DIR" ]; then
+        git clone --depth 1 https://github.com/void-linux/void-mklive.git "$MKLIVE_DIR"
+    fi
+fi
+cd "$MKLIVE_DIR"
+
+echo "[4/4] Building ISO with mklive.sh..."
+ISO_PATH="$OUTPUT_DIR/mycel-os-${PROFILE}-${ARCH}-${DATE}.iso"
+rm -f "$ISO_PATH"
 
 ./mklive.sh \
-    -a x86_64 \
-    -p "$(cat /tmp/packages.txt | tr '\n' ' ')" \
+    -a "$ARCH" \
+    -r "$REPO" \
+    -p "$PACKAGES" \
     -S "$SERVICES" \
-    -o "$OUTPUT_DIR/mycel-os-$(date +%Y%m%d).iso" \
+    -I "$INCLUDEDIR" \
+    -o "$ISO_PATH" \
     -T "Mycel OS" \
-    -C "Mycel OS - The intelligent network beneath everything" \
+    -C "console=ttyS0,115200n8 console=tty0" \
     2>&1 | tee "$OUTPUT_DIR/build.log"
 
-echo "[4/5] Copying mycel-runtime..."
-# If we have a pre-built runtime, we'd add it here
-if [ -f "$WORKSPACE/mycel-runtime/target/release/mycel-runtime" ]; then
-    echo "Found mycel-runtime binary"
-    # Would need to remaster ISO to include it
-fi
-
-echo "[5/5] Build complete!"
 echo ""
-ls -lh "$OUTPUT_DIR"/*.iso 2>/dev/null || echo "ISO not found - check build.log"
-echo ""
-echo "ISO saved to: $OUTPUT_DIR/"
+echo "Build complete!"
+ls -lh "$ISO_PATH"

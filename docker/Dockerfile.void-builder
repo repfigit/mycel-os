@@ -1,31 +1,38 @@
-# Void Linux ISO Builder
-# Used to create bootable Mycel OS images
+# Void Linux x86_64-musl ISO Builder
+# Used to build static musl mycel-runtime and bootable Mycel OS ISOs
 
-FROM ghcr.io/void-linux/void-glibc-full:latest
+FROM ghcr.io/void-linux/void-musl-full:latest
 
-# Install build dependencies
-RUN xbps-install -Syu && xbps-install -y \
-    base-devel \
+# Install void-mklive and Rust musl build dependencies
+RUN xbps-install -Syu -y && xbps-install -y \
+    bash \
     git \
-    curl \
-    xz \
+    xorriso \
     squashfs-tools \
-    liblz4 \
-    grub-x86_64-efi \
-    grub-i386-pc \
     dosfstools \
     e2fsprogs \
     mtools \
-    xorriso \
-    void-mklive
+    grub-x86_64-efi \
+    grub \
+    liblz4 \
+    xz \
+    curl \
+    tar \
+    gzip \
+    cpio \
+    file \
+    gcc \
+    llvm-libunwind-devel \
+    rust \
+    cargo
 
-# Create build user
-RUN useradd -m builder
 WORKDIR /build
 
-# Copy build scripts
-COPY scripts/void-build-iso.sh /build/
+# Pre-clone void-mklive
+RUN git clone --depth 1 https://github.com/void-linux/void-mklive.git /opt/void-mklive
+
+# Copy build script
+COPY void-build-iso.sh /build/void-build-iso.sh
 RUN chmod +x /build/void-build-iso.sh
 
-# Default command
 CMD ["/build/void-build-iso.sh"]
