@@ -256,36 +256,77 @@ def cmd_status(args):
         print(f"Unexpected response: {response}")
 
 
+def _handle_mesh_error(response: dict) -> None:
+    """Exit with code 1 if the runtime returned an Error response."""
+    if response.get("type") == "Error":
+        print(f"Error: {response.get('message', 'Unknown error')}", file=sys.stderr)
+        sys.exit(1)
+    if "error" in response:
+        print(f"Error: {response['error']}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _print_peer_added(response: dict) -> None:
+    """Print details from a PeerAdded response."""
+    peer = response.get("peer", {})
+    addrs = ", ".join(peer.get("addresses", [])) or "none"
+    print(f"Peer added: {peer.get('name', 'unnamed')} ({peer.get('id', 'unknown')})")
+    print(f"Status: {peer.get('status', 'unknown')}")
+    print(f"Addresses: {addrs}")
+    print(f"Synced events: {response.get('synced_events', 0)}")
+
+
 def cmd_mesh(args):
     """Mesh network commands."""
     if args.mesh_cmd == "status":
-        response = send_request({"type": "mesh_status"})
-        if "error" in response:
-            print(f"Error: {response['error']}")
-        else:
-            print(f"Mesh Status: {response.get('status', 'unknown')}")
-            print(f"Devices: {response.get('device_count', 0)}")
-            for device in response.get('devices', []):
-                status = "●" if device.get('online') else "○"
-                print(f"  {status} {device['name']} - {device.get('last_sync', 'never')}")
+        response = send_request({"type": "SyncStatus"})
+        _handle_mesh_error(response)
+        enabled = "enabled" if response.get("enabled") else "disabled"
+        print(f"Mesh Sync: {enabled}")
+        print(f"Device ID: {response.get('device_id', 'unknown')}")
+        print(f"Transport: {response.get('transport', 'unknown')}")
+        if response.get("interface"):
+            print(f"Interface: {response['interface']}")
+        if response.get("listen_addr"):
+            print(f"Listen Addr: {response['listen_addr']}")
+        print(f"Trusted Peers: {response.get('trusted_peers', 0)}")
+        print(f"Connected Peers: {response.get('connected_peers', 0)}")
+        print(f"Event Log Length: {response.get('event_log_len', 0)}")
+        peers = response.get("peers", [])
+        if peers:
+            print("Peers:")
+            for peer in peers:
+                addrs = ", ".join(peer.get("addresses", [])) or "none"
+                print(f"  - {peer.get('name', 'unnamed')} ({peer.get('id', 'unknown')}) [{peer.get('status', 'unknown')}] {addrs}")
 
     elif args.mesh_cmd == "add-device":
-        response = send_request({"type": "mesh_add_device"})
-        if "error" in response:
-            print(f"Error: {response['error']}")
-        else:
-            print(f"Pairing code: {response.get('pairing_code', 'N/A')}")
-            print(f"Expires in: {response.get('expires_in', 'N/A')}")
-            if response.get('qr_code'):
-                print(f"\nQR Code:\n{response['qr_code']}")
+        response = send_request({"type": "GeneratePairingCode", "endpoint": args.endpoint})
+        _handle_mesh_error(response)
+        print(f"Device ID: {response.get('device_id', 'unknown')}")
+        if response.get("endpoint"):
+            print(f"Endpoint: {response['endpoint']}")
+        print(f"Pairing Code: {response.get('code', 'N/A')}")
 
     elif args.mesh_cmd == "join":
-        code = input("Enter pairing code: ").strip()
-        response = send_request({"type": "mesh_join", "code": code})
-        if "error" in response:
-            print(f"Error: {response['error']}")
-        else:
-            print(f"Successfully joined mesh!")
+        code = args.code.strip() if args.code else input("Enter pairing code: ").strip()
+        response = send_request({"type": "PairPeer", "code": code})
+        _handle_mesh_error(response)
+        _print_peer_added(response)
+
+    elif args.mesh_cmd == "pair":
+        response = send_request({
+            "type": "AddTrustedPeer",
+            "peer_id": args.peer_id,
+            "name": args.name,
+            "endpoint": args.endpoint,
+        })
+        _handle_mesh_error(response)
+        _print_peer_added(response)
+
+    elif args.mesh_cmd == "sync":
+        response = send_request({"type": "TriggerSync", "peer_id": args.peer})
+        _handle_mesh_error(response)
+        print(response.get("message", "Sync triggered"))
 
 
 def cmd_collective(args):
@@ -328,6 +369,9 @@ Examples:
   mycel "@cloud explain quantum" Force cloud LLM
   mycel "@local what time is it" Force local LLM
   mycel status                  Show runtime status
+  mycel mesh status             Show mesh sync status
+  mycel mesh add-device         Generate a mesh pairing code
+  mycel mesh join               Join a mesh using a pairing code
 
 Environment:
   MYCEL_SOCKET      Socket path (default: /tmp/mycel-dev.sock)
@@ -355,9 +399,28 @@ Environment:
 
     # Mesh
     mesh_parser = subparsers.add_parser('mesh', help='Mesh network commands')
-    mesh_parser.add_argument('mesh_cmd', choices=['status', 'add-device', 'join'],
-                            help='Mesh subcommand')
-    mesh_parser.set_defaults(func=cmd_mesh)
+    mesh_subparsers = mesh_parser.add_subparsers(dest='mesh_cmd', required=True)
+
+    mesh_status_parser = mesh_subparsers.add_parser('status', help='Show mesh sync status')
+    mesh_status_parser.set_defaults(func=cmd_mesh)
+
+    mesh_add_parser = mesh_subparsers.add_parser('add-device', help='Generate a pairing code for another device')
+    mesh_add_parser.add_argument('--endpoint', default=None, help='Optional HOST:PORT endpoint to advertise')
+    mesh_add_parser.set_defaults(func=cmd_mesh)
+
+    mesh_join_parser = mesh_subparsers.add_parser('join', help='Pair with a peer using a pairing code')
+    mesh_join_parser.add_argument('code', nargs='?', default=None, help='Pairing code or raw base64 peer ID')
+    mesh_join_parser.set_defaults(func=cmd_mesh)
+
+    mesh_pair_parser = mesh_subparsers.add_parser('pair', help='Add a trusted peer directly')
+    mesh_pair_parser.add_argument('peer_id', help='Base64 peer public key')
+    mesh_pair_parser.add_argument('--name', default=None, help='Optional peer name')
+    mesh_pair_parser.add_argument('--endpoint', default=None, help='Optional HOST:PORT endpoint')
+    mesh_pair_parser.set_defaults(func=cmd_mesh)
+
+    mesh_sync_parser = mesh_subparsers.add_parser('sync', help='Trigger mesh sync')
+    mesh_sync_parser.add_argument('--peer', default=None, help='Optional peer ID to sync with')
+    mesh_sync_parser.set_defaults(func=cmd_mesh)
 
     # Collective
     collective_parser = subparsers.add_parser('collective', help='Collective network commands')

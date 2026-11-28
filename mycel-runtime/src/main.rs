@@ -158,6 +158,9 @@ async fn main() -> Result<()> {
     sync_service
         .set_command_registry(command_registry.clone())
         .await;
+    sync_service
+        .set_context_manager(context_manager.clone())
+        .await;
 
     // Create the main runtime
     let runtime = MycelRuntime {

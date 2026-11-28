@@ -173,6 +173,16 @@ fn default_max_processes() -> u32 {
     4096
 }
 
+/// Transport mode for the personal device mesh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshTransportMode {
+    #[default]
+    Auto,
+    WireGuard,
+    Direct,
+}
+
 /// Personal device mesh configuration.
 ///
 /// Secure by default: the mesh is off, and when on, only explicitly trusted
@@ -199,6 +209,26 @@ pub struct MeshConfig {
     /// Replicate conversation history to trusted peers (opt-in)
     #[serde(default)]
     pub sync_ai_context: bool,
+
+    /// Kernel WireGuard interface name
+    #[serde(default = "default_mesh_interface")]
+    pub interface: String,
+
+    /// Mesh transport mode (auto, wireguard, direct)
+    #[serde(default)]
+    pub transport: MeshTransportMode,
+
+    /// TCP/UDP port for sync protocol traffic inside the mesh
+    #[serde(default = "default_sync_port")]
+    pub sync_port: u16,
+
+    /// Optional explicit WireGuard IPv4 address (derived from public key if None)
+    #[serde(default)]
+    pub wg_address: Option<String>,
+
+    /// Static peer endpoints keyed by Mycel ID (base64 public key) -> "ip:port"
+    #[serde(default)]
+    pub peer_endpoints: HashMap<String, String>,
 }
 
 impl Default for MeshConfig {
@@ -209,12 +239,25 @@ impl Default for MeshConfig {
             mdns_enabled: true,
             trusted_peers: Vec::new(),
             sync_ai_context: false,
+            interface: default_mesh_interface(),
+            transport: MeshTransportMode::Auto,
+            sync_port: default_sync_port(),
+            wg_address: None,
+            peer_endpoints: HashMap::new(),
         }
     }
 }
 
 fn default_mesh_port() -> u16 {
     51820
+}
+
+fn default_mesh_interface() -> String {
+    "mycel0".to_string()
+}
+
+fn default_sync_port() -> u16 {
+    51821
 }
 
 /// MCP (Model Context Protocol) configuration
@@ -369,6 +412,7 @@ impl MycelConfig {
             config.context_path = "./mycel-data".to_string();
             config.code_path = "./mycel-code".to_string();
             config.ipc_socket_path = "/tmp/mycel-dev.sock".to_string();
+            config.mesh.transport = MeshTransportMode::Direct;
         }
 
         Ok(config)
@@ -392,6 +436,12 @@ mod tests {
         assert_eq!(config.local_model, "qwen3:8b");
         assert_eq!(config.ollama_url, "http://localhost:11434");
         assert!(!config.force_cloud_for_complex);
+        assert!(!config.mesh.enabled);
+        assert_eq!(config.mesh.interface, "mycel0");
+        assert_eq!(config.mesh.transport, MeshTransportMode::Auto);
+        assert_eq!(config.mesh.sync_port, 51821);
+        assert_eq!(config.mesh.wg_address, None);
+        assert!(config.mesh.peer_endpoints.is_empty());
     }
 
     #[test]
@@ -401,5 +451,53 @@ mod tests {
         let config = MycelConfig::load("non_existent_config.toml", true).unwrap();
         assert_eq!(config.context_path, "./mycel-data");
         assert_eq!(config.ipc_socket_path, "/tmp/mycel-dev.sock");
+        assert_eq!(config.mesh.transport, MeshTransportMode::Direct);
+    }
+
+    #[test]
+    fn test_mesh_config_backward_compatible_toml() {
+        let legacy_toml = r#"
+[mesh]
+enabled = true
+listen_port = 55555
+mdns_enabled = false
+trusted_peers = ["peerA"]
+sync_ai_context = true
+"#;
+        let parsed: MycelConfig = toml::from_str(legacy_toml).unwrap();
+        assert!(parsed.mesh.enabled);
+        assert_eq!(parsed.mesh.listen_port, 55555);
+        assert!(!parsed.mesh.mdns_enabled);
+        assert_eq!(parsed.mesh.trusted_peers, vec!["peerA"]);
+        assert!(parsed.mesh.sync_ai_context);
+        assert_eq!(parsed.mesh.interface, "mycel0");
+        assert_eq!(parsed.mesh.transport, MeshTransportMode::Auto);
+        assert_eq!(parsed.mesh.sync_port, 51821);
+        assert_eq!(parsed.mesh.wg_address, None);
+        assert!(parsed.mesh.peer_endpoints.is_empty());
+    }
+
+    #[test]
+    fn test_mesh_config_full_toml_and_dev_override() {
+        let full_toml = r#"
+[mesh]
+enabled = true
+interface = "wg-mycel"
+transport = "wireguard"
+sync_port = 52000
+wg_address = "10.100.1.2"
+
+[mesh.peer_endpoints]
+"peerA" = "203.0.113.5:51820"
+"#;
+        let parsed: MycelConfig = toml::from_str(full_toml).unwrap();
+        assert_eq!(parsed.mesh.interface, "wg-mycel");
+        assert_eq!(parsed.mesh.transport, MeshTransportMode::WireGuard);
+        assert_eq!(parsed.mesh.sync_port, 52000);
+        assert_eq!(parsed.mesh.wg_address.as_deref(), Some("10.100.1.2"));
+        assert_eq!(
+            parsed.mesh.peer_endpoints.get("peerA").map(String::as_str),
+            Some("203.0.113.5:51820")
+        );
     }
 }
