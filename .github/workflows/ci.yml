@@ -79,6 +79,100 @@ jobs:
         working-directory: mycel-runtime
         run: cargo audit
 
+  check-shell:
+    name: Check Shell (mycel-shell)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Wayland/X11 client dev libs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            mycel-shell/target
+          key: ${{ runner.os }}-cargo-shell-${{ hashFiles('mycel-shell/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-shell-
+
+      - name: Check formatting
+        working-directory: mycel-shell
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        working-directory: mycel-shell
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        working-directory: mycel-shell
+        run: cargo test --verbose
+
+  check-compositor:
+    name: Check Compositor (mycel-compositor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Smithay/DRM dev libs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libdrm-dev libgbm-dev libinput-dev libudev-dev libseat-dev libpixman-1-dev
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            mycel-compositor/target
+          key: ${{ runner.os }}-cargo-compositor-${{ hashFiles('mycel-compositor/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-compositor-
+
+      - name: Check formatting
+        working-directory: mycel-compositor
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy (default + drm features)
+        working-directory: mycel-compositor
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --features drm --all-targets -- -D warnings
+
+      - name: Run tests
+        working-directory: mycel-compositor
+        run: cargo test --verbose
+
+  check-scripts-and-builder:
+    name: Check Scripts & Void Builder
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate shell scripts and Python tools
+        run: |
+          bash -n scripts/build-iso.sh scripts/void-build-iso.sh scripts/build-mycel-iso.sh scripts/test-iso.sh
+          PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile tools/mycel-cli.py scripts/smoke-test-iso.py
+
+      - name: Verify Void musl ISO builder Dockerfile builds
+        run: docker build -t mycel-iso-builder-ci -f docker/Dockerfile.void-builder scripts
+
   build-release:
     name: Build Release
     runs-on: ubuntu-latest
