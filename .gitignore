@@ -35,3 +35,6 @@ plans/
 .env
 **/.venv/
 .pi-subagents/
+
+output/
+build/
